@@ -255,6 +255,7 @@ static volatile int g_coop_teardown;        // the session ended inside a level:
 static uint32_t g_jhit_n; static float g_jhit_dmg;   // host: the JOINER clone's hits on enemies / their damage (playtest #6)
 static uint32_t g_own_brains[4]; static int g_own_brains_n;   // the brains our own spawn popped (the clone, the self model)
 static uint32_t g_cp_sec, g_cp_peer_sec;    // level-part sections started since the level load: ours / the partner's highest
+static int32_t g_cp_part = -1;              // the world's part (+0x5AF0) when our section last started (-1 = not seen yet)
 static uint64_t g_part_ms;                  // when our last section (level part) was set up
 static float g_cp_tpos[3]; static bool g_cp_tpos_ok;
 static uint32_t g_fj_obj; static uint64_t g_fj_ms;   // host: the last trigger its test fired at the JOINER's feet
@@ -5039,8 +5040,77 @@ static void coop_part_step()
             logf("coop: level part: this level streams %u part(s) (current %d)", cnt, *(volatile int32_t *)(uintptr_t)(W0 + 0x5AF0));
         }
     }
-    if (!g_cfg.coop_role || g_cp_peer_sec <= g_cp_sec) return;
+    if (!g_cfg.coop_role) return;
     uint64_t now = GetTickCount64();
+    {   // Two-PC play 20261115 #6 (mission 3, joiner AV 0x1C6196 in the area-trigger test): the game's own trigger switched
+        // the joiner's part (world part 1 -> 2) and our section start (coop_level_prepare) had not run yet: the spawn sync
+        // read the old part's spawner table (garbage "spawned 3eba1c69") and the far-teleport fired into the area being
+        // replaced. While the world's part differs from the one our section started with, the game is switching:
+        // nothing here acts, and the trigger / spawn tables are dropped now (indexed again after the section start).
+        uint32_t W0 = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+        if (W0 >= 0x80000000 && W0 < 0x84000000) {
+            int32_t cur0 = *(volatile int32_t *)(uintptr_t)(W0 + 0x5AF0);
+            if (g_cp_part < 0) g_cp_part = cur0;
+            if (cur0 != g_cp_part) {
+                static int32_t noted = -1;
+                {   static uint64_t tl; if (now - tl > 2000) { tl = now;
+                    logf("coop: level part: switching state: part %d (ours %d), world state %x request %u, slots %x/%d/%u %x/%d/%u", cur0, g_cp_part,
+                         *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE0), *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE8),
+                         *(volatile uint32_t *)(uintptr_t)(W0 + 0x49D0), *(volatile int32_t *)(uintptr_t)(W0 + 0x49D8), *(volatile uint8_t *)(uintptr_t)(W0 + 0x4A08),
+                         *(volatile uint32_t *)(uintptr_t)(W0 + 0x5250), *(volatile int32_t *)(uintptr_t)(W0 + 0x5258), *(volatile uint8_t *)(uintptr_t)(W0 + 0x5288)); } }
+                if (noted != cur0) {
+                    noted = cur0;
+                    logf("coop: level part: the game switches part %d -> %d here (our section %u) - sync tables dropped until the section starts", g_cp_part, cur0, g_cp_sec);
+                }
+                g_trig_T = 0; g_trig_n = 0; g_sp_T = 0; g_sp_n = 0; g_part_ms = now;
+                // parttp5 (mission 1): a part switch is two steps. ADVANCE: the world's part goes up (request 1, or the
+                // partner's synced trigger) and the old slot starts streaming the part after it; ENTER: an area trigger
+                // inside the new part (FUN_001C7620: the slot holding part current + 1 loaded with +0x38 == 0) sets
+                // request 2 and the section starts (coop_level_prepare, request 4). A player teleported past that trigger
+                // never enters: the host sat at "part 2 (ours 1)" for 40 s. With the partner a section ahead, once no
+                // slot is loading: a far player is moved next to the partner (not when downed), and the ENTER request is
+                // made here - for a player near the partner or just moved.
+                if (g_cp_peer_sec > g_cp_sec && now - g_cp_moved_ms > 500) {
+                    uint32_t st0 = *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE0), fl0 = *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE8);
+                    int nx = -1; bool loading0 = false;
+                    for (int k = 0; k < 2; k++) {
+                        uint32_t sl = W0 + 0x49D0 + k * 0x880;
+                        if (*(volatile uint32_t *)(uintptr_t)sl != 0x1C) loading0 = true;
+                        if (*(volatile int32_t *)(uintptr_t)(sl + 8) == cur0 + 1 && *(volatile uint32_t *)(uintptr_t)sl == 0x1C &&
+                            *(volatile uint8_t *)(uintptr_t)(sl + 0x38) == 0) nx = k;
+                    }
+                    if (st0 == 0x1C && fl0 == 0 && !loading0 && nx >= 0) {
+                        bool is_near0 = false;
+                        float pf[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
+                        uint32_t ctrl = g_coop_last_ctrl, po = 0;
+                        if (ctrl >= 0x80000000 && ctrl < 0x84000000) coop_safe_copy(&po, ctrl + 0x8C, 4);
+                        if (po >= 0x80000000 && po < 0x84000000 && g_coop_host_pawn_ok) {
+                            const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
+                            float dx = f[0] - pf[0], dy = f[1] - pf[1], dz = f[2] - pf[2];
+                            is_near0 = dx * dx + dy * dy + dz * dz < 40.0f * 40.0f;
+                        }
+                        bool moved0 = now - g_cp_moved_ms < 8000;
+                        if (!is_near0 && !moved0 && !g_coop_downed && g_coop_host_pawn_ok) {
+                            logf("coop: level part: part %d here (our section %u), the partner is at section %u and we are far - teleported to the partner", cur0, g_cp_sec, g_cp_peer_sec);
+                            coop_respawn_at(pf, g_coop_host_yaw, false);
+                            g_cp_moved_ms = now;
+                            strncpy(g_coop_info_msg, "GETTING TOO FAR - TELEPORTED TO YOUR PARTNER", sizeof g_coop_info_msg - 1);
+                            g_coop_info_msg_until = now + 4000;
+                            moved0 = true;
+                        }
+                        static uint64_t t_enter;
+                        if ((is_near0 || moved0) && now - t_enter > 5000) {
+                            t_enter = now;
+                            *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE8) = 2;
+                            logf("coop: level part: part %d here, part %d loaded (slot %d) - entering it as the partner did (+0x5AE8 = 2)", cur0, cur0 + 1, nx);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+    }
+    if (g_cp_peer_sec <= g_cp_sec) return;
     if (now - g_cp_moved_ms < 500) return;
     // playtest #7 (owner: "one time the host was in the void"): switching parts drops the oldest part - a player still
     // standing in it floats in the void. Two-PC play 20261115 #5: the partner went ahead into the next part, so ours
@@ -5065,26 +5135,41 @@ static void coop_part_step()
     if (W < 0x80000000 || W >= 0x84000000) return;
     int32_t cur = *(volatile int32_t *)(uintptr_t)(W + 0x5AF0);
     uint32_t state = *(volatile uint32_t *)(uintptr_t)(W + 0x5AE0), flag = *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8);
-    int ready = -1; uint32_t sd[2][3] = {};
+    // mission 3 (20261115 #6): both slots kept +0x38 = 1 for 90 s with part 2 loaded (0x1C) - the old "ready" (+0x38 == 0,
+    // FUN_001C7620's condition for request 2) never came and the joiner was never moved. FUN_001B73B0 (the other area
+    // trigger kind) advances with request 1 and no slot test (current == target - 1, not the last part). Ready = the
+    // next part loaded in a slot and no slot loading (state 3); the request = 2 when its +0x38 is 0, else 1.
+    int ready = -1; bool loading = false; uint32_t sd[2][3] = {};
     for (int k = 0; k < 2; k++) {
         uint32_t sl = W + 0x49D0 + k * 0x880;
         sd[k][0] = *(volatile uint32_t *)(uintptr_t)sl; sd[k][1] = *(volatile uint32_t *)(uintptr_t)(sl + 8);
         sd[k][2] = *(volatile uint8_t *)(uintptr_t)(sl + 0x38);
-        if ((int32_t)sd[k][1] == cur + 1 && sd[k][2] == 0) ready = k;
+        if (sd[k][0] != 0x1C) loading = true;
+        if ((int32_t)sd[k][1] == cur + 1 && sd[k][0] == 0x1C) ready = k;
     }
+    uint32_t parts = 0;
+    {
+        uint32_t pd = 0; uint8_t cnt = 0;
+        if (coop_safe_copy(&pd, W + 0x5AF4, 4) && pd >= 0x80000000 && pd < 0x84000000 && coop_safe_copy(&cnt, pd + 0x11, 1)) parts = cnt;
+    }
+    if (loading || (parts && cur >= (int32_t)parts)) ready = -1;
+    uint32_t req = ready >= 0 && sd[ready][2] == 0 ? 2u : 1u;
     if (state == 0x1C && flag == 0 && ready >= 0 && !is_near && !moved_recently && !g_coop_downed && g_coop_host_pawn_ok) {
-        logf("coop: level part: the partner is at section %u, we at %u and far from them - teleported to the partner before the switch", g_cp_peer_sec, g_cp_sec);
+        logf("coop: level part: the partner is at section %u, we at %u and far from them - teleported to the partner, switching to part %d (+0x5AE8 = %u)",
+             g_cp_peer_sec, g_cp_sec, cur + 1, req);
         coop_respawn_at(pfeet, g_coop_host_yaw, false);
         g_cp_moved_ms = now;
         strncpy(g_coop_info_msg, "GETTING TOO FAR - TELEPORTED TO YOUR PARTNER", sizeof g_coop_info_msg - 1);
         g_coop_info_msg_until = now + 4000;
-        return;   // the switch follows half a second later (moved_recently)
-    }
-    if (state == 0x1C && flag == 0 && ready >= 0) {
-        *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8) = 2;
+        *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8) = req;   // the switch in the same frame (the next part is loaded)
         t_req = now; req_for = g_cp_sec;
-        logf("coop: level part: the partner is at section %u, we at %u -> part %d streamed in (slot %d) - switching to it here (+0x5AE8 = 2)",
-             g_cp_peer_sec, g_cp_sec, cur + 1, ready);
+        return;
+    }
+    if (state == 0x1C && flag == 0 && ready >= 0 && (is_near || moved_recently)) {
+        *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8) = req;
+        t_req = now; req_for = g_cp_sec;
+        logf("coop: level part: the partner is at section %u, we at %u -> part %d loaded (slot %d) - switching to it here (+0x5AE8 = %u)",
+             g_cp_peer_sec, g_cp_sec, cur + 1, ready, req);
         return;
     }
     if (now - t_log > 2000) {
@@ -5239,6 +5324,7 @@ static void coop_checkpoint_section()
     g_part_ms = GetTickCount64();
     {
         uint32_t W = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+        if (W >= 0x80000000 && W < 0x84000000) g_cp_part = *(volatile int32_t *)(uintptr_t)(W + 0x5AF0);
         if (W >= 0x80000000 && W < 0x84000000)
             logf("coop: level part: section %u here - world part %d, request %u", g_cp_sec + 0, *(volatile int32_t *)(uintptr_t)(W + 0x5AF0), *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8));
     }
@@ -5287,7 +5373,7 @@ extern "C" void coop_level_prepare(uint32_t obj)
         coop_clone_state_reset();
         g_pawncap_n = 0;
         coop_enid_reset();
-        g_cp_sec = 0; g_cp_peer_sec = 0;   // checkpoint section numbers start again
+        g_cp_sec = 0; g_cp_peer_sec = 0; g_cp_part = -1;   // checkpoint section numbers start again
         // rc1: the trigger / spawn sync tables stayed indexed (same table pointer 0x2D45D0) -> the joiner's
         // level-start triggers (the intro script) and its first spawns were held as requests to the host,
         // which was still in its intro: the intro message came 15 s late and spawn #3/#4 (the clone's chained
@@ -5322,7 +5408,7 @@ extern "C" void coop_level_prepare(uint32_t obj)
         }
         g_pawncap_n = 0;
         coop_enid_reset();          // enemy identity: spawn-point counters and ids start fresh in every level
-        g_cp_sec = 0; g_cp_peer_sec = 0;   // checkpoint section numbers start again
+        g_cp_sec = 0; g_cp_peer_sec = 0; g_cp_part = -1;   // checkpoint section numbers start again
     }
 
     uint32_t size = (cnt + 1) * 0x1D0;
