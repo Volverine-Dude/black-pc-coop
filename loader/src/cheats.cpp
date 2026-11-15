@@ -323,8 +323,11 @@ void cheats_apply()
     if (g_unlock_ok)
         for (const Bytes &b : kUnlock) nop_or_restore(b, g_cfg.cheat_unlock);
     g_cheat_unlock_on = g_unlock_ok && g_cfg.cheat_unlock ? 1 : 0;
-    g_cheat_god = g_god_ok && g_cfg.cheat_god ? 1 : 0;
-    g_cheat_ammo_on = g_ammo_ok && g_cfg.cheat_ammo ? 1 : 0;
+    // co-op merge (owner: 0.4.0's solo features stay out of co-op): god / ammo / damage are off in a co-op session
+    // (coop/coop.cpp calls this again when a session starts and ends); the unlock only touches the menus
+    bool solo = !g_cfg.coop_role;
+    g_cheat_god = solo && g_god_ok && g_cfg.cheat_god ? 1 : 0;
+    g_cheat_ammo_on = solo && g_ammo_ok && g_cfg.cheat_ammo ? 1 : 0;
     static const float kMult[] = {1.0f, 2.0f, 4.0f, 1.0e6f};
-    g_cheat_damage = kMult[g_cfg.cheat_damage >= 0 && g_cfg.cheat_damage < 4 ? g_cfg.cheat_damage : 0];
+    g_cheat_damage = kMult[solo && g_cfg.cheat_damage >= 0 && g_cfg.cheat_damage < 4 ? g_cfg.cheat_damage : 0];
 }

@@ -6,3 +6,4 @@
 // Once per pad poll on the game thread, with the Xbox pad state the game gets and whether Enter is held.
 void movies_poll(uint16_t buttons, const uint8_t analog[8], bool enter);
 bool movie_playing(); // a movie that does not loop is playing (the menus' backgrounds loop)
+bool movies_playing(); // a movie plays (briefings, cinematics)

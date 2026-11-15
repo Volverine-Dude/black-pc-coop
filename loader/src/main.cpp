@@ -7,6 +7,7 @@
 #include "d3d/dispatch.h"
 #include "fe/calls.h"
 #include "fe/pages.h"
+#include "region_grow.h"
 #include "bigbuf.h"
 #include "fov.h"
 #include "hooks.h"
@@ -15,6 +16,7 @@
 #include "timing.h"
 #include "settings.h"
 #include "input/autoaim.h"
+#include "coop/coop.h"
 #include "input/lean.h"
 #include "input/mouselook.h"
 #include "kernel/ktable.h"
@@ -107,6 +109,7 @@ void usage()
            "  --autoaim         the game's auto-aim (the view pulling toward enemies), off by default; --no-autoaim\n"
            "  --sprint          run 1.25x as fast while the Sprint key (Left Shift) is held (default off; PC SETTINGS > CONTROLS); --no-sprint\n"
            "  --lean-angle D    tactical lean: view roll at full lean in degrees (default 10); --lean-offset M: eye shift (0.35; PC SETTINGS > TWEAKS)\n"
+           "  --coop-send H:P   co-op bridge (coop/coop.cpp): send the player state as a UDP packet to HOST:PORT each player update; --no-coop-log silences its log lines\n"
            "  --no-reload-blur  no screen blur while reloading (default: on, as the original); --reload-blur\n"
            "  --fast-menus      menu animations twice as fast (60 fps only; default off); --no-fast-menus\n"
            "  --cheat NAME      unlock (all missions), god, ammo (no ammo used), x2, x4, onehit (damage to enemies)\n"
@@ -119,6 +122,7 @@ void usage()
            "  --no-aa           no anti-aliasing (default: edge-directed post filter; F9 toggles)\n"
            "  --no-seamfill     do not fill hairline cracks between geometry pieces (destructible walls)\n"
            "  --perf-at S:D     record performance for D seconds from S seconds after the first frame (perf\\)\n"
+           "  --no-shader-cache compile shaders at first use every session (default: keep them in shadercache\\)\n"
            "  --timer-vblank    vblank from a 59.94 Hz timer instead of the display's refresh (default: follow a ~60 Hz display)\n"
            "  --force           run an XBE other than the known NTSC-U build\n"
            "  --buf-mb N        weapon-data buffers of N MB for modded weapon files (default 0 = the original 0.88 MB)\n"
@@ -179,6 +183,44 @@ bool parse_args()
             std::wstring v;
             if (!next(v) || g_cfg.probe_count >= 16) return false;
             g_cfg.probe[g_cfg.probe_count++] = (uint32_t)wcstoul(v.c_str(), nullptr, 16);
+        } else if (a == L"--probe-eax") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.probe_eax = (uint32_t)wcstoul(v.c_str(), nullptr, 16);
+        } else if (a == L"--enemy-test-clone") {
+            g_cfg.enemy_test_clone = true;
+        } else if (a == L"--coop-role") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.coop_role = v == L"host" ? 1 : v == L"joiner" ? 2 : 0;
+        } else if (a == L"--no-shader-cache") {
+            g_cfg.no_shader_cache = true;
+        } else if (a == L"--shot-test-npc") {
+            g_cfg.shot_test_npc = true;
+        } else if (a == L"--hit-test-death") {
+            g_cfg.hit_test_death = true;
+        } else if (a == L"--coop-downed") {
+            g_cfg.coop_downed = true;
+        } else if (a == L"--downed-at") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.downed_at = _wtoi(v.c_str());
+        } else if (a == L"--skip-caller") {
+            if (!next(g_cfg.skip_caller)) return false;
+        } else if (a == L"--msg-test") {
+            g_cfg.msg_test = true;
+        } else if (a == L"--role-label") {
+            g_cfg.role_label = true;
+        } else if (a == L"--hide-test") {
+            g_cfg.hide_test = true;
+        } else if (a == L"--as-log") {
+            g_cfg.as_log = true;
+        } else if (a == L"--xd-test") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.xd_test = _wtoi(v.c_str());
+        } else if (a == L"--downed-via-explosion") {
+            g_cfg.downed_via_explosion = true;
         }
         else if (a == L"--strict") g_cfg.strict = true;
         else if (a == L"--multicore") g_cfg.multicore = true;
@@ -264,6 +306,51 @@ bool parse_args()
                 settings_mark_cli("cheat_damage");
             } else fprintf(stderr, "unknown --cheat %ls\n", v.c_str());
         }
+        else if (a == L"--pawn-on") g_cfg.pawn_cap = true;
+        else if (a == L"--p13-on") g_cfg.p13_redirect = true;
+        else if (a == L"--p13-park") g_cfg.p13_park = true;
+        else if (a == L"--no-pc-pad") g_cfg.no_pc_pad = true;
+        else if (a == L"--no-markers") g_cfg.no_markers = true;
+        else if (a == L"--p13-face") g_cfg.p13_face = true;
+        else if (a == L"--bone-scan") g_cfg.bone_scan = true;
+        else if (a == L"--skin-hook") g_cfg.skin_hook = true;
+        else if (a == L"--helmet-scan") g_cfg.helmet_scan = true;
+        else if (a == L"--bend-at-draw") g_cfg.bend_at_draw = true;
+        else if (a == L"--rec4-test") g_cfg.rec4_test = true;
+        else if (a == L"--rec-probe") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.rec_probe = _wtoi(v.c_str());
+        }
+        else if (a == L"--palette-test") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.palette_vs = (uint32_t)wcstoul(v.c_str(), nullptr, 16);
+        }
+        else if (a == L"--skin-bones") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.skin_bones = (uint32_t)wcstoul(v.c_str(), nullptr, 16);
+        }
+        else if (a == L"--aim-test") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.aim_test_deg = (float)_wtof(v.c_str());
+        } else if (a == L"--aim-rec") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.aim_test_rec = _wtoi(v.c_str());
+        }
+        else if (a == L"--no-coop") g_cfg.coop_off = true;
+        else if (a == L"--coop-log") g_cfg.coop_log = true;
+        else if (a == L"--no-coop-log") g_cfg.coop_log = false;
+        else if (a == L"--coop-clone") g_cfg.coop_clone = true;
+        else if (a == L"--coop-listen") {
+            std::wstring v;
+            if (!next(v)) return false;
+            g_cfg.coop_listen_port = _wtoi(v.c_str());
+        }
+        else if (a == L"--coop-send") { if (!next(g_cfg.coop_send)) return false; }
         else if (a == L"--fov") {
             settings_mark_cli("fov");
             std::wstring v;
@@ -440,7 +527,7 @@ void pin_to_one_cpu()
 void request_exit(int code, const char *why)
 {
     int expected = -1;
-    if (g_exit_code.compare_exchange_strong(expected, code)) logc("exit requested: %s (code %d)", why, code);
+    if (g_exit_code.compare_exchange_strong(expected, code)) { logc("exit requested: %s (code %d)", why, code); coop_on_exit(); }
     if (g_exit_event) SetEvent(g_exit_event);
 }
 
@@ -564,8 +651,10 @@ int run(void *reserve, unsigned reserve_size)
     if (supported_build) install_inspect_patch();
     if (supported_build) install_settings_autosave_patch();
     if (supported_build) install_hud_widescreen_patch();
+    if (supported_build) install_coop_module();
     if (supported_build) install_fov_patch();
     if (supported_build) install_bigbuf_patch();
+    if (supported_build) install_region_grow_patch();   // 0.4.0 + co-op: the front end's region (region_grow.cpp)
     if (supported_build) install_fe_calls();
     menu_mouse::install();
     if (supported_build && g_cfg.pc_menus) { // the in-game PC SETTINGS pages, from the user's own front-end file

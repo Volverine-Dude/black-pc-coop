@@ -30,7 +30,9 @@ add_library(blackrt SHARED
   src/cheats.cpp
   src/checkpoints.cpp
   src/bigbuf.cpp
+  src/region_grow.cpp
   src/fe/calls.cpp
+  src/fe/coop_menu.cpp
   src/fe/vars.cpp
   src/fe/pc_settings.cpp
   src/fe/menu_speed.cpp
@@ -47,6 +49,8 @@ add_library(blackrt SHARED
   src/input/menu_mouse.cpp
   src/input/bindings.cpp
   src/input/movies.cpp
+  src/coop/coop.cpp
+  src/coop/coop_joiner_perception.cpp
   src/audio/reverb.cpp
   src/settings.cpp
   src/language.cpp
@@ -73,6 +77,7 @@ add_library(blackrt SHARED
   src/d3d/nv2a_psh.cpp
   src/d3d/pshader.cpp
   src/d3d/compiler.cpp
+  src/d3d/shader_cache.cpp
   src/audio/dsound.cpp
   src/audio/output.cpp
   src/input/xinput.cpp
@@ -81,7 +86,7 @@ target_include_directories(blackrt PRIVATE src)
 target_compile_definitions(blackrt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS UNICODE _UNICODE
   BLACK_VERSION="${PROJECT_VERSION}")
 target_compile_options(blackrt PRIVATE /W3 /utf-8 /EHsc)
-target_link_libraries(blackrt PRIVATE ntdll bcrypt d3d9 windowscodecs ole32 user32 gdi32 winmm dbghelp advapi32 shell32)
+target_link_libraries(blackrt PRIVATE ntdll bcrypt d3d9 windowscodecs ole32 user32 gdi32 winmm dbghelp advapi32 shell32 ws2_32)
 # Xbox SEH handlers run through the same fs:[0] chain; no SafeSEH tables anywhere in the process.
 # Full links, unused code dropped: an incremental link kept the import of a function no longer called (BCryptHash,
 # Windows 10 only), and the DLL must load on Windows 8 (every import has to exist there).

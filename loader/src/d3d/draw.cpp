@@ -12,12 +12,16 @@
 #include "d3d/vshader.h"
 #include "fov.h"
 #include "perf.h"
+#include "coop/coop.h"
+#include <cmath>
+#include <cstdio>
 
 #include <wincodec.h>
 
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 namespace xd3d {
 
@@ -182,6 +186,8 @@ void init_default_states()
 }
 
 // ---- state application ----
+
+extern "C" volatile uint8_t g_fov_viewmodel; // fov.cpp: set while the first-person gun list draws
 
 namespace {
 
@@ -601,8 +607,143 @@ void linear_texture_scale(int stage, float *sx, float *sy)
 // All 200 registers on every draw (~1.3 ms a frame in busy scenes). Sending only the registers that changed
 // since the last upload broke the picture: the device then held values that were never sent to those
 // registers (seen with GetVertexShaderConstantF), not explained by the shaders' def constants; not solved yet.
+// --bone-scan (black-coop arm aim): find the co-op clone's skinning bones at DRAW time.
+// The game fills the D3D shadow (0x27C2A8) itself; scan the 192 registers for bone-like
+// groups whose translation lies within 2.5 m of the clone's world position:
+//   L43: 3 consecutive regs with unit xyz rows, translation in .w (4x3 row-major)
+//   L44: 4 consecutive regs, rows 0-2 unit xyz, translation in reg 3 .xyz (4x4)
+// First matching draw: dump all 192 regs once; then a compact summary every ~2 s.
+static void bone_scan(void)
+{
+    if (!g_cfg.bone_scan || !g_coop_clone_on) return;
+    const float (*c)[4] = g_st.vs_constants;
+    float px = g_coop_clone_pos[0], py = g_coop_clone_pos[1], pz = g_coop_clone_pos[2];
+    auto unit = [](const float *v) { float n = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]; return n > 0.9f && n < 1.1f; };
+    auto near_clone = [&](float x, float y, float z) { return fabsf(x - px) < 2.5f && fabsf(y - py) < 3.0f && fabsf(z - pz) < 2.5f; };
+    char hits[400]; int w = 0, n43 = 0, n44 = 0, first = -1;
+    for (int r = 0; r + 2 < 192 && w < 360; r++) {
+        if (unit(c[r]) && unit(c[r + 1]) && unit(c[r + 2])) {
+            if (near_clone(c[r][3], c[r + 1][3], c[r + 2][3])) { n43++; if (first < 0) first = r; w += snprintf(hits + w, sizeof hits - w, " 43@%d", r); }
+            else if (r + 3 < 192 && near_clone(c[r + 3][0], c[r + 3][1], c[r + 3][2])) { n44++; if (first < 0) first = r; w += snprintf(hits + w, sizeof hits - w, " 44@%d", r); }
+        }
+    }
+    // ROUND 3 (owner: "compare draws"): per-draw REGISTER DIFF for one whole frame,
+    // ~10 s after the clone went live (parked in view). For every draw: which register
+    // ranges changed since the previous draw + the VS handle; a skin palette changes per
+    // character. Also the first 3 changed registers' values for offline analysis.
+    {
+        static uint32_t live_since, diff_frame;
+        static float prev[192][4];
+        uint32_t frd = g_frame_count.load();
+        if (!live_since) live_since = frd;
+        if (!diff_frame && frd - live_since >= 660) diff_frame = frd + 1;   // a full frame
+        if (diff_frame && frd == diff_frame) {
+            char rng[300]; int rw = 0, a = -1, nch = 0, shown = 0;
+            char vals[300]; int vw = 0;
+            for (int r = 0; r <= 192; r++) {
+                bool ch = r < 192 && memcmp(c[r], prev[r], 16) != 0;
+                if (ch) {
+                    nch++;
+                    if (a < 0) a = r;
+                    if (shown < 3 && vw < 250) { vw += snprintf(vals + vw, sizeof vals - vw, " c%d(%+.2f %+.2f %+.2f %+.2f)", r, c[r][0], c[r][1], c[r][2], c[r][3]); shown++; }
+                } else if (a >= 0) {
+                    if (rw < 270) rw += snprintf(rng + rw, sizeof rng - rw, " %d-%d", a, r - 1);
+                    a = -1;
+                }
+            }
+            if (nch)
+                logf("bonediff: frame %u draw %u vs %08x changed %d:%s |%s", frd, g_st.draws, g_st.vertex_shader, nch, rw ? rng : " -", vals);
+            memcpy(prev, c, sizeof prev);
+        } else if (diff_frame && frd == diff_frame - 1) {
+            memcpy(prev, c, sizeof prev);   // baseline = the last draw of the previous frame
+        }
+    }
+    // bscan78: ZERO world-space hits -> also census MODEL-space bone groups (unit rows,
+    // |t| < 2 m) for every draw of ONE frame (~95 s into a run is not needed: the first
+    // frame after the clone is live), logging draws with >= 6 such groups.
+    {
+        static uint32_t census_frame;
+        uint32_t frc = g_frame_count.load();
+        if (!census_frame) census_frame = frc + 60;            // one frame, 1 s after the clone is live
+        if (frc == census_frame) {
+            int nl = 0, fl = -1;
+            for (int r = 0; r + 2 < 192; r++)
+                if (unit(c[r]) && unit(c[r + 1]) && unit(c[r + 2]) &&
+                    fabsf(c[r][3]) < 2.0f && fabsf(c[r + 1][3]) < 2.0f && fabsf(c[r + 2][3]) < 2.0f) {
+                    nl++; if (fl < 0) fl = r; r += 2;            // non-overlapping groups
+                }
+            if (nl >= 6)
+                logf("bonescan: census frame %u draw %u vs %08x local-bone groups %d from c%d | c0 %+.2f %+.2f %+.2f %+.2f | c3 %+.2f %+.2f %+.2f %+.2f",
+                     frc, g_st.draws, g_st.vertex_shader, nl, fl, c[0][0], c[0][1], c[0][2], c[0][3], c[3][0], c[3][1], c[3][2], c[3][3]);
+        }
+    }
+    if (!n43 && !n44) return;
+    static int dumped;
+    static uint32_t lastlog;
+    uint32_t fr = g_frame_count.load();
+    if (!dumped) {
+        dumped = 1;
+        logf("bonescan: FIRST clone-like draw: frame %u vs %08x clone %.1f %.1f %.1f hits:%s", fr, g_st.vertex_shader, px, py, pz, hits);
+        for (int r = 0; r < 192; r++)
+            logf("bonescan: c%03d %+9.3f %+9.3f %+9.3f %+9.3f", r, c[r][0], c[r][1], c[r][2], c[r][3]);
+    } else if (fr - lastlog >= 120) {
+        lastlog = fr;
+        logf("bonescan: frame %u vs %08x draws %u | 4x3 %d 4x4 %d first r%d |%s", fr, g_st.vertex_shader, g_st.draws, n43, n44, first, hits);
+    }
+}
+
+// --helmet-scan (black-coop: the floating helmet): coop's skin hook raises
+// g_coop_skin_mark when it bends the CLONE's bones; the next upload is the clone's body
+// draw. Log the 8 draws before it, that draw, and the 8 after (draw#, VS, c10..c13 =
+// model->clip rows, translation in .w) - twice per run. Offline: project each draw's
+// origin and match the one sitting on the body's head point = the helmet draw.
+static void helmet_scan(void)
+{
+    if (!g_cfg.helmet_scan) return;
+    struct Snap { uint32_t draw, vs; float m[4][4]; };
+    static Snap ring[8]; static int rpos, after = -1, shots;
+    const float (*c)[4] = g_st.vs_constants;
+    Snap cur; cur.draw = g_st.draws; cur.vs = g_st.vertex_shader; memcpy(cur.m, c[10], sizeof cur.m);
+    auto put = [](const char *tag, const Snap &s) {
+        logf("helmetscan: %s draw %u vs %08x | c10 %+.3f %+.3f %+.3f %+.3f | c11 %+.3f %+.3f %+.3f %+.3f | c12 %+.3f %+.3f %+.3f %+.3f | c13 %+.3f %+.3f %+.3f %+.3f",
+             tag, s.draw, s.vs, s.m[0][0], s.m[0][1], s.m[0][2], s.m[0][3], s.m[1][0], s.m[1][1], s.m[1][2], s.m[1][3],
+             s.m[2][0], s.m[2][1], s.m[2][2], s.m[2][3], s.m[3][0], s.m[3][1], s.m[3][2], s.m[3][3]);
+    };
+    if (after >= 0) {
+        put("AFTER", cur);
+        if (++after >= 8) after = -1;
+    } else if (g_coop_skin_mark && shots < 2) {
+        g_coop_skin_mark = 0;
+        shots++;
+        logf("helmetscan: ===== clone body draw (shot %d) =====", shots);
+        for (int i = 0; i < 8; i++) put("BEFORE", ring[(rpos + i) % 8]);
+        put("BODY", cur);
+        after = 0;
+    }
+    ring[rpos] = cur; rpos = (rpos + 1) % 8;
+}
+
 void upload_vs_constants(IDirect3DDevice9 *d)
 {
+    bone_scan();
+    if (g_coop_skin_mark == 2) {   // COOP_GUN_MARK: the clone body draw -> keep its model->clip rows
+        memcpy((void *)g_clone_mvp, g_st.vs_constants[10], 64);
+        g_clone_mvp_ok = 1;
+        g_coop_skin_mark = 0;
+    }
+    helmet_scan();
+    // --palette-test <vs>: decisive check (black-coop arm aim, bend84-86 had no visible
+    // effect): for draws with that VS handle upload a COPY with +0.5 on the .w lane of
+    // c66..c134 (the bdiff80 bone palette). Visible tearing = these registers drive the
+    // soldier mesh; nothing = they do not.
+    if (g_cfg.palette_vs && g_st.vertex_shader == g_cfg.palette_vs) {
+        static float tmp[192][4];
+        memcpy(tmp, g_st.vs_constants, sizeof tmp);
+        for (int r = 66; r <= 134; r++) tmp[r][3] += 0.5f;
+        d->SetVertexShaderConstantF(0, &tmp[0][0], 192);
+        static uint32_t pn;
+        if ((pn++ % 600) == 0) logf("palette-test: draw %u vs %08x c66..c134 .w += 0.5", g_st.draws, g_st.vertex_shader);
+    } else
     d->SetVertexShaderConstantF(0, &g_st.vs_constants[0][0], 192);
     float k[36] = {};
     host_viewport_transform(k, k + 4);
@@ -622,7 +763,16 @@ void upload_vs_constants(IDirect3DDevice9 *d)
     default: k[31] = 1.0f; break;
     }
     k[32] = k[33] = fov_viewmodel_scale(); // c200: the first-person gun keeps the game's FOV
-    k[34] = k[35] = 1.0f;
+    // c200.zw: a clip-space shift of the first-person gun (x right, y up, times w): co-op SPRINT lowers it (owner 20261115)
+    k[34] = k[35] = 0.0f;
+    {
+        float b = g_coop_sprint_blend;
+        if (g_fov_viewmodel && b > 0.0f) {
+            b = b * b * (3.0f - 2.0f * b);
+            k[34] = 0.10f * b;
+            k[35] = -0.38f * b;
+        }
+    }
     d->SetVertexShaderConstantF(192, k, 9);
 }
 
@@ -660,7 +810,7 @@ std::string game_callers(const uint32_t *sp)
     const uint32_t *top = (const uint32_t *)((NT_TIB *)NtCurrentTeb())->StackBase;
     std::string out;
     int found = 0;
-    for (const uint32_t *p = sp; p < top && p < sp + 0x800 && found < 5; p++) {
+    for (const uint32_t *p = sp; p < top && p < sp + 0x800 && found < 10; p++) {   // 10 deep: frame drivers sit ~8 levels up
         uint32_t v = *p;
         if (v < 0x00011005 || v >= xbe_va(0x00269000)) continue; // game code (.text and the libraries before D3D)
         const uint8_t *c = (const uint8_t *)(uintptr_t)v;
@@ -670,6 +820,91 @@ std::string game_callers(const uint32_t *sp)
         out += (found++ ? " < " : "") + sym_name(v);
     }
     return out;
+}
+
+// --debug-frame: save a host texture (level 0, alpha kept) as PNG - used to dump the HUD's
+// textures (font atlas hunt). Managed-pool textures lock directly; DXT1/3/5 are decoded.
+static void dxt_block(const uint8_t *b, int kind, uint32_t out[16])
+{
+    const uint8_t *cb = kind == 1 ? b : b + 8;
+    uint16_t c0 = cb[0] | (cb[1] << 8), c1 = cb[2] | (cb[3] << 8);
+    uint32_t col[4];
+    auto exp = [](uint16_t c, int &r, int &g, int &bb) { r = (c >> 11) * 255 / 31; g = ((c >> 5) & 63) * 255 / 63; bb = (c & 31) * 255 / 31; };
+    int r0, g0, b0, r1, g1, b1; exp(c0, r0, g0, b0); exp(c1, r1, g1, b1);
+    col[0] = 0xFF000000 | (r0 << 16) | (g0 << 8) | b0;
+    col[1] = 0xFF000000 | (r1 << 16) | (g1 << 8) | b1;
+    if (kind != 1 || c0 > c1) {
+        col[2] = 0xFF000000 | (((2 * r0 + r1) / 3) << 16) | (((2 * g0 + g1) / 3) << 8) | ((2 * b0 + b1) / 3);
+        col[3] = 0xFF000000 | (((r0 + 2 * r1) / 3) << 16) | (((g0 + 2 * g1) / 3) << 8) | ((b0 + 2 * b1) / 3);
+    } else {
+        col[2] = 0xFF000000 | (((r0 + r1) / 2) << 16) | (((g0 + g1) / 2) << 8) | ((b0 + b1) / 2);
+        col[3] = 0;
+    }
+    uint32_t idx = cb[4] | (cb[5] << 8) | (cb[6] << 16) | ((uint32_t)cb[7] << 24);
+    for (int i = 0; i < 16; i++) out[i] = col[(idx >> (2 * i)) & 3];
+    if (kind == 3) for (int i = 0; i < 16; i++) { uint32_t a = (b[i / 2] >> ((i & 1) * 4)) & 15; out[i] = (out[i] & 0xFFFFFF) | ((a * 17) << 24); }
+    if (kind == 5) {
+        uint8_t a0 = b[0], a1 = b[1]; uint8_t av[8] = {a0, a1};
+        if (a0 > a1) for (int i = 1; i < 7; i++) av[i + 1] = (uint8_t)(((7 - i) * a0 + i * a1) / 7);
+        else { for (int i = 1; i < 5; i++) av[i + 1] = (uint8_t)(((5 - i) * a0 + i * a1) / 5); av[6] = 0; av[7] = 255; }
+        uint64_t bits = 0; for (int i = 0; i < 6; i++) bits |= (uint64_t)b[2 + i] << (8 * i);
+        for (int i = 0; i < 16; i++) out[i] = (out[i] & 0xFFFFFF) | ((uint32_t)av[(bits >> (3 * i)) & 7] << 24);
+    }
+}
+static bool save_texture_png(IDirect3DBaseTexture9 *bt, const wchar_t *path)
+{
+    if (!bt || bt->GetType() != D3DRTYPE_TEXTURE) return false;
+    IDirect3DTexture9 *t = (IDirect3DTexture9 *)bt;
+    D3DSURFACE_DESC dd;
+    if (FAILED(t->GetLevelDesc(0, &dd))) return false;
+    D3DLOCKED_RECT lr;
+    if (FAILED(t->LockRect(0, &lr, nullptr, D3DLOCK_READONLY))) return false;
+    UINT w = dd.Width, h = dd.Height;
+    std::vector<uint32_t> px((size_t)w * h, 0);
+    const uint8_t *src = (const uint8_t *)lr.pBits;
+    bool ok = true;
+    switch (dd.Format) {
+    case D3DFMT_A8R8G8B8: case D3DFMT_X8R8G8B8:
+        for (UINT y = 0; y < h; y++) memcpy(&px[(size_t)y * w], src + y * lr.Pitch, w * 4);
+        if (dd.Format == D3DFMT_X8R8G8B8) for (auto &v : px) v |= 0xFF000000;
+        break;
+    case D3DFMT_A8: for (UINT y = 0; y < h; y++) for (UINT x = 0; x < w; x++) px[y * w + x] = ((uint32_t)src[y * lr.Pitch + x] << 24) | 0xFFFFFF; break;
+    case D3DFMT_L8: for (UINT y = 0; y < h; y++) for (UINT x = 0; x < w; x++) { uint32_t l = src[y * lr.Pitch + x]; px[y * w + x] = 0xFF000000 | l * 0x010101; } break;
+    case D3DFMT_A8L8: for (UINT y = 0; y < h; y++) for (UINT x = 0; x < w; x++) { uint32_t l = src[y * lr.Pitch + 2 * x], a = src[y * lr.Pitch + 2 * x + 1]; px[y * w + x] = (a << 24) | l * 0x010101; } break;
+    case D3DFMT_A4R4G4B4: for (UINT y = 0; y < h; y++) for (UINT x = 0; x < w; x++) { uint16_t v = *(const uint16_t *)(src + y * lr.Pitch + 2 * x); px[y * w + x] = ((uint32_t)((v >> 12) * 17) << 24) | (((v >> 8) & 15) * 17 << 16) | (((v >> 4) & 15) * 17 << 8) | ((v & 15) * 17); } break;
+    case D3DFMT_DXT1: case D3DFMT_DXT2: case D3DFMT_DXT3: case D3DFMT_DXT4: case D3DFMT_DXT5: {
+        int kind = dd.Format == D3DFMT_DXT1 ? 1 : (dd.Format == D3DFMT_DXT2 || dd.Format == D3DFMT_DXT3) ? 3 : 5;
+        int bs = kind == 1 ? 8 : 16;
+        for (UINT by = 0; by < (h + 3) / 4; by++)
+            for (UINT bx = 0; bx < (w + 3) / 4; bx++) {
+                uint32_t blk[16]; dxt_block(src + by * lr.Pitch + bx * bs, kind, blk);
+                for (int i = 0; i < 16; i++) { UINT x = bx * 4 + (i & 3), y = by * 4 + (i >> 2); if (x < w && y < h) px[y * w + x] = blk[i]; }
+            }
+        break; }
+    default: ok = false; logf("[draw] texture dump: format %u not handled", (unsigned)dd.Format);
+    }
+    t->UnlockRect(0);
+    if (!ok) return false;
+    // composite over a dark purple so white-on-alpha glyphs are visible in a viewer
+    for (auto &v : px) {
+        uint32_t al = v >> 24;
+        auto mix = [&](int sh, uint32_t bg) { return ((((v >> sh) & 255) * al + bg * (255 - al)) / 255) << sh; };
+        v = 0xFF000000 | mix(16, 40) | mix(8, 0) | mix(0, 60);
+    }
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    IWICImagingFactory *f = nullptr; IWICStream *st = nullptr; IWICBitmapEncoder *enc = nullptr; IWICBitmapFrameEncode *fr = nullptr;
+    bool done = false;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&f))) &&
+        SUCCEEDED(f->CreateStream(&st)) && SUCCEEDED(st->InitializeFromFilename(path, GENERIC_WRITE)) &&
+        SUCCEEDED(f->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+        SUCCEEDED(enc->Initialize(st, WICBitmapEncoderNoCache)) && SUCCEEDED(enc->CreateNewFrame(&fr, nullptr)) &&
+        SUCCEEDED(fr->Initialize(nullptr)) && SUCCEEDED(fr->SetSize(w, h))) {
+        WICPixelFormatGUID pf = GUID_WICPixelFormat32bppBGRA;
+        fr->SetPixelFormat(&pf);
+        done = SUCCEEDED(fr->WritePixels(h, w * 4, (UINT)(px.size() * 4), (BYTE *)px.data())) && SUCCEEDED(fr->Commit()) && SUCCEEDED(enc->Commit());
+    }
+    if (fr) fr->Release(); if (enc) enc->Release(); if (st) st->Release(); if (f) f->Release();
+    return done;
 }
 
 void debug_draw(const char *what, const DrawCtx &ctx, uint32_t prim, uint32_t count, const float *verts, uint32_t stride_floats)
@@ -684,7 +919,23 @@ void debug_draw(const char *what, const DrawCtx &ctx, uint32_t prim, uint32_t co
     const uint32_t *rs = render_state();
     logf("[draw] %s prim %u count %u, %s 0x%x, ps 0x%x, tex0 %p", what, prim, count, ctx.path == Path::Prog ? "vs" : "fvf",
          g_st.vertex_shader, g_st.pixel_shader, g_st.textures[0]);
-    if (this_frame) logf("[draw]   from %s", game_callers((const uint32_t *)_AddressOfReturnAddress()).c_str());
+    if (this_frame) {
+        std::string callers = game_callers((const uint32_t *)_AddressOfReturnAddress());
+        logf("[draw]   from %s", callers.c_str());
+        // HUD draws (UI layer movie, see coop.cpp gates): dump their textures once (font atlas hunt)
+        // (now: every texture bound on the debug frame, the HUD ones tagged "hud")
+        if (g_tex_sent[0] && !g_cfg.screenshot_dir.empty()) {
+            static std::vector<void *> dumped;
+            if (std::find(dumped.begin(), dumped.end(), (void *)g_st.textures[0]) == dumped.end()) {
+                dumped.push_back((void *)g_st.textures[0]);
+                wchar_t name[96];
+                bool hud = callers.find("0x000da507") != std::string::npos || callers.find("0x0013c02f") != std::string::npos;
+                swprintf(name, 96, L"\\%stex_%08x.png", hud ? L"hud" : L"", (unsigned)(uintptr_t)g_st.textures[0]);
+                bool okp = save_texture_png(g_tex_sent[0], (g_cfg.screenshot_dir + name).c_str());
+                logf("[draw]   HUD texture %p -> %s", g_st.textures[0], okp ? "saved" : "not saved");
+            }
+        }
+    }
     logf("[draw]   z %u func 0x%x write %u | blend %u 0x%x/0x%x op 0x%x | atest %u func 0x%x ref %u | cull 0x%x | cwrite 0x%x | stencil %u",
          rs[XRS_ZENABLE], rs[XRS_ZFUNC], rs[XRS_ZWRITEENABLE], rs[XRS_ALPHABLENDENABLE], rs[XRS_SRCBLEND], rs[XRS_DESTBLEND],
          rs[XRS_BLENDOP], rs[XRS_ALPHATESTENABLE], rs[XRS_ALPHAFUNC], rs[XRS_ALPHAREF], rs[XRS_CULLMODE], rs[XRS_COLORWRITEENABLE],
@@ -794,10 +1045,49 @@ void forget_sent_state()
 
 namespace {
 
+// --skip-caller "S:hex,S:hex,...": a test tool to learn which game code draws what on screen.
+// Stage i is active from S_i seconds (after the first draw) until S_{i+1}; while active,
+// draws whose game caller chain (return addresses on the stack, as in game_callers)
+// contains that address are skipped.
+static bool skip_by_caller()
+{
+    static bool parsed;
+    static int n;
+    static double at[16];
+    static uint32_t addr[16];
+    static ULONGLONG t0;
+    if (!parsed) {
+        parsed = true;
+        t0 = GetTickCount64();
+        std::string s = narrow(g_cfg.skip_caller);
+        const char *q = s.c_str();
+        while (*q && n < 16) {
+            double sec = strtod(q, (char **)&q);
+            if (*q != ':') break;
+            q++;
+            addr[n] = (uint32_t)strtoul(q, (char **)&q, 16);
+            at[n++] = sec;
+            if (*q == ',') q++;
+        }
+        logf("[draw] skip-caller: %d stages", n);
+    }
+    if (!n) return false;
+    double t = (GetTickCount64() - t0) / 1000.0;
+    int st = -1;
+    for (int i = 0; i < n; i++) if (t >= at[i]) st = i;
+    if (st < 0) return false;
+    const uint32_t *sp = (const uint32_t *)_AddressOfReturnAddress();
+    const uint32_t *top = (const uint32_t *)((NT_TIB *)NtCurrentTeb())->StackBase;
+    for (const uint32_t *p = sp; p < top && p < sp + 0x800; p++)
+        if (*p == addr[st]) return true;
+    return false;
+}
+
 bool begin_draw(DrawCtx &ctx)
 {
     IDirect3DDevice9 *d = host3d::dev();
     if (!d) return false;
+    if (!g_cfg.skip_caller.empty() && skip_by_caller()) return false;
     g_draw_serial++;
     apply_render_states(d);
     bool ps = g_st.pixel_shader != 0;

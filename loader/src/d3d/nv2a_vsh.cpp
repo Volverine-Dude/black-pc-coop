@@ -333,6 +333,7 @@ std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_
          "  o.pos.w = w;\n"
          "  o.pos.xyz = (oPos.xyz - vpOffset.xyz) / vpScale.xyz * w;\n"
          "  o.pos.xy *= vmScale.xy;\n"
+         "  o.pos.xy += vmScale.zw * o.pos.w;\n"   // the first-person gun lowered (co-op sprint; 0 otherwise)
          "  o.d0 = oD0; o.d1 = oD1;\n"
          "  o.t0 = oT0 * float4(texScale[0].xy, 1, 1); o.t1 = oT1 * float4(texScale[1].xy, 1, 1);\n"
          "  o.t2 = oT2 * float4(texScale[2].xy, 1, 1); o.t3 = oT3 * float4(texScale[3].xy, 1, 1);\n"

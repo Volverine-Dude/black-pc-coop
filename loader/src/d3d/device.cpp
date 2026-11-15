@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include "coop/coop.h"
 
 std::atomic<uint32_t> g_frame_count;
 
@@ -1308,6 +1309,528 @@ void check_render_size()
     change_render_scale(w, h);
 }
 
+// Blocky 5x7 pixel font for the DOWNED HUD (rows top->bottom, bits 4..0 = columns
+// left->right). Only the letters the two banners need.
+static const uint8_t *coop_hud_glyph(char c)
+{
+    static const uint8_t
+        A[7] = {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11},
+        D[7] = {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+        E[7] = {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+        I[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F},
+        N[7] = {0x11, 0x19, 0x19, 0x15, 0x13, 0x13, 0x11},
+        O[7] = {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+        P[7] = {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10},
+        R[7] = {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11},
+        S[7] = {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E},
+        T[7] = {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+        V[7] = {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04},
+        W[7] = {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A},
+        X[7] = {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11};
+    switch (c) {
+    case 'A': return A; case 'D': return D; case 'E': return E; case 'I': return I;
+    case 'N': return N; case 'O': return O; case 'P': return P; case 'R': return R;
+    case 'S': return S; case 'T': return T; case 'V': return V; case 'W': return W;
+    case 'X': return X;
+    }
+    return nullptr; // unknown char: skip (space)
+}
+
+// draw a string with the 5x7 font: each glyph cell is 6 px wide (5 + 1 space),
+// consecutive set pixels in a row merge into one ColorFill rect.
+static void coop_hud_text(const char *s, int x, int y, int px, uint32_t argb, const RECT &clip)
+{
+    if (!host3d::dev()) return;
+    for (const char *p = s; *p; p++, x += 6 * px) {
+        const uint8_t *g = coop_hud_glyph(*p);
+        if (!g) continue;
+        for (int row = 0; row < 7; row++) {
+            uint8_t bits = g[row];
+            for (int col = 0; col < 5; col++) {
+                if (!(bits & (0x10 >> col))) continue;
+                int run = 1;
+                while (col + run < 5 && (bits & (0x10 >> (col + run)))) run++;
+                RECT r = {x + col * px, y + row * px, x + (col + run) * px, y + (row + 1) * px};
+                if (r.right > clip.right || r.left < clip.left) break;   // clip both sides
+                host3d::dev()->ColorFill(g_host_backbuffer, &r, argb);
+                col += run - 1;
+            }
+        }
+    }
+}
+
+// ---- The game's own bitmap fonts (game\language\fonts\Big.bin / Small.bin), day 8 ----
+// File layout (reverse-engineered, see NOTES "GAME FONT FILES"): "4.1v", u32 texture offset,
+// 6 header floats, a 128-entry hash table of record offsets (0x1C..0x21B), u32, then glyph
+// records of 0x28 bytes from 0x220 up to the texture: 7 floats {u, v, w, h (normalised),
+// xoff, yoff, advance (x by tex width, y by tex height)}, u32 code (UTF-16), u32, u32. The
+// texture is an Xbox resource header (format dword at +12, data offset at +4): linear
+// DXT3, 128x256 (Small) / 256x256 (Big). Caps only (lowercase records alias the caps).
+// Controller buttons are glyphs: U+00B0 Y, U+00B9 B, U+00B2 A, U+00B3 X.
+struct CoopGlyph {
+    float u, v, w, h, xo, yo, adv;
+};
+struct CoopFont {
+    IDirect3DTexture9 *tex = nullptr;
+    int tw = 0, th = 0;
+    bool tried = false;
+    std::unordered_map<uint32_t, CoopGlyph> glyphs;
+};
+static CoopFont g_font_big, g_font_small;
+
+static bool coop_font_load(CoopFont &f, const wchar_t *file)
+{
+    if (f.tex || f.tried) return f.tex != nullptr;
+    f.tried = true;
+    std::wstring path = g_cfg.game_dir + L"\\language\\fonts\\" + file;
+    FILE *fp = _wfopen(path.c_str(), L"rb");
+    if (!fp) { logf("coop: font %ls not found", path.c_str()); return false; }
+    std::vector<uint8_t> d;
+    fseek(fp, 0, SEEK_END);
+    long n = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (n > 0 && n < (8 << 20)) { d.resize((size_t)n); if (fread(d.data(), 1, d.size(), fp) != d.size()) d.clear(); }
+    fclose(fp);
+    auto u32 = [&](size_t o) { uint32_t v = 0; if (o + 4 <= d.size()) memcpy(&v, &d[o], 4); return v; };
+    if (d.size() < 0x300 || memcmp(d.data(), "4.1v", 4)) { logf("coop: font %ls: unknown layout", file); return false; }
+    uint32_t toff = u32(4), fmt = u32(toff + 12), data = toff + u32(toff + 4);
+    int xf = (fmt >> 8) & 255;
+    f.tw = 1 << ((fmt >> 20) & 15);
+    f.th = 1 << ((fmt >> 24) & 15);
+    size_t bytes = (size_t)f.tw * f.th; // DXT3: 16 bytes per 4x4 block
+    if (xf != 0x0E || data + bytes > d.size() || f.tw < 4 || f.th < 4) {
+        logf("coop: font %ls: texture format 0x%x %dx%d not handled", file, xf, f.tw, f.th);
+        return false;
+    }
+    for (uint32_t o = 0x220; o + 0x28 <= toff; o += 0x28) {
+        CoopGlyph g;
+        memcpy(&g, &d[o], sizeof g);
+        uint32_t code = u32(o + 28);
+        if (code && !f.glyphs.count(code)) f.glyphs[code] = g;
+    }
+    if (FAILED(host3d::dev()->CreateTexture(f.tw, f.th, 1, 0, D3DFMT_DXT3, D3DPOOL_MANAGED, &f.tex, nullptr))) {
+        logf("coop: font %ls: CreateTexture failed", file);
+        f.tex = nullptr;
+        return false;
+    }
+    D3DLOCKED_RECT lr;
+    if (SUCCEEDED(f.tex->LockRect(0, &lr, nullptr, 0))) {
+        size_t row = (size_t)f.tw / 4 * 16;
+        for (int by = 0; by < f.th / 4; by++) memcpy((uint8_t *)lr.pBits + by * lr.Pitch, &d[data + by * row], row);
+        f.tex->UnlockRect(0);
+    }
+    logf("coop: font %ls loaded: %dx%d DXT3, %u glyphs", file, f.tw, f.th, (unsigned)f.glyphs.size());
+    return true;
+}
+
+static const CoopGlyph *coop_font_glyph(const CoopFont &f, unsigned char c)
+{
+    auto it = f.glyphs.find(c);
+    if (it == f.glyphs.end() && c >= 'a' && c <= 'z') it = f.glyphs.find(c - 32);
+    return it == f.glyphs.end() ? nullptr : &it->second;
+}
+
+static bool coop_font_is_icon(unsigned char c) { return c == 0xB0 || c == 0xB2 || c == 0xB3 || c == 0xB9; }
+
+// width in screen pixels of a Latin-1 string at `scale` screen px per font texel
+static float coop_font_width(const CoopFont &f, const char *s, float scale)
+{
+    float w = 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (const CoopGlyph *g = coop_font_glyph(f, *p)) w += g->adv * f.tw * scale;
+    return w;
+}
+
+struct CoopFontV {
+    float x, y, z, rhw;
+    D3DCOLOR c;
+    float u, v;
+};
+
+// append the glyph quads of `s` (cap line top at y) as triangle-list vertices
+static void coop_font_quads(std::vector<CoopFontV> &out, const CoopFont &f, const char *s, float x, float y, float scale,
+                            D3DCOLOR col)
+{
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        const CoopGlyph *g = coop_font_glyph(f, *p);
+        if (!g) continue;
+        if (g->w > 0 && g->h > 0 && g->u >= 0) {
+            D3DCOLOR c = coop_font_is_icon(*p) ? (col & 0xFF000000) | 0xFFFFFF : col; // icons keep their colours
+            float x0 = x + g->xo * f.tw * scale - 0.5f, y0 = y + g->yo * f.th * scale - 0.5f;
+            float x1 = x0 + g->w * f.tw * scale, y1 = y0 + g->h * f.th * scale;
+            float u0 = g->u, v0 = g->v, u1 = g->u + g->w, v1 = g->v + g->h;
+            CoopFontV q[6] = {{x0, y0, 0, 1, c, u0, v0}, {x1, y0, 0, 1, c, u1, v0}, {x0, y1, 0, 1, c, u0, v1},
+                              {x1, y0, 0, 1, c, u1, v0}, {x1, y1, 0, 1, c, u1, v1}, {x0, y1, 0, 1, c, u0, v1}};
+            out.insert(out.end(), q, q + 6);
+        }
+        x += g->adv * f.tw * scale;
+    }
+}
+
+// draw untextured (band) and per-font textured triangle lists onto the host back buffer,
+// alpha blended, fixed function; restores the device state like fullscreen_pass
+static void coop_font_draw(const std::vector<CoopFontV> &band, const CoopFont *fonts[], const std::vector<CoopFontV> *lists[],
+                           int nlists)
+{
+    IDirect3DDevice9 *d = host3d::dev();
+    IDirect3DStateBlock9 *sb = nullptr;
+    d->CreateStateBlock(D3DSBT_ALL, &sb);
+    IDirect3DSurface9 *old_rt = nullptr, *old_z = nullptr;
+    d->GetRenderTarget(0, &old_rt);
+    d->GetDepthStencilSurface(&old_z);
+    d->SetRenderTarget(0, g_host_backbuffer);
+    d->SetDepthStencilSurface(nullptr);
+    d->SetVertexShader(nullptr);
+    d->SetPixelShader(nullptr);
+    d->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    for (D3DRENDERSTATETYPE rs : {D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE, D3DRS_FOGENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_ZENABLE,
+                                  D3DRS_ZWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE, D3DRS_SEPARATEALPHABLENDENABLE,
+                                  D3DRS_CLIPPLANEENABLE, D3DRS_SPECULARENABLE})
+        d->SetRenderState(rs, FALSE);
+    d->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    d->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    d->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    d->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    d->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    d->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    d->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+    for (DWORD st = 1; st < 8; st++) {
+        d->SetTextureStageState(st, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        d->SetTextureStageState(st, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        d->SetTexture(st, nullptr);
+    }
+    d->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+    d->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    d->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    d->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    d->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    d->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    d->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    d->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    host3d::begin_scene();
+    if (!band.empty()) {
+        d->SetTexture(0, nullptr);
+        d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+        d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)band.size() / 3, band.data(), sizeof(CoopFontV));
+    }
+    d->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    d->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    d->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    d->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    for (int i = 0; i < nlists; i++) {
+        if (!fonts[i]->tex || lists[i]->empty()) continue;
+        d->SetTexture(0, fonts[i]->tex);
+        d->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)lists[i]->size() / 3, lists[i]->data(), sizeof(CoopFontV));
+    }
+    d->SetRenderTarget(0, old_rt);
+    d->SetDepthStencilSurface(old_z);
+    if (sb) {
+        sb->Apply();
+        sb->Release();
+    }
+    forget_sent_shaders();
+    if (old_rt) old_rt->Release();
+    if (old_z) old_z->Release();
+}
+
+// The downed banner in the game's font: a big title line + a small line (with the X button
+// icon), centred in the upper part of the picture over a translucent band, drop-shadowed.
+// Returns false when the fonts are not available (the caller falls back to the 5x7 font).
+static bool coop_banner(const RECT &pic, const char *title, const char *sub, uint32_t title_rgb, uint32_t frameno);
+static bool coop_downed_banner(const RECT &pic, bool self_downed, uint32_t frameno)
+{
+    return coop_banner(pic, self_downed ? "DOWNED" : "PARTNER DOWN",
+                       self_downed ? "BACK WHEN A MAIN OBJECTIVE IS COMPLETED" : "COMPLETE A MAIN OBJECTIVE TO BRING THEM BACK", // respawn rule (owner)
+                       self_downed ? 0xFF4A3A : 0x40E0FF, frameno);
+}
+// owner (day 15): "put the banner at the bottom where the black bars are, to not interfere with the cinematic" - one
+// pulsing line of the small font on a dark band in the bottom letterbox bar (the briefing video leaves ~13 % black)
+static bool coop_bottom_note(const RECT &pic, const char *text, uint32_t rgb, uint32_t frameno)
+{
+    if (!coop_font_load(g_font_small, L"Small.bin")) return false;
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    float s = ph / 480.0f;
+    while (s > 0.5f && coop_font_width(g_font_small, text, s) > pw * 0.9f) s *= 0.9f;
+    float cap = 11.0f * s;
+    float cy = pic.top + ph * 0.935f;                 // the middle of the bottom bar
+    float top = cy - cap / 2;
+    float band_t = top - 6.0f * s, band_b = top + cap + 6.0f * s;
+    float bl = (float)pic.left, br = (float)pic.right;
+    D3DCOLOR bc = 0xA0000000;
+    std::vector<CoopFontV> band = {{bl, band_t, 0, 1, bc, 0, 0}, {br, band_t, 0, 1, bc, 0, 0}, {bl, band_b, 0, 1, bc, 0, 0},
+                                   {br, band_t, 0, 1, bc, 0, 0}, {br, band_b, 0, 1, bc, 0, 0}, {bl, band_b, 0, 1, bc, 0, 0}};
+    float pulse = 0.775f + 0.225f * sinf(frameno * 0.10f);
+    D3DCOLOR col = ((uint32_t)(pulse * 255.0f) << 24) | rgb;
+    std::vector<CoopFontV> sml;
+    float x = pic.left + (pw - coop_font_width(g_font_small, text, s)) / 2;
+    coop_font_quads(sml, g_font_small, text, x + 1.5f * s, top + 1.5f * s, s, 0xC0000000);
+    coop_font_quads(sml, g_font_small, text, x, top, s, col);
+    const CoopFont *fonts[1] = {&g_font_small};
+    const std::vector<CoopFontV> *lists[1] = {&sml};
+    coop_font_draw(band, fonts, lists, 1);
+    return true;
+}
+
+// HIT MARKER (owner 20261115): four short diagonal strokes around the crosshair (the screen centre) - white for a
+// hit (0.25 s), red and a little larger for a kill (0.5 s), fading out. coop/coop.cpp sets g_coop_hm_ms / g_coop_hm_kill.
+static void coop_hitmarker(const RECT &pic)
+{
+    unsigned long long t0 = g_coop_hm_ms;
+    if (!t0 || !g_cfg.coop_hitmarker) return;
+    bool kill = g_coop_hm_kill != 0;
+    float life = kill ? 500.0f : 250.0f;
+    float age = (float)(GetTickCount64() - t0);
+    if (age < 0 || age >= life) return;
+    float a = 1.0f - age / life;
+    a = a * a * (3.0f - 2.0f * a);                     // smooth fade
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    float s = ph / 480.0f;
+    float cx = pic.left + pw * 0.5f, cy = pic.top + ph * 0.5f;
+    float pop = kill ? 1.25f : 1.0f;
+    float r1 = 5.0f * s * pop, r2 = 12.0f * s * pop, hw = (kill ? 1.3f : 1.0f) * s;   // inner / outer radius, half width
+    D3DCOLOR col = ((uint32_t)(a * 255.0f) << 24) | (kill ? 0xFF2A2A : 0xFFFFFF);
+    D3DCOLOR sh = ((uint32_t)(a * 150.0f) << 24);       // a dark outline so it reads on bright scenes
+    std::vector<CoopFontV> tri;
+    auto stroke = [&](float dx, float dy, float w, D3DCOLOR c, float grow) {
+        float px = -dy * w, py = dx * w;               // perpendicular (dx, dy is a unit diagonal)
+        float ax = cx + dx * (r1 - grow), ay = cy + dy * (r1 - grow), bx = cx + dx * (r2 + grow), by = cy + dy * (r2 + grow);
+        CoopFontV q[4] = {{ax + px, ay + py, 0, 1, c, 0, 0}, {bx + px, by + py, 0, 1, c, 0, 0},
+                          {bx - px, by - py, 0, 1, c, 0, 0}, {ax - px, ay - py, 0, 1, c, 0, 0}};
+        tri.push_back(q[0]); tri.push_back(q[1]); tri.push_back(q[2]);
+        tri.push_back(q[0]); tri.push_back(q[2]); tri.push_back(q[3]);
+    };
+    const float k = 0.70710678f;
+    const float dirs[4][2] = {{k, k}, {-k, k}, {k, -k}, {-k, -k}};
+    for (auto &d : dirs) stroke(d[0], d[1], hw + 1.0f * s, sh, 1.0f * s);   // outline
+    for (auto &d : dirs) stroke(d[0], d[1], hw, col, 0.0f);
+    coop_font_draw(tri, nullptr, nullptr, 0);
+}
+
+// a co-op banner: a pulsing title and a line under it on a translucent band (the DOWNED cue, the shared skip popup)
+static bool coop_banner(const RECT &pic, const char *title, const char *sub, uint32_t title_rgb, uint32_t frameno)
+{
+    if (!coop_font_load(g_font_big, L"Big.bin") || !coop_font_load(g_font_small, L"Small.bin")) return false;
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    float s = ph / 480.0f; // the fonts are authored for the 640x480 Xbox screen
+    float sub_s = s;
+    while (sub_s > 0.5f && coop_font_width(g_font_small, sub, sub_s) > pw * 0.9f) sub_s *= 0.9f;
+    float big_cap = 22.0f * s, small_cap = 11.0f * sub_s;
+    float top = pic.top + ph * 0.20f;
+    float sub_top = top + big_cap + 12.0f * s;
+    float band_t = top - 14.0f * s, band_b = sub_top + small_cap + 14.0f * s;
+    D3DCOLOR bc = 0x90000000;
+    float bl = (float)pic.left, br = (float)pic.right;
+    std::vector<CoopFontV> band = {{bl, band_t, 0, 1, bc, 0, 0}, {br, band_t, 0, 1, bc, 0, 0}, {bl, band_b, 0, 1, bc, 0, 0},
+                                   {br, band_t, 0, 1, bc, 0, 0}, {br, band_b, 0, 1, bc, 0, 0}, {bl, band_b, 0, 1, bc, 0, 0}};
+    // the title pulses (alpha 0.55..1) so it reads as a state, not a static label
+    float pulse = 0.775f + 0.225f * sinf(frameno * 0.10f);
+    uint32_t a = (uint32_t)(pulse * 255.0f) << 24;
+    D3DCOLOR title_col = a | title_rgb;
+    std::vector<CoopFontV> big, sml;
+    float tx = pic.left + (pw - coop_font_width(g_font_big, title, s)) / 2;
+    float sx = pic.left + (pw - coop_font_width(g_font_small, sub, sub_s)) / 2;
+    float sh = 2.0f * s; // drop shadow offset
+    coop_font_quads(big, g_font_big, title, tx + sh, top + sh, s, 0xC0000000);
+    coop_font_quads(big, g_font_big, title, tx, top, s, title_col);
+    // shadow without the icon (its colours would turn black): skip it but keep its advance
+    {
+        float x = sx + sh;
+        for (const unsigned char *p = (const unsigned char *)sub; *p; p++) {
+            const CoopGlyph *g = coop_font_glyph(g_font_small, *p);
+            if (!g) continue;
+            char one[2] = {(char)*p, 0};
+            if (!coop_font_is_icon(*p)) coop_font_quads(sml, g_font_small, one, x, sub_top + sh, sub_s, 0xC0000000);
+            x += g->adv * g_font_small.tw * sub_s;
+        }
+    }
+    coop_font_quads(sml, g_font_small, sub, sx, sub_top, sub_s, 0xFFE8E8E8);
+    const CoopFont *fonts[2] = {&g_font_big, &g_font_small};
+    const std::vector<CoopFontV> *lists[2] = {&big, &sml};
+    coop_font_draw(band, fonts, lists, 2);
+    return true;
+}
+
+// --role-label (test runs only; owner: "put a name for identifying who is the host and who is the
+// joiner on top of the screen, show that only for the tests"): the role in the game's small font at
+// the top centre of the picture over a small translucent plate (HOST amber, JOINER cyan, SOLO grey),
+// and once in the window title.
+static void coop_role_label(const RECT &pic)
+{
+    const char *name = g_cfg.coop_role == 1 ? "HOST" : (g_cfg.coop_role == 2 ? "JOINER" : "SOLO");
+    static bool titled = false;
+    if (!titled) { titled = true; char t[32]; snprintf(t, sizeof t, "BLACK - %s", name); host3d::set_title(t); }
+    if (!coop_font_load(g_font_small, L"Small.bin")) return;
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    float s = ph / 480.0f * 1.3f;
+    float w = coop_font_width(g_font_small, name, s), cap = 11.0f * s;
+    float x = pic.left + (pw - w) / 2, y = pic.top + 8.0f * (ph / 480.0f);
+    float l = x - 8.0f * s, r = x + w + 8.0f * s, t = y - 4.0f * s, b = y + cap + 5.0f * s;
+    D3DCOLOR bc = 0xA0000000;
+    std::vector<CoopFontV> band = {{l, t, 0, 1, bc, 0, 0}, {r, t, 0, 1, bc, 0, 0}, {l, b, 0, 1, bc, 0, 0},
+                                   {r, t, 0, 1, bc, 0, 0}, {r, b, 0, 1, bc, 0, 0}, {l, b, 0, 1, bc, 0, 0}};
+    D3DCOLOR col = g_cfg.coop_role == 1 ? 0xFFFFB030 : (g_cfg.coop_role == 2 ? 0xFF40E0FF : 0xFFC0C0C0);
+    std::vector<CoopFontV> txt;
+    coop_font_quads(txt, g_font_small, name, x + 1.5f * s, y + 1.5f * s, s, 0xC0000000);
+    coop_font_quads(txt, g_font_small, name, x, y, s, col);
+    const CoopFont *fonts[1] = {&g_font_small};
+    const std::vector<CoopFontV> *lists[1] = {&txt};
+    coop_font_draw(band, fonts, lists, 1);
+}
+
+void D3DDevice_Swap_after_compose()
+{
+    // Route B: draw the marker (the streamed host / guest role) and the pilot clone's
+    // position dot. Cheap ColorFills on the host back buffer; no game render state.
+    bool marker_on = g_coop_marker_on != 0 && !g_cfg.no_markers; // --no-markers: boxes covered bodies
+    bool clone_on = g_coop_clone_on != 0 && !g_cfg.no_markers;
+    bool downed_hud = (g_coop_downed || g_coop_peer_downed) != 0 && !g_coop_mission_failed; // DOWNED cue: independent of --no-markers (not over the mission failed screen)
+    // --msg-test (solo): show the downed banner from frame 4300, then the survivor one from 4600
+    int banner_test = 0;
+    if (g_cfg.msg_test && g_frame_count.load() >= 4300) banner_test = g_frame_count.load() < 4600 ? 1 : 2;
+    if (banner_test) downed_hud = true;
+    {   // owner (20261115): "make the DOWNED and PARTNER DOWN banners disappear after 5 s" - each shows 5 s from the moment
+        // that state began (a new state - we go down, the partner goes down - shows its banner again)
+        int state = g_coop_downed ? 1 : g_coop_peer_downed ? 2 : 0;
+        if (banner_test) state = 2 + banner_test;
+        static int last_state; static ULONGLONG since;
+        ULONGLONG now = GetTickCount64();
+        if (state != last_state) { last_state = state; since = now; }
+        if (state && now - since > 5000) downed_hud = false;
+    }
+    { static int nb = -1; if (nb < 0) { char e[8] = {0}; nb = GetEnvironmentVariableA("COOP_NO_BANNER", e, sizeof e) && e[0] == '1'; } if (nb) downed_hud = false; }   // test shots: no DOWNED banner
+    bool hm_on = g_cfg.coop_hitmarker && g_coop_hm_ms && GetTickCount64() - g_coop_hm_ms < 600;   // a hit marker is showing
+    // the bottom notes (session ended, checkpoint, the joiner's save warning) are drawn in the menus too: without them
+    // in this test the early return skipped them outside the test runs (owner 20261115: the joiner's save warning)
+    ULONGLONG nowm = GetTickCount64();
+    // owner two-PC play 20261115: "the skip-cinematic banner and the level-exit banner didn't show" - they lived behind
+    // this early return too and passed only while the HOST / JOINER label was on (removed from regular play)
+    bool notes_on = (g_coop_end_msg[0] && nowm < g_coop_end_msg_until) || (g_coop_info_msg[0] && nowm < g_coop_info_msg_until) ||
+                    (g_coop_warn_msg[0] && nowm < g_coop_warn_msg_until) || g_coop_skip_ui || g_coop_exit_ui || g_coop_load_ui;
+    if (!marker_on && !clone_on && !downed_hud && !g_gunmark_on && !g_cfg.role_label && !hm_on && !notes_on) return;
+    RECT frame, pic;
+    host3d::frame_layout(&frame, &pic);
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    if (pw < 8 || ph < 8) return;
+    if (g_cfg.role_label && host3d::dev()) coop_role_label(pic);
+    if (hm_on && host3d::dev()) coop_hitmarker(pic);
+    // the shared cinematic skip (fe/coop_menu.cpp): drawn over the briefing video
+    if (g_coop_info_msg[0] && GetTickCount64() < g_coop_info_msg_until && host3d::dev())   // co-op notice (checkpoint)
+        coop_bottom_note(pic, g_coop_info_msg, 0x60FF60, g_frame_count.load());
+    if (g_coop_warn_msg[0] && GetTickCount64() < g_coop_warn_msg_until && host3d::dev())   // the joiner's save warning (fe/coop_menu.cpp)
+        coop_bottom_note(pic, g_coop_warn_msg, 0xFFC040, g_frame_count.load());
+    if (g_coop_end_msg[0] && GetTickCount64() < g_coop_end_msg_until && host3d::dev())   // the co-op session ended (coop/coop.cpp)
+        coop_bottom_note(pic, g_coop_end_msg, 0xFF6050, g_frame_count.load());
+    if (g_coop_exit_ui > 0 && host3d::dev()) {   // the shared level exit (coop/coop.cpp)
+        char t[80];
+        snprintf(t, sizeof t, "EXIT REACHED - THE LEVEL ENDS IN %d S", g_coop_exit_ui);
+        coop_bottom_note(pic, t, 0x60FF60, g_frame_count.load());
+    }
+    if (g_coop_load_ui && host3d::dev())   // the loading barrier (coop/coop.cpp): this copy is done, the partner is not
+        coop_bottom_note(pic, "LOADED - WAITING FOR YOUR PARTNER TO FINISH LOADING", 0xFFC040, g_frame_count.load());
+    if (g_coop_skip_ui && host3d::dev())
+        coop_bottom_note(pic, g_coop_skip_ui == 1 ? "SKIP - WAITING FOR YOUR PARTNER" : "YOUR PARTNER WANTS TO SKIP - PRESS A / ENTER",
+                         0xFFC040, g_frame_count.load());
+    float f[2];
+    static uint32_t lastdraw;
+    uint32_t frameno = g_frame_count.load();
+
+    // DOWNED HUD (day 6): a red DOWNED banner on the downed player's screen, a cyan
+    // PEER DOWNED / PRESS X TO REVIVE banner on the survivor's screen. Blocky 5x7
+    // pixel font, rows merged into horizontal run rects so a word costs ~3 fills
+    // per letter. Drawn in this compose hook like the markers: no game state.
+    if (downed_hud && host3d::dev()) {
+        bool fresh_peer = g_coop_peer_downed && g_coop_host_ms != 0 &&
+                          GetTickCount64() - g_coop_host_ms <= 400;   // the flag rides the state packets
+        // day 8: the game's own font (Big/Small.bin atlas) via textured quads; the 5x7
+        // ColorFill font below stays as the fallback when the font files cannot be loaded
+        if (banner_test) {
+            coop_downed_banner(pic, banner_test == 1, frameno);
+        } else if ((g_coop_downed || fresh_peer) && coop_downed_banner(pic, g_coop_downed != 0, frameno)) {
+        } else if (g_coop_downed || fresh_peer) {
+            // review fix (rv152): the old px = ph/48 made "PRESS X TO REVIVE" ~3060 px wide
+            // at 1440p (clipped both sides) and the band covered one line only. Now: ~1/120
+            // of the height, shrunk until the widest line (17 chars x 6 cells) fits 90% of
+            // the width; the band covers every line drawn.
+            int px = ph / 120;
+            while (px > 2 && 17 * 6 * px > pw * 9 / 10) px--;
+            if (px < 2) px = 2;
+            int lines = g_coop_downed ? 1 : 2;
+            int gap = px * 3, top = pic.top + gap;
+            int bandh = gap + lines * 7 * px + (lines - 1) * gap + gap;
+            RECT band = {pic.left, pic.top, pic.right, pic.top + bandh};
+            host3d::dev()->ColorFill(g_host_backbuffer, &band, 0xFF101018);
+            bool blink = (frameno & 8) != 0;
+            auto centered = [&](const char *t) { return pic.left + (pw - (int)strlen(t) * 6 * px + px) / 2; };
+            if (g_coop_downed) {
+                uint32_t col = blink ? 0xFFFF4030 : 0xFF901008;
+                coop_hud_text("DOWNED", centered("DOWNED"), top, px, col, pic);
+            } else {
+                uint32_t col = blink ? 0xFF30E0FF : 0xFF0F7080;
+                coop_hud_text("PEER DOWNED", centered("PEER DOWNED"), top, px, col, pic);
+                coop_hud_text("PRESS X TO REVIVE", centered("PRESS X TO REVIVE"), top + 7 * px + gap, px, 0xFFE0E0E0, pic);
+            }
+        }
+    }
+
+    if (g_gunmark_on && host3d::dev()) {   // COOP_GUN_MARK diagnostics: hand white, muzzle red, wanted aim green, chest blue
+        // 0 hand white, 1 muzzle red, 2 want green, 3 chest blue; probes +r0 yellow, -r0 orange,
+        // +r1 magenta, -r1 purple, +r2 cyan, -r2 teal
+        const uint32_t cols[10] = {0xFFFFFFFF, 0xFFFF2020, 0xFF20FF20, 0xFF4080FF,
+                                   0xFFFFFF00, 0xFFFF8000, 0xFFFF00FF, 0xFF8000C0, 0xFF00FFFF, 0xFF008080};
+        static int probes = -1;
+        if (probes < 0) { char e[8] = {0}; probes = GetEnvironmentVariableA("COOP_GUN_AXES", e, sizeof e) && e[0] == '1'; }
+        for (int k = 0; k < (probes ? 10 : 4); k++) {
+            if (!g_clone_mvp_ok) continue;
+            // the clone body draw's own c10..c13 (rows; clip_r = row . (x, y, z, 1))
+            float q[4];
+            for (int r = 0; r < 4; r++)
+                q[r] = g_clone_mvp[4 * r] * g_gunmodel[3 * k] + g_clone_mvp[4 * r + 1] * g_gunmodel[3 * k + 1] +
+                       g_clone_mvp[4 * r + 2] * g_gunmodel[3 * k + 2] + g_clone_mvp[4 * r + 3];
+            static uint32_t pl;
+            if (k == 0 && (pl++ % 300) == 0)
+                logf("coop: gunmark clip: hand model %.2f %.2f %.2f -> clip %.3f %.3f %.3f %.3f", g_gunmodel[0], g_gunmodel[1],
+                     g_gunmodel[2], q[0], q[1], q[2], q[3]);
+            if (q[3] <= 0.01f) continue;
+            f[0] = q[0] / q[3]; f[1] = q[1] / q[3];
+            // NDC (-1..1, y up) or Xbox screen pixels (640x480): pick by range
+            if (fabsf(f[0]) <= 1.5f && fabsf(f[1]) <= 1.5f) { f[0] = 0.5f + 0.5f * f[0]; f[1] = 0.5f - 0.5f * f[1]; }
+            else { f[0] /= 640.0f; f[1] /= 480.0f; }
+            int cx = pic.left + (int)(f[0] * pw), cy = pic.top + (int)(f[1] * ph), hs = k == 0 ? 3 : 5;
+            RECT r = {cx - hs, cy - hs, cx + hs, cy + hs};
+            host3d::dev()->ColorFill(g_host_backbuffer, &r, cols[k]);
+        }
+    }
+    if (marker_on) {
+        if (coop_marker_screen(f)) {
+            int cx = pic.left + (int)(f[0] * pw), cy = pic.top + (int)(f[1] * ph);
+            int half = (int)(0.025f * pw) + 2;
+            RECT r = {cx - half, cy - half, cx + half, cy + half};
+            HRESULT hr = E_FAIL;
+            if (host3d::dev()) hr = host3d::dev()->ColorFill(g_host_backbuffer, &r, 0xFF30FF50);
+            if (frameno % 120 == 0 && frameno != lastdraw) {
+                lastdraw = frameno;
+                logf("coop: marker draw frameno %u frac %.3f %.3f -> px %d %d half %d (ColorFill hr 0x%08x)",
+                     frameno, f[0], f[1], cx, cy, half, (uint32_t)hr);
+            }
+        }
+    }
+
+    if (clone_on && !g_cfg.p13_park) { // park runs: no box (it covered the body at range)
+        if (coop_project_point((const float *)g_coop_clone_pos, f)) {
+            int cx2 = pic.left + (int)(f[0] * pw), cy2 = pic.top + (int)(f[1] * ph);
+            int h2 = (int)(0.02f * pw) + 2;
+            RECT r2 = {cx2 - h2 - 40, cy2 - h2, cx2 - 40, cy2 + h2}; // offset left so the clone spot beside it stays visible
+            if (host3d::dev()) host3d::dev()->ColorFill(g_host_backbuffer, &r2, 0xFFFF7030);
+            if (frameno % 120 == 0) logf("coop: clone dot frameno %u frac %.3f %.3f", frameno, f[0], f[1]);
+        }
+    }
+}
+
 uint32_t __stdcall D3DDevice_Swap(uint32_t Flags)
 {
     DTRACE("0x%x", Flags);
@@ -1315,6 +1838,7 @@ uint32_t __stdcall D3DDevice_Swap(uint32_t Flags)
     perf::swap_begin();
     pace_swap();
     present_backbuffer();
+    D3DDevice_Swap_after_compose();
     capture_frame();
     uint32_t frames = ++g_frame_count;
     memdump_frame(frames);

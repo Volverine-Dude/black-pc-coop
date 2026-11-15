@@ -306,11 +306,11 @@ std::string ingame(const std::string &page) { return page + "IG"; }
 
 // ---------------------------------------------------------------------------------------------------- rows
 struct RowSpec {
-    enum Kind { Choice, Slider, Link, Key } kind;
+    enum Kind { Choice, Slider, Link, Key, Action } kind;   // Action: select calls <page>'s action function (id)
     int id;            // the setting (Choice, Slider) or the list row (Key)
     std::string label; // caption text: literal, or a variable for Key rows
     std::string value; // the value's variable ("" for Link)
-    std::string page;  // Link: the page it opens
+    std::string page;  // Link: the page it opens; Action: the port's function name (PCCoop ...)
 };
 
 std::vector<RowSpec> group_rows(const pcset::Group &g, bool pause)
@@ -708,6 +708,14 @@ void page_script(Movie &mv, const PageScript &p)
                 set(f, {row_var(i)}, "actionSelectPage", S(r.page));
                 continue;
             }
+            if (r.kind == RowSpec::Action) {   // the CO-OP page: select = the port's function (id)
+                make(f, row_var(i), "BkMenuButton", {at(clip)});
+                std::string fn = r.page; int id = r.id;
+                set(f, {row_var(i)}, "actionSelectFunction", [fn, id](Asm &g) {
+                    g.function2("", [fn, id](Asm &h) { trigger(h, fn, {I(id)}); });
+                });
+                continue;
+            }
             make(f, row_var(i), "BkMultiChoiceMenuButton", {at(clip)});
             if (r.kind == RowSpec::Slider) {
                 make(f, list_var(i), "BkMovieclipSlider",
@@ -722,9 +730,12 @@ void page_script(Movie &mv, const PageScript &p)
                 right.insert(right.end(), {"Arrows", "RightArrow"});
                 make(f, list_var(i), "BkListBox");
                 call(f, {list_var(i)}, "SetId", {I(r.id)});
-                call(f, {list_var(i)}, "SetGameFunction", {S("PCChange")});
+                call(f, {list_var(i)}, "SetGameFunction", {S(r.page.empty() ? std::string("PCChange") : r.page)});   // co-op rows: PCCoopChange
                 call(f, {list_var(i)}, "SetLeftAnimation", {at(left)});
                 call(f, {list_var(i)}, "SetRightAnimation", {at(right)});
+                // owner (day 15): "only CONNECT should be pressable by A - A anywhere else brings you to the previous menu
+                // and quits the lobby": on the co-op pages A on a value row does nothing (Back stays on B)
+                if (p.page_id >= 200 && p.page_id < 300) set(f, {row_var(i)}, "actionSelectFunction", nothing_fn());
             } else {
                 make(f, list_var(i), p.choice_class);
                 set(f, {list_var(i)}, "mId", I(r.id));
@@ -745,7 +756,7 @@ void page_script(Movie &mv, const PageScript &p)
     a.function2("PageRelease", [&](Asm &f) {
         for (size_t i = 0; i < k; i++) {
             call(f, {row_var(i)}, "Release");
-            if (p.rows[i].kind != RowSpec::Link) call(f, {list_var(i)}, "Release");
+            if (p.rows[i].kind != RowSpec::Link && p.rows[i].kind != RowSpec::Action) call(f, {list_var(i)}, "Release");
         }
     });
     a.function2("Update", [&](Asm &f) {
@@ -787,7 +798,7 @@ void page_script(Movie &mv, const PageScript &p)
 // frame (a Move with a colour transform) with a flash bar. The copy: depth 2, dy lower, named `name`, revealed 3
 // frames after the bottom row with its own bar at new_bar_depth.
 void add_menu_row(Movie &mv, uint32_t textanim, const std::string &label, const std::string &name, float dy, int reveal,
-                  uint32_t bar_depth, uint32_t new_bar_depth, uint32_t text_depth)
+                  uint32_t bar_depth, uint32_t new_bar_depth, uint32_t text_depth = 2, int delay = 3)
 {
     int t = mv.add_character(mv.clone_text(mv.character(5), label, label));
     int s6 = mv.add_character(mv.clone_sprite(mv.character(6), {{5, t}}));
@@ -800,11 +811,11 @@ void add_menu_row(Movie &mv, uint32_t textanim, const std::string &label, const 
     mv.append_control(textanim, 0, mv.alloc(row.data(), 64));
     Bytes show = body(mv, mv.find_place(textanim, reveal, 1, 1));
     wr(show, 8, text_depth);
-    mv.append_control(textanim, reveal + 3, mv.alloc(show.data(), 64));
+    mv.append_control(textanim, reveal + delay, mv.alloc(show.data(), 64));
     Bytes bar = body(mv, mv.find_place(textanim, reveal, bar_depth));
     wr(bar, 8, new_bar_depth);
     wrf(bar, 36, rdf(bar, 36) + dy);
-    mv.append_control(textanim, reveal + 3, mv.alloc(bar.data(), 64));
+    mv.append_control(textanim, reveal + delay, mv.alloc(bar.data(), 64));
 }
 
 // the first depth from `from` up that no PlaceObject in any frame of the sprite uses
@@ -856,28 +867,56 @@ void options_row(Movie &mv)
 // asks the port to close the game (PCQuit, like closing the window). CONTINUE LAST GAME goes above the first row
 // (rows above the bottom one; checkpoints.cpp): while a checkpoint is kept (externObject.FEPCHasCheckpoint) it is in the
 // ring between QUIT and the first button and starts that mission there (PCContinue); otherwise it is hidden.
-void main_menu_quit(Movie &mv, int textanim, float dy, int reveal, uint32_t bar_depth, uint32_t new_bar_depth,
-                    const char *last, const char *first, int rows)
+// asks the port to close the game (PCQuit, like closing the window).
+// one-off depth survey (COOP menu work): every place control of a sprite, frame by frame (BLACK_FE_DEPTHS=1)
+void dump_depths(const Movie &mv, uint32_t sprite, const char *tag)
 {
-    add_menu_row(mv, mv.character(textanim), "QUIT", "Quit_Text", dy, reveal, bar_depth, new_bar_depth, 2);
+    if (!getenv("BLACK_FE_DEPTHS")) return;
+    int frames = (int)rd(mv.apt, sprite + 8);
+    for (int f = 0; f < frames; f++) {
+        std::string line;
+        for (uint32_t c : mv.controls(sprite, f))
+            if (rd(mv.apt, c) == 3) line += " d" + std::to_string(rd(mv.apt, c + 8)) + ((rd(mv.apt, c + 4) & 1) ? "m" : "") + "/c" + std::to_string(rd(mv.apt, c + 12));
+        if (!line.empty()) logf("fe: depths %s frame %d:%s", tag, f, line.c_str());
+    }
+}
+
+// CO-OP (day 15, owner: "start the very next big step, the co-op menu"): the title menus get CO-OP (opens the CO-OP
+// page) and QUIT below it, both in the up / down ring between the last and the first button. Depths (BLACK_FE_DEPTHS
+// survey): blacktitlemenu rows 1/3/5, bars 7/9/11, decoration 13/15 -> CO-OP row 4 bar 14, QUIT row 2 bar 12;
+// blacktitlemenu2 rows 1/3, bars 5/7, decoration 9/11 -> CO-OP row 4 bar 10, QUIT row 2 bar 8. CO-OP is revealed 3
+// frames after the bottom row, QUIT 3 frames later (the timelines run to 62 / 60).
+// 0.4.0 merge: CO-OP (dy) and QUIT (2 dy) below the bottom row, CONTINUE LAST GAME above the first one (rows up); its
+// depths are taken after ours (free_depth skips the CO-OP / QUIT rows and bars).
+void main_menu_quit(Movie &mv, int textanim, float dy, int reveal, uint32_t bar_depth, uint32_t quit_bar_depth,
+                    uint32_t coop_bar_depth, const char *last, const char *first, const char *coop_page, int rows)
+{
+    dump_depths(mv, mv.character(textanim), last);
+    add_menu_row(mv, mv.character(textanim), "CO-OP", "Coop_Text", dy, reveal, bar_depth, coop_bar_depth, 4, 3);
+    add_menu_row(mv, mv.character(textanim), "QUIT", "Quit_Text", 2 * dy, reveal, bar_depth, quit_bar_depth, 2, 6);
     add_menu_row(mv, mv.character(textanim), "CONTINUE LAST GAME", "LastGame_Text", -dy * rows, reveal, bar_depth,
-                 free_depth(mv, mv.character(textanim), new_bar_depth + 1), free_depth(mv, mv.character(textanim), 3));
+                 free_depth(mv, mv.character(textanim), quit_bar_depth + 1), free_depth(mv, mv.character(textanim), 3));
     uint32_t script = mv.main_script();
     for (const char *f : {"PagePrepare", "PageRelease", "PageDestruct", "Update"}) mv.rename_function(script, f, std::string(f) + "0");
     Classes classes = own_classes_prepare(mv);
     Asm a(mv);
     own_classes_script(a, classes, "main");
     heal_update(a, "quitButton", classes, "main", emit_ring_report);
+    a.push(Value::S("coopButton")).define_local2();
     a.push(Value::S("quitButton")).define_local2();
     a.push(Value::S("lastButton")).define_local2();
-    a.function2("PagePrepare", [last, first](Asm &f) {
+    a.function2("PagePrepare", [last, first, coop_page](Asm &f) {
         call_function(f, "PagePrepare0");
+        make(f, "coopButton", "BkMenuButton", {at({"Main", "TextAnim", "Coop_Text"})});
         make(f, "quitButton", "BkMenuButton", {at({"Main", "TextAnim", "Quit_Text"})});
         make(f, "lastButton", "BkMenuButton", {at({"Main", "TextAnim", "LastGame_Text"})});
-        set(f, {last}, "buttonDown", at({"quitButton"}));
-        set(f, {"quitButton"}, "buttonUp", at({last}));
+        set(f, {last}, "buttonDown", at({"coopButton"}));
+        set(f, {"coopButton"}, "buttonUp", at({last}));
+        set(f, {"coopButton"}, "buttonDown", at({"quitButton"}));
+        set(f, {"quitButton"}, "buttonUp", at({"coopButton"}));
         set(f, {"quitButton"}, "buttonDown", at({first}));
         set(f, {first}, "buttonUp", at({"quitButton"}));
+        set(f, {"coopButton"}, "actionSelectPage", S(coop_page));
         set(f, {"quitButton"}, "actionSelectFunction", [](Asm &g) {
             g.function2("", [](Asm &h) { trigger(h, "PCQuit", {}); });
         });
@@ -898,11 +937,13 @@ void main_menu_quit(Movie &mv, int textanim, float dy, int reveal, uint32_t bar_
     });
     a.function2("PageRelease", [](Asm &f) {
         call_function(f, "PageRelease0");
+        call(f, {"coopButton"}, "Release");
         call(f, {"quitButton"}, "Release");
         call(f, {"lastButton"}, "Release");
     });
     a.function2("PageDestruct", [](Asm &f) {
         call_function(f, "PageDestruct0");
+        f.push(Value::S("coopButton")).delete2().pop();
         f.push(Value::S("quitButton")).delete2().pop();
         f.push(Value::S("lastButton")).delete2().pop();
     });
@@ -1497,11 +1538,59 @@ bool fe_build_pages(const std::wstring &game_dir, const std::wstring &out_root)
         std::set<std::string> changed = {"pcsettings", lower(kBindings), "optionsmenuxbox", "blacktitlemenu", "blacktitlemenu2"};
         for (const pcset::Group &g : pcset::groups()) changed.insert(lower(g.page));
         ring_reports(c, changed, "FEMain.bin");
-        Movie title(movie(c, "blacktitlemenu")); // QUIT under OPERATOR PROFILE (rows 25.1 apart, revealed 43/46/49)
-        main_menu_quit(title, 18, 25.1f, 49, 11, 12, "profileButton", "continueButton", 3);
+        // the CO-OP page (a copy of Sound Setup like the PC SETTINGS groups): HOST GAME / JOIN GAME call PCCoop(1 / 2);
+        // one copy per title menu so Back returns to the menu it came from
+        // step 2 (fe/coop_menu.cpp): HOST GAME / JOIN GAME > INTERNET (later) / LAN > the host lobby / the join code page
+        // owner (20261115): "a hit marker option ... each time the player hits a target the hit marker appears, a red one
+        // for a kill" - on the CO-OP page (the join page has no free row): left / right toggles, saved in black.ini
+        const std::vector<RowSpec> coop_rows = {{RowSpec::Link, 1, "HOST GAME", "", "CoopHost"},
+                                                {RowSpec::Link, 2, "JOIN GAME", "", "CoopJoin"},
+                                                {RowSpec::Choice, 3, "HIT MARKER", "&PC_V2", "PCCoopChange"}};
+        for (int k = 0; k < 2; k++) {
+            Movie page(sound);
+            choice_page(page, "CO-OP", coop_rows, k ? "BlackTitleMenu2" : "BlackTitleMenu", true, 200 + k);
+            add_movie(c, k ? "coopmenu2" : "coopmenu", page.build());
+        }
+        {
+            Movie host(sound);
+            choice_page(host, "HOST GAME", {{RowSpec::Action, 11, "INTERNET (COMING LATER)", "", "PCCoop"},
+                                            {RowSpec::Link, 12, "LAN", "", "CoopLobby"}}, "CoopMenu", true, 210);
+            add_movie(c, "coophost", host.build());
+            Movie join(sound);
+            choice_page(join, "JOIN GAME", {{RowSpec::Action, 21, "INTERNET (COMING LATER)", "", "PCCoop"},
+                                            {RowSpec::Link, 22, "LAN", "", "CoopCode"}}, "CoopMenu", true, 211);
+            add_movie(c, "coopjoin", join.build());
+            Movie lobby(sound);   // rows show &PC_V<row>: the code, the status, player 2
+            choice_page(lobby, "LAN LOBBY", {{RowSpec::Choice, 403, "CODE", "&PC_V0", "PCCoopChange"},
+                                             {RowSpec::Choice, 404, "STATUS", "&PC_V1", "PCCoopChange"},
+                                             {RowSpec::Choice, 405, "PLAYER 2", "&PC_V2", "PCCoopChange"},
+                                             {RowSpec::Choice, 408, "SPRINT", "&PC_V3", "PCCoopChange"},   // owner 20261115: host-only option
+                                             {RowSpec::Action, 41, "START MISSION", "", "PCCoop"},
+                                             {RowSpec::Action, 42, "LEAVE LOBBY", "", "PCCoop"}}, "CoopHost", true, 220);   // step 4: only with player 2 READY (fe/coop_menu.cpp opens mission select)
+            add_movie(c, "cooplobby", lobby.build());
+            Movie code(sound);
+            choice_page(code, "JOIN LAN GAME", {{RowSpec::Choice, 401, "CODE", "&PC_V0", "PCCoopChange"},
+                                                {RowSpec::Choice, 402, "LETTER", "&PC_V1", "PCCoopChange"},
+                                                {RowSpec::Action, 31, "CONNECT", "", "PCCoop"},
+                                                {RowSpec::Choice, 406, "STATUS", "&PC_V3", "PCCoopChange"},
+                                                {RowSpec::Choice, 407, "READY", "&PC_V4", "PCCoopChange"},
+                                                {RowSpec::Action, 32, "LEAVE LOBBY", "", "PCCoop"}}, "CoopJoin", true, 230);
+            add_movie(c, "coopcode", code.build());
+        }
+        Movie title(movie(c, "blacktitlemenu")); // CO-OP + QUIT under OPERATOR PROFILE (rows 25.1 apart, revealed 43/46/49)
+        main_menu_quit(title, 18, 25.1f, 49, 11, 12, 14, "profileButton", "continueButton", "CoopMenu", 3);
         c.movies["blacktitlemenu"] = title.build();
-        Movie fresh(movie(c, "blacktitlemenu2")); // QUIT under OPTIONS (revealed 43/46)
-        main_menu_quit(fresh, 14, 25.0f, 46, 7, 8, "optionsButton", "startButton", 2);
+        Movie fresh(movie(c, "blacktitlemenu2")); // CO-OP + QUIT under OPTIONS (revealed 43/46)
+        main_menu_quit(fresh, 14, 25.0f, 46, 7, 8, 10, "optionsButton", "startButton", "CoopMenu2", 2);
+        if (const char *drop = getenv("BLACK_FE_DROP")) {   // test: boot with these pages left out (the front-end heap limit)
+            std::string d = std::string(",") + drop + ",";
+            for (auto it = c.movies.begin(); it != c.movies.end();)
+                if (d.find("," + it->first + ",") != std::string::npos) { logf("fe: test drop %s", it->first.c_str()); it = c.movies.erase(it); }
+                else ++it;
+            c.order.erase(std::remove_if(c.order.begin(), c.order.end(), [&](const std::string &n) { return d.find("," + n + ",") != std::string::npos; }), c.order.end());
+        }
+        if (getenv("BLACK_FE_SIZES"))
+            for (const auto &kv : c.movies) logf("fe: size %s %zu", kv.first.c_str(), kv.second.size());
         c.movies["blacktitlemenu2"] = fresh.build();
     }, fe) && write_file(dir + L"FEMain.bin", fe);
     if (!main_ok) DeleteFileW((dir + L"FEMain.bin").c_str()); // not an old build of the pages

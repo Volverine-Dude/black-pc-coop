@@ -34,6 +34,10 @@ void save_ini(FILE *f);
 void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16_t &rx, int16_t &ry, bool focus,
            bool mouse_live, int wheel);
 bool in_play(); // the player is being updated (not a menu, pause or cutscene)
+bool sprint_held(); // the Sprint key (a port action) is held
+bool intro_text();  // a mission's intro text is up (no menu page, no player update, no stopping hint): START skips it
+bool action_down(int game_action, uint16_t buttons, const uint8_t analog[8]); // that action's pad input is pressed
+void clear_action(int game_action, uint16_t &buttons, uint8_t analog[8]);      // ... released (buttons / triggers)
 // The menu key pressed (or repeating) at the last poll as the menus' input id, once: 1 up, 2 down, 3 left, 4 right,
 // 5 select (Enter), 6 back (Backspace); 0 none. The front end's input (fe/calls.cpp) takes it.
 int take_menu_input();

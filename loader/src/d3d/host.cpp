@@ -1,4 +1,5 @@
 #include "d3d/host.h"
+#include "fe/coop_menu.h"
 
 #include "settings.h"
 #include "perf.h"
@@ -312,6 +313,9 @@ LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_APP_CAPTURE: // from the input poll: pause frees the mouse, resuming play takes it again
         if (!wp) capture_mouse(false);
         else if (GetForegroundWindow() == h && !IsIconic(h)) capture_mouse(true);
+        return 0;
+    case WM_CHAR: // the CO-OP join code page types the code (fe/coop_menu.cpp)
+        coop_menu_char((wchar_t)wp);
         return 0;
     case WM_SYSCOMMAND:
         if ((wp & 0xFFF0) == SC_KEYMENU) return 0; // Alt / F10 must not open the system menu by keyboard and stall input

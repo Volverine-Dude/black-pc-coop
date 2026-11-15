@@ -177,6 +177,7 @@ __declspec(naked) void player_thunk()
 
 extern "C" void __cdecl cpt_taken(uint8_t *record)
 {
+    if (g_cfg.coop_role) return;   // co-op merge (owner: 0.4.0's solo features stay out of co-op): no file from a co-op mission
     uint8_t *g = game(), *w = world();
     if (!g || !w || !record) return;
     Snapshot s;

@@ -118,11 +118,49 @@ struct Config {
     bool info_only = false;    // print XBE info and exit
     uint32_t buf_mb = 0;       // the two weapon-data buffers in MB (bigbuf.cpp; 0 = the game's 0.88 MB; PC SETTINGS, --buf-mb)
     bool force = false;        // run even if the XBE is not the build the address tables were made for
+    bool coop_log = true;      // co-op bridge (coop/coop.cpp): log the player state every ~2 s; --no-coop-log
+    std::wstring coop_send;    // --coop-send HOST:PORT: the same state as a UDP packet per player update
+    bool coop_clone = false;   // co-op pilot stage 2: clone unit 0 beside the player after a level load (--coop-clone)
+    bool coop_off = false;     // --no-coop: skip install_coop_module entirely (hook bisect baseline)
+    bool pawn_cap = false;     // --pawn-on: install the pawn-capture hook (pure read)
+    bool p13_redirect = false; // --p13-on: arm the spawn-#4 pose redirect (the pawn adoption)
+    bool p13_park = false;     // --p13-park: place the adopted body beside the player (solo visual check)
+    bool no_pc_pad = false;    // --no-pc-pad (tests): ignore real PC controllers (only --press input reaches the game)
+    bool no_markers = false;   // --no-markers: hide the co-op overlay boxes (green host / orange clone)
+    bool p13_face = false;     // --p13-face (with --p13-park): the parked clone faces the camera, same pitch (aim check)
+    float aim_test_deg = 0.0f; // --aim-test <deg> [rec]: rotate the clone's anim frame record <rec> (default 1) by <deg>
+    int aim_test_rec = 1;
+    bool bone_scan = false;    // --bone-scan: log VS-constant bone groups near the co-op clone at draw time
+    bool skin_hook = false;    // --skin-hook: hook FUN_0016f420 (skin palette upload) for the clone's arm aim
+    uint32_t skin_bones = 0;   // --skin-bones <hex>: the clone's bone array to bend (0 = none)
+    uint32_t palette_vs = 0;   // --palette-test <vs hex>: offset palette regs c66..c134 for that VS (diagnostic)
+    bool helmet_scan = false;  // --helmet-scan: log the draws around the clone's skinned body draw
+    bool bend_at_draw = false; // --bend-at-draw: bend the clone at the skin upload (old; helmet does not follow)
+    int rec_probe = -1;        // --rec-probe <0|1>: float the clone's skin record kind (+0x1C zero / non-zero)
+    bool rec4_test = false;    // --rec4-test: lift the clone's rec4 frame (gun candidate) 0.5 m after the bone pass
+    int coop_listen_port = 0;  // --coop-listen N: receive the other player's position on UDP port N and draw a marker
     unsigned timeout_s = 0;    // exit after N seconds (0 = never)
     uint32_t watch[4] = {};    // --watch: hardware write breakpoints (Xbox addresses)
     int watch_count = 0;
     uint32_t probe[16] = {};   // --probe: log each time execution reaches these addresses
     int probe_count = 0;
+    bool enemy_test_clone = false; // --enemy-test-clone: (host test) enemy pellets aimed at the joiner's clone
+    int coop_role = 0;           // --coop-role host|joiner: who owns the enemies (0 = unset: no enemy sync)
+    bool no_shader_cache = false; // --no-shader-cache: compile every shader at first use (no shadercache\ folder)
+    bool shot_test_npc = false; // --shot-test-npc: solo hit-sync test - the clone's pellets aim at the nearest live enemy
+    bool hit_test_death = false; // --hit-test-death: (joiner test) pin our hp to the next relayed hit's damage so it kills (the death-path test)
+    bool coop_sprint = false;    // co-op (HOST's lobby option, black.ini sprint): both players may sprint (pad L1 / Shift)
+    bool coop_hitmarker = false; // co-op: a local hit marker at the crosshair (white = hit, red = kill); CO-OP page, black.ini hitmarker
+    bool coop_downed = false;  // --coop-downed: killing blows clamp to hp 1 (DOWNED, no death branch); spectator cam on the survivor; the survivor's X respawns them
+    std::wstring skip_caller;     // --skip-caller "S:hex,S:hex,...": (test) from S seconds skip draws whose game caller chain contains hex, until the next stage
+    bool role_label = false;      // --role-label: TEST RUNS ONLY - draw "HOST" / "JOINER" at the top centre of the picture (+ the window title) so the two windows can be told apart
+    bool msg_test = false;        // --msg-test: from 72 s write a test string into the game's HUD message box (game font probe)
+    bool hide_test = false;       // --hide-test: staged HUD/viewmodel/UI hiding from 70/74/78 s (which game pass draws what)
+    bool as_log = false;          // --as-log: log every distinct ActionScript variable path the game sets (FUN_00101790) - HUD clip discovery
+    bool downed_via_explosion = false; // --downed-via-explosion: the --downed-at test kills through the player's EXPLOSION virtual (+0x2C FUN_001ed2b0) to exercise the death backstop
+    int xd_test = 0;           // --xd-test <sec>: (host test) N s after launch call the joiner clone's explosion (+0x2C) then, 3 s later, melee (+0x48) damage slot -> exercises the CLXD relay
+    int downed_at = 0;         // --downed-at <sec>: (joiner test) fire a synthetic 26-dmg "host hit" N seconds after launch - the downed sequence is deterministic (dn142: the battle happened but the clone sat behind cover, zero relayed hits)
+    uint32_t probe_eax = 0;    // --probe-eax <hex>: log only probe hits whose EAX equals this (0 = all)
     unsigned debug_draws = 0;  // --debug-draws: describe the first N draws
     unsigned debug_frame = 0;  // --debug-frame: describe every draw of this frame
     std::wstring press_script; // --press: "frame:button,frame:button" scripted controller input
@@ -136,6 +174,26 @@ struct Config {
 extern Config g_cfg;
 extern DWORD_PTR g_game_cpu; // affinity of the threads that run game code (0 = any, --multicore)
 extern uint32_t g_pad_watch; // address DR3 watches for --watch-pad (input/xinput.cpp), 0 = off
+extern volatile int g_coop_load_ui;
+extern volatile int g_coop_exit_ui;
+extern volatile int g_coop_sprint_allowed;   // coop/coop.cpp: sprint is on this session (the host's lobby option)
+extern volatile int g_coop_sprinting;        // input/xinput.cpp: our player sprints now
+extern volatile float g_coop_sprint_blend;   // 0..1, eased: the lowered gun (d3d/draw.cpp)
+extern volatile unsigned long long g_coop_hm_ms;  // coop/coop.cpp: when the last hit marker started (0 = none)
+extern volatile int g_coop_hm_kill;                  // 1 = that marker is a kill (red)
+extern volatile uint32_t g_coop_peer_intro;           // coop/coop.cpp: the partner skipped the intro text (CLIT)
+extern volatile uint64_t g_coop_peer_intro_ms;
+extern char g_coop_warn_msg[96];                // fe/coop_menu.cpp: a co-op warning (the joiner's save), shown in amber
+extern volatile unsigned long long g_coop_warn_msg_until;
+extern char g_coop_info_msg[96];                // coop/coop.cpp: a short co-op notice (checkpoint), shown in green
+extern volatile unsigned long long g_coop_info_msg_until;
+extern char g_coop_end_msg[96];                 // coop/coop.cpp: why the co-op session ended (shown on the menus)
+extern volatile unsigned long long g_coop_end_msg_until;   // GetTickCount64 until which it shows   // coop/coop.cpp: seconds left of the shared level-exit countdown (0 = none)   // coop/coop.cpp: 1 = this copy finished loading the level and waits for the partner
+extern volatile int g_coop_skip_ui;   // fe/coop_menu.cpp: shared cinematic skip popup (1 we wait for the partner, 2 the partner wants to skip)
+extern volatile uint32_t g_coop_downed; // coop.cpp: this instance's player is DOWNED (input muted, spectator cam on the survivor)
+extern volatile uint32_t g_coop_mission_failed; // coop.cpp: both players went down -> the mission failed screen is up (no downed banner)
+bool coop_game_paused(void); // coop.cpp: co-op no-pause - the in-level pause menu is open (the world keeps running; no mouse-look)
+void coop_notify_x_press(unsigned char analogButtons[8]); // coop.cpp, called from read_pad AFTER the key bindings: the SURVIVOR's X revives the downed peer (and is eaten)
 extern std::atomic<uint32_t> g_frame_count; // frames presented so far (d3d/device.cpp)
 
 // Logging: every line goes to the log file and the console, prefixed with time and host thread id.

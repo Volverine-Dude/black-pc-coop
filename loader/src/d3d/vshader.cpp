@@ -6,6 +6,7 @@
 #include "kernel/kexports.h"
 
 #include "d3d/compiler.h"
+#include "d3d/shader_cache.h"
 
 #include <cstring>
 #include <string>
@@ -134,30 +135,21 @@ IDirect3DVertexShader9 *vs_host_shader(VertexShader *vs)
     if (!vs || !vs->program) return nullptr;
     if (vs->host_vs || vs->translate_failed) return vs->host_vs;
     std::string hlsl = vsh_to_hlsl(vs->program, vs->program_insts, vs_input_mask(vs));
-    perf::Scope perf_scope(perf::kCompile);
-    perf::add_compile();
-    ID3DBlob *code = nullptr, *errors = nullptr;
-    HRESULT hr = E_FAIL;
-    for (const char *profile : {"vs_2_0", "vs_2_a"}) {
-        if (errors) { errors->Release(); errors = nullptr; }
-        hr = xd3d::compile(hlsl.data(), hlsl.size(), "nv2a_vsh", nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL2, 0,
-                        &code, &errors);
-        if (SUCCEEDED(hr)) break;
-    }
-    if (FAILED(hr)) {
+    std::vector<uint8_t> code;
+    std::string errors;
+    bool ok = compile_cached(hlsl, "nv2a_vsh", {"vs_2_0", "vs_2_a"}, code, errors);   // disk cache, see shader_cache.h
+    if (!ok) {
         vs->translate_failed = true;
-        logf("[vsh] compile failed for shader %p: %s", vs, errors ? (const char *)errors->GetBufferPointer() : "?");
+        logf("[vsh] compile failed for shader %p: %s", vs, errors.c_str());
         static std::atomic<int> dumped{0};
         if (dumped++ < 3) logf("[vsh] HLSL:\n%s", hlsl.c_str());
-    } else if (FAILED(host3d::dev()->CreateVertexShader((const DWORD *)code->GetBufferPointer(), &vs->host_vs))) {
+    } else if (FAILED(host3d::dev()->CreateVertexShader((const DWORD *)code.data(), &vs->host_vs))) {
         vs->translate_failed = true;
         logf("[vsh] CreateVertexShader failed for shader %p", vs);
     } else {
         static std::atomic<int> n{0};
         if (++n <= 30) logf("[vsh] shader %p translated (%u instructions)", vs, vs->program_insts);
     }
-    if (code) code->Release();
-    if (errors) errors->Release();
     return vs->host_vs;
 }
 

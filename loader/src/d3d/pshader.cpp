@@ -4,6 +4,7 @@
 #include "perf.h"
 #include "d3d/nv2a_psh.h"
 #include "d3d/state.h"
+#include "d3d/shader_cache.h"
 
 #include "d3d/compiler.h"
 
@@ -80,32 +81,23 @@ IDirect3DPixelShader9 *ps_host_shader()
     }
 
     std::string hlsl = psh_to_hlsl(def, cube);
-    perf::Scope perf_scope(perf::kCompile);
-    perf::add_compile();
-    ID3DBlob *code = nullptr, *errors = nullptr;
-    HRESULT hr = E_FAIL;
-    for (const char *profile : {"ps_2_0", "ps_2_a", "ps_2_b"}) {
-        if (errors) { errors->Release(); errors = nullptr; }
-        hr = xd3d::compile(hlsl.data(), hlsl.size(), "nv2a_psh", nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL2, 0,
-                        &code, &errors);
-        if (SUCCEEDED(hr)) break;
-    }
+    std::vector<uint8_t> code;
+    std::string errors;
+    bool ok = compile_cached(hlsl, "nv2a_psh", {"ps_2_0", "ps_2_a", "ps_2_b"}, code, errors);   // disk cache, see shader_cache.h
     IDirect3DPixelShader9 *ps = nullptr;
     static int logged;
-    if (FAILED(hr)) {
-        logf("[psh] compile failed: %s", errors ? (const char *)errors->GetBufferPointer() : "?");
+    if (!ok) {
+        logf("[psh] compile failed: %s", errors.c_str());
         log_def(def);
         static int dumped;
         if (dumped++ < 3) logf("[psh] HLSL:\n%s", hlsl.c_str());
-    } else if (FAILED(host3d::dev()->CreatePixelShader((const DWORD *)code->GetBufferPointer(), &ps))) {
+    } else if (FAILED(host3d::dev()->CreatePixelShader((const DWORD *)code.data(), &ps))) {
         logf("[psh] CreatePixelShader failed");
         ps = nullptr;
     } else if (logged++ < 40) {
         logf("[psh] pixel shader #%zu translated (cube mask 0x%x)", g_cache.size() + 1, cube);
         log_def(def);
     }
-    if (code) code->Release();
-    if (errors) errors->Release();
     g_cache[k] = ps; // failures are cached too (drawn with the fallback)
     memcpy(last_key, key, n * 4);
     last_n = n;

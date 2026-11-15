@@ -10,6 +10,7 @@
 // port's own (handled and cleared here), the others go on to the game and are logged.
 #include "fe/calls.h"
 #include "checkpoints.h"
+#include "fe/coop_menu.h"
 
 #include "common.h"
 #include "d3d/host.h"
@@ -64,6 +65,7 @@ void refresh_ui()
 void pc_page(const char *id, const char *, const char *)
 {
     g_page = atoi(id);
+    if (coop_menu_page(g_page)) { g_ui = Ui::None; logf("fe: CO-OP page %d open", g_page); return; }   // fe/coop_menu.cpp fills them
     g_ui = g_page == kKeysPage ? Ui::Keys : Ui::Page;
     if (g_ui == Ui::Keys) bindlist::open();
 }
@@ -98,6 +100,13 @@ void pc_quit(const char *, const char *, const char *)
 
 // CONTINUE LAST GAME on the main menu (fe/pages.cpp main_menu_quit): the kept checkpoint's mission, started there
 void pc_continue(const char *, const char *, const char *) { checkpoints_continue(); }
+// the CO-OP page (fe/pages.cpp): HOST GAME (1) / JOIN GAME (2). Step 1 of the co-op menu: the choice is logged only.
+void pc_coop(const char *id, const char *, const char *)
+{
+    logf("fe: CO-OP: action %s", id);
+    coop_menu_action(atoi(id));
+}
+void pc_coop_change(const char *id, const char *dir, const char *) { coop_menu_change(atoi(id), atoi(dir)); }
 
 // a page found its menu gone and made it again (fe/pages.cpp emit_heal)
 void pc_healed(const char *, const char *, const char *) { logf("fe: a page's menu was gone; made again"); }
@@ -118,6 +127,8 @@ const Handler kHandlers[] = {
     {"PCHealed", pc_healed},
     {"PCQuit", pc_quit},
     {"PCContinue", pc_continue},
+    {"PCCoop", pc_coop},
+    {"PCCoopChange", pc_coop_change},
 };
 
 } // namespace
@@ -126,6 +137,7 @@ const Handler kHandlers[] = {
 static int __cdecl fe_dispatch(uint8_t *fe)
 {
     fe_vars_poll();
+    coop_menu_poll();
     static int s_tick;
     bool tick = s_tick++ % 15 == 0; // values changed elsewhere (hotkeys, the window)
     static bool s_was_capturing; // the bindings list follows a capture every update, and once more when it ends
@@ -137,8 +149,15 @@ static int __cdecl fe_dispatch(uint8_t *fe)
     Field name(fe, kName, kNameSize), p1(fe, kParam[0], kParamSize), p2(fe, kParam[1], kParamSize),
         p3(fe, kParam[2], kParamSize);
     if (strncmp(name.s, "PC", 2) != 0) {
-        logf("fe: game call %s('%s', '%s', '%s')", name.s, p1.s, p2.s, p3.s);
-        if (!strcmp(name.s, "RestartLevel") || !strcmp(name.s, "RestartMission")) checkpoints_drop("the mission restarts");
+        bool held = coop_menu_game_call(name.s, p1.s, p2.s, p3.s);
+        if (!held) logf("fe: game call %s('%s', '%s', '%s')", name.s, p1.s, p2.s, p3.s);
+        if (held) {   // the CO-OP lobby held this call (fe/coop_menu.cpp; the briefing page repeats it every frame)
+            *(int32_t *)(fe + kTrigger) = 0;
+            fe[kName] = 0;
+            for (uint32_t off : kParam) fe[off] = 0;
+            return 1;
+        }
+        if (!held && (!strcmp(name.s, "RestartLevel") || !strcmp(name.s, "RestartMission"))) checkpoints_drop("the mission restarts");
         return 0;
     }
     logf("fe: port call %s('%s', '%s', '%s')", name.s, p1.s, p2.s, p3.s);

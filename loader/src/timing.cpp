@@ -134,7 +134,17 @@ extern "C" uint32_t __cdecl refire_interval(uint32_t bits)
             left = left - step;
             n++;
         } while (left > 0.0f);
-        t = (2.0f * (float)n - 0.5f) * (1.0f / 60.0f);
+        // Co-op merge (owner 20261115: "the glock seems to not fire some bullet if you keep the trigger pushed"): with
+        // the trigger held the Glock (0.3 s, n = 10) fired at 37 / 20 / 37 / 20 frames - the shot due on the 20th frame
+        // missed every second time and waited ~17 frames more (the weapon stayed in its fire state with the timer below
+        // 0; 0.3.0's 18-19 frames and native 30 fps (10 frames) were steady). One 1/60 s step earlier (the 19th frame)
+        // is steady (19 19 19 ...). Only for the slow weapons (>= 0.25 s: at most ~5% faster than the 30 fps rhythm);
+        // the fast ones keep the exact count (one step there would be up to 20% more fire rate).
+        // BLACK_REFIRE_BACK=<steps> forces one value for every weapon (test; 0.5 = upstream).
+        static float back = -1.0f;
+        if (back < 0.0f) { const char *e = getenv("BLACK_REFIRE_BACK"); back = e ? (float)atof(e) : 0.0f; }
+        float b = back > 0.0f ? back : (t >= 0.25f ? 1.5f : 0.5f);
+        t = (2.0f * (float)n - b) * (1.0f / 60.0f);
     }
     memcpy(&bits, &t, 4);
     return bits;

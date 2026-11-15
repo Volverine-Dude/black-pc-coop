@@ -41,6 +41,11 @@ bool movie_playing()
     return p && playing_once(p);
 }
 
+bool movies_playing()   // co-op code (fe/coop_menu.cpp): the same test as movie_playing
+{
+    return movie_playing();
+}
+
 void movies_poll(uint16_t buttons, const uint8_t analog[8], bool enter)
 {
     bool down = analog[0] > 30 || (buttons & 0x10) || enter; // A, START or Enter

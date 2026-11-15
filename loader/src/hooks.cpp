@@ -148,8 +148,10 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *ep)
         int i = probe_index((uint32_t)(uintptr_t)ep->ExceptionRecord->ExceptionAddress);
         if (i >= 0) {
             const uint32_t *s = (const uint32_t *)(uintptr_t)c->Esp;
-            uint32_t n = ++g_probe_hits[i];
-            if (n <= 50) {
+            // --probe-eax: only hits with this EAX are counted/logged (e.g. one body)
+            bool match = !g_cfg.probe_eax || c->Eax == g_cfg.probe_eax;
+            uint32_t n = match ? ++g_probe_hits[i] : 0;
+            if (match && n <= 50) {
                 XThread *t = xthread_current_or_null();
                 float xmm0 = 0.0f; // FXSAVE image: XMM0 at byte 160
                 if ((c->ContextFlags & CONTEXT_EXTENDED_REGISTERS) == CONTEXT_EXTENDED_REGISTERS) memcpy(&xmm0, c->ExtendedRegisters + 160, 4);

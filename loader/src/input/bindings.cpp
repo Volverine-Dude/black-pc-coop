@@ -20,6 +20,7 @@
 // Port actions (game index -1, at the end of the list) are not the game's: the lean keys go to input/lean.cpp, the
 // Sprint key to input/sprint.cpp, the Show weapon key to input/inspect.cpp.
 #include "input/bindings.h"
+#include "fe/coop_menu.h"
 #include "xbe.h"
 
 #include "common.h"
@@ -73,6 +74,7 @@ const Action kActions[] = {
     {"lean_right", L"Lean right", -1, {'B', 0}},
     {"sprint", L"Sprint", -1, {VK_LSHIFT, 0}}, // input/sprint.cpp (PC SETTINGS > CONTROLS > SPRINT)
     {"inspect", L"Show weapon", -1, {'T', 0}}, // input/inspect.cpp
+    {"coopsprint", L"Sprint (co-op)", -1, {VK_SHIFT, 0}},   // co-op sprint (the host's lobby option; the pad's L1 too, input/xinput.cpp)
 };
 constexpr int kCount = sizeof kActions / sizeof kActions[0];
 constexpr int kPause = 21;
@@ -219,6 +221,7 @@ uint16_t wheel_key(int wheel)
     return held;
 }
 
+bool g_sprint_key; // the Sprint key is held (apply)
 const int32_t *game_table()
 {
     if (!mouselook_installed()) return nullptr; // not the build these addresses are for
@@ -339,8 +342,36 @@ int take_menu_input()
 bool g_click_held; // a left click outside play (the mouse is free there)
 bool menu_select_held() { return g_menu_select || g_click_held; }
 
+bool sprint_held() { return g_sprint_key; }
+bool intro_text() { return !in_play() && no_menu_page() && !hint_stopped(); }   // a mission's intro text types out (START skips it)
+// the pad input that feeds a game action's channel (buttons and triggers; not the stick axes)
+static int action_channel(int game_action)
+{
+    const int32_t *t = game_table();
+    return t && game_action >= 0 && game_action < 37 ? t[game_action] : -1;
+}
+bool action_down(int game_action, uint16_t buttons, const uint8_t analog[8])
+{
+    int ch = action_channel(game_action);
+    if (ch < 0) return false;
+    if (ch < 4) return (buttons & (1 << ch)) != 0;
+    if (ch >= 12 && ch < 16) return (buttons & (0x10 << (ch - 12))) != 0;
+    if (ch >= 16 && ch < 24) return analog[ch - 16] > 30;
+    return false;
+}
+void clear_action(int game_action, uint16_t &buttons, uint8_t analog[8])
+{
+    int ch = action_channel(game_action);
+    if (ch < 0) return;
+    if (ch < 4) buttons &= (uint16_t)~(1 << ch);
+    else if (ch >= 12 && ch < 16) buttons &= (uint16_t)~(0x10 << (ch - 12));
+    else if (ch >= 16 && ch < 24) analog[ch - 16] = 0;
+}
 bool in_play()
 {
+    // co-op: the world now runs under the pause menu and the mission failed screen, so the player's frame keeps
+    // ticking - those screens still need the menu keys (play 20261114_000151: nothing could be chosen)
+    if (coop_game_paused() || g_coop_mission_failed) return false;
     uint32_t f = mouselook_play_frame();
     return f && g_frame_count - f <= 3;
 }
@@ -392,7 +423,7 @@ void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16
     const int32_t *table = game_table();
     bool pause_down = false;
     int lean = 0;
-    bool sprint = false, inspect = false;
+    bool sprint = false, inspect = false, coop_sprint = false;
     for (int i = 0; play && i < kCount && table; i++) {
         bool down = false;
         for (int s = 0; s < kSlots; s++) down |= held(g_keys[i][s]);
@@ -403,6 +434,7 @@ void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16
             else if (!strcmp(kActions[i].ini, "lean_right")) lean++;
             else if (!strcmp(kActions[i].ini, "sprint")) sprint = true;
             else if (!strcmp(kActions[i].ini, "inspect")) inspect = true;
+            else if (!strcmp(kActions[i].ini, "coopsprint")) coop_sprint = true;
             continue;
         }
         int ch = table[kActions[i].game];
@@ -415,8 +447,9 @@ void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16
         press_channel(ch, p);
     }
     lean_input(lean); // 0 outside play: the view eases back upright
-    sprint_input(sprint);
-    inspect_input(inspect);
+    sprint_input(sprint && !g_cfg.coop_role);   // the solo Sprint option: off in a co-op session (owner: co-op has its own)
+    inspect_input(inspect && !g_cfg.coop_role);   // solo only, like the solo Sprint
+    g_sprint_key = coop_sprint;
     bool menu_esc = false;
     int input = 0;
     ULONGLONG now = GetTickCount64();
@@ -445,6 +478,8 @@ void apply(uint16_t &buttons, uint8_t analog[8], int16_t &lx, int16_t &ly, int16
         g_click_held = click;
     }
     host3d::set_cursor_hidden(!play && movie_playing()); // no cursor over a movie
+    if (input == 6 && g_coop_code_len > 0) input = 0;
+    if (input == 5 && coop_skip_holding()) input = 0;   // a co-op movie: Enter only counts as the skip request   // Backspace edits the CO-OP code
     if (input) {
         g_menu_input_frame = g_frame_count.load();
         g_menu_input = input;

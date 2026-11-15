@@ -266,3 +266,30 @@ NTSTATUS __stdcall NtQueryVirtualMemory(void *BaseAddress, MEMORY_BASIC_INFORMAT
 }
 
 } // namespace xk
+
+// test (0.4.0 merge, the front-end heap): free contiguous RAM and the largest free block
+void contig_report(const char *why)
+{
+    std::lock_guard<std::mutex> g(g_contig_mutex);
+    uint64_t total = 0; uint32_t big = 0, bigat = 0;
+    for (auto &kv : g_contig_free) { total += kv.second; if (kv.second > big) { big = kv.second; bigat = kv.first; } }
+    logf("memory: %s: %llu KB contiguous RAM free, largest block %u KB at %08x (%zu blocks)", why, total >> 10, big >> 10, 0x80000000u + bigat, g_contig_free.size());
+}
+
+// region_grow.cpp: a part of an allocation the game no longer uses goes back to the free list (merged with its
+// neighbours); the allocation's own record is left as it is (the game never frees the arena).
+void contig_release(void *at, uint32_t size)
+{
+    uint32_t off = (uint32_t)((uint8_t *)at - g_contig_base);
+    std::lock_guard<std::mutex> g(g_contig_mutex);
+    auto next = g_contig_free.lower_bound(off);
+    if (next != g_contig_free.end() && next->first == off + size) {
+        size += next->second;
+        next = g_contig_free.erase(next);
+    }
+    if (next != g_contig_free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == off) { prev->second += size; return; }
+    }
+    g_contig_free[off] = size;
+}

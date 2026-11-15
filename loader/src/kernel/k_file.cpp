@@ -8,6 +8,7 @@
 #include "kernel/kexports.h"
 #include "kernel/nt.h"
 
+#include <intrin.h>
 #include <cctype>
 #include <map>
 #include <mutex>
@@ -340,6 +341,7 @@ bool kfile_init()
     return true;
 }
 
+void contig_report(const char *why);
 namespace xk {
 
 NTSTATUS __stdcall NtCreateFile(HANDLE *FileHandle, ACCESS_MASK DesiredAccess, XOBJECT_ATTRIBUTES *ObjectAttributes,
@@ -414,6 +416,29 @@ NTSTATUS __stdcall NtReadFile(HANDLE FileHandle, HANDLE Event, void *ApcRoutine,
         VirtualQuery(Buffer, &mi, sizeof mi);
         logf("[k] NtReadFile('%s', len 0x%x) failed 0x%08x (buffer %p, region %p + 0x%zx, state 0x%x)", handle_desc(FileHandle).c_str(),
              Length, s, Buffer, mi.BaseAddress, mi.RegionSize, (unsigned)mi.State);
+        if (!Buffer) {   // who asked (the allocation came back null): game return addresses on the stack
+            uint32_t *sp = (uint32_t *)_AddressOfReturnAddress();
+            char line[512]; int n = 0;
+            MEMORY_BASIC_INFORMATION sm = {};
+            VirtualQuery(sp, &sm, sizeof sm);
+            uint32_t *end = (uint32_t *)((uint8_t *)sm.BaseAddress + sm.RegionSize);
+            for (int i = 0; i < 400 && sp + i < end && n < 480; i++) {
+                uint32_t v = sp[i];
+                if (v >= 0x00011000 && v < 0x00290000) n += snprintf(line + n, sizeof line - n, " %08x", v);
+            }
+            logf("[k] NtReadFile null buffer: stack game addresses%s", line);
+            ::contig_report("menu read failed");
+            {   // the game's memory manager 0x2D12E8: current region, flag, region records (9 dwords each)
+                const uint32_t *m = (const uint32_t *)(uintptr_t)0x002D12E8;
+                const uint8_t *mb = (const uint8_t *)m;
+                logf("[k] memory manager: +364 cur region %08x, +370 flag %u, +374 arena %08x", m[0x364 / 4], mb[0x370], m[0x374 / 4]);
+                for (int r = 0; r < 16; r++) {
+                    const uint32_t *q = (const uint32_t *)(mb + 4 + r * 0x24);
+                    logf("[k]   region %2d @%08x: start %08x end %08x cur %08x (used %u KB of %u KB) align %u base %08x", r,
+                         0x002D12E8 + 4 + r * 0x24, q[2], q[3], q[4], (q[4] - q[2]) >> 10, (q[3] - q[2]) >> 10, q[5], q[8]);
+                }
+            }
+        }
     }
     return s;
 }

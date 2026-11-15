@@ -10,6 +10,7 @@
 #include "input/menu_mouse.h"
 #include "input/mouselook.h"
 #include "input/movies.h"
+#include "fe/coop_menu.h"
 #include "xbe.h"
 
 #include <algorithm>
@@ -22,6 +23,7 @@ uint32_t g_pad_watch;
 
 namespace xinput {
 namespace {
+bool g_script_lb; // a scripted "lb" press this poll (co-op sprint tests)
 
 #pragma pack(push, 1)
 struct XGamepad { // Xbox XINPUT_GAMEPAD
@@ -267,6 +269,7 @@ void apply_presses(XGamepad &g)
         else if (b == "rt") g.bAnalogButtons[7] = 255;
         else if (b == "lthumb") g.wButtons |= 0x40;
         else if (b == "rthumb") g.wButtons |= 0x80;
+        else if (b == "lb") g_script_lb = true;   // the left shoulder = co-op SPRINT
         static uint32_t logged_frame;
         if (logged_frame != p.frame) {
             logged_frame = p.frame;
@@ -299,7 +302,8 @@ int mouse_look(bool live, int *raw_wheel)
     float k = 0.022f * g_cfg.mouse_sens; // degrees per count
     // The game's yaw rate is positive to the left and its pitch rate positive downwards (mouse dy > 0 = towards
     // the user = look down).
-    mouselook_set_frame(-dx * k, (g_cfg.mouse_invert ? -dy : dy) * k);
+    if (!g_coop_downed && !coop_game_paused()) // downed spectator: no look control; co-op pause menu open: the world runs, no look
+        mouselook_set_frame(-dx * k, (g_cfg.mouse_invert ? -dy : dy) * k);
     return wheel;
 }
 
@@ -311,7 +315,11 @@ void read_pad(uint32_t port, XGamepad &g)
     if (port != 0) return;
     static uint32_t polls, absent[4]; // absent: the poll count when a slot was last found empty
     polls++;
-    for (DWORD i = 0; g_pc_get && i < 4; i++) {
+    bool lb = false;
+    g_script_lb = false;
+    // --no-pc-pad (tests): real PC controllers are merged WITHOUT a focus check, so a
+    // connected pad's stick moved scripted runs' menus (black-coop runs 46/53).
+    for (DWORD i = 0; g_pc_get && !g_cfg.no_pc_pad && i < 4; i++) {
         if (absent[i] && polls - absent[i] < 120) continue;
         PcState pc = {};
         if (g_pc_get(i, &pc) != ERROR_SUCCESS) {
@@ -326,7 +334,10 @@ void read_pad(uint32_t port, XGamepad &g)
         if (p.wButtons & 0x4000) g.bAnalogButtons[2] = 255; // X
         if (p.wButtons & 0x8000) g.bAnalogButtons[3] = 255; // Y
         if (p.wButtons & 0x0200) g.bAnalogButtons[4] = 255; // BLACK = right shoulder
-        if (p.wButtons & 0x0100) g.bAnalogButtons[5] = 255; // WHITE = left shoulder
+        if (p.wButtons & 0x0100) { // WHITE = left shoulder; with co-op SPRINT on it is SPRINT (WHITE = only "next music track")
+            if (g_coop_sprint_allowed) lb = true;
+            else g.bAnalogButtons[5] = 255;
+        }
         g.bAnalogButtons[6] = max8(g.bAnalogButtons[6], p.bLeftTrigger);
         g.bAnalogButtons[7] = max8(g.bAnalogButtons[7], p.bRightTrigger);
         merge_stick(g.sThumbLX, g.sThumbLY, p.sThumbLX, p.sThumbLY);
@@ -339,7 +350,33 @@ void read_pad(uint32_t port, XGamepad &g)
     int wheel = mouse_look(live, &raw_wheel);
     if (!bindings::capture_poll(focus, raw_wheel)) // while the key bindings page waits for a key, keys bind instead
         bindings::apply(g.wButtons, g.bAnalogButtons, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY, focus, live, wheel);
-    movies_poll(g.wButtons, g.bAnalogButtons, bindings::menu_select_held());
+    // DOWNED (co-op): runs AFTER every input source is merged - pad, scripted presses
+    // AND the keyboard/mouse bindings - so a downed keyboard player is locked out too
+    // and a keyboard survivor's X key revives. The downed player has no control
+    // (coop.cpp parks the pawn beside the survivor and copies their look).
+    if (g_coop_downed && !g_coop_mission_failed) memset(&g, 0, sizeof g);   // (the mission failed screen needs the pad)
+    {   // co-op SPRINT (owner 20261115: "a sprint button bound to L1, only the host can turn it on or off; faster, the
+        // weapon lowered, faster bobbing; the player can't fire while sprinting"). Held L1 / the Sprint key while pushing
+        // forward (left stick up), not aiming, not downed. coop/coop.cpp scales the run speed, d3d/draw.cpp lowers the gun;
+        // here the FIRE action's input is released while sprinting and until the gun is back up.
+        bool held = lb || g_script_lb || bindings::sprint_held();
+        bool can = g_coop_sprint_allowed && g_cfg.coop_role && bindings::in_play() && !g_coop_downed && !coop_game_paused();
+        bool aim = bindings::action_down(16, g.wButtons, g.bAnalogButtons);   // 16 = aim
+        bool want = can && held && g.sThumbLY > 12000 && !aim;
+        static ULONGLONG last; ULONGLONG now = GetTickCount64();
+        float dt = last ? (float)(now - last) / 1000.0f : 0.0f; last = now;
+        if (dt > 0.1f) dt = 0.1f;
+        float b = g_coop_sprint_blend + (want ? dt : -dt) / 0.18f;   // 0.18 s to lower / raise
+        g_coop_sprint_blend = b < 0.0f ? 0.0f : b > 1.0f ? 1.0f : b;
+        if (want != (g_coop_sprinting != 0)) logf("[input] co-op SPRINT %s", want ? "start" : "stop");
+        g_coop_sprinting = want ? 1 : 0;
+        if (want || g_coop_sprint_blend > 0.35f) bindings::clear_action(9, g.wButtons, g.bAnalogButtons);   // 9 = fire
+    }
+    coop_notify_x_press(g.bAnalogButtons);   // the survivor's X = revive (eaten while the peer is down)
+    bool enter = bindings::menu_select_held();
+    coop_skip_gate(g.wButtons, g.bAnalogButtons, enter);
+    coop_intro_gate(g.wButtons, enter);   // co-op: one player's START skips the mission's intro text for both   // co-op: a movie is skipped when BOTH players pressed (fe/coop_menu.cpp)
+    movies_poll(g.wButtons, g.bAnalogButtons, enter);
 }
 
 } // namespace
