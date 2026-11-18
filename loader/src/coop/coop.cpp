@@ -5349,13 +5349,33 @@ static uint32_t coop_build_one(uint32_t type, uint32_t tidx, const float pos[3],
             // non-squad type here (after the factory: the look is already built), so they join their team's own
             // formation (the manager's +0x30), led by our own clone. TRIED: still crashed (the team formation left the same gap) -
             // the FORMATION GUARD (FUN_001A01A0) is the fix; this stays as a test switch: COOP_BRAIN_TYPE=<hex> (default: keep).
+            // NON-SQUAD TEST (two-PC play 20261117, Level_07: a door that should explode never did on either copy; the owner
+            // suspects a squad-ally script): our clone / self model brains carry the SQUAD type (+CA8 0x1E) and sit in the
+            // player's squad formation - a script order to "the squad" may land on them (their think step is skipped).
+            // -31 test: COOP_BRAIN_TYPE=auto = the level's common soldier type index (the first type record with slot 0).
+            // RESULT (two-PC play, -31): "squad formation members 2 -> 2" - the factory joins the squad formation
+            // before this runs, so the type change does not take our bodies out of it; and the Level_07 door was the
+            // PLAYERS' job (owner), not a squad script. Default back to KEEP; =<hex> = that index, =auto = the test.
             static int bt = -2;
-            if (bt == -2) { char e[16] = {0}; bt = GetEnvironmentVariableA("COOP_BRAIN_TYPE", e, sizeof e) ? (strcmp(e, "keep") == 0 ? -1 : (int)strtol(e, nullptr, 16)) : -1; }   // default keep: the formation guard fixed it
-            uint32_t ty = *(volatile uint32_t *)(uintptr_t)(brain + 0xCA8);
-            if (bt >= 0 && (ty == 0x1D || ty == 0x1E || ty == 0x1F)) {
-                *(volatile uint32_t *)(uintptr_t)(brain + 0xCA8) = (uint32_t)bt;
-                logf("coop: own spawn: brain %08x type %x -> %x (no squad formation for our bodies)", brain, ty, bt);
+            if (bt == -2) { char e[16] = {0}; bt = GetEnvironmentVariableA("COOP_BRAIN_TYPE", e, sizeof e) ? (strcmp(e, "keep") == 0 ? -1 : strcmp(e, "auto") == 0 ? -3 : (int)strtol(e, nullptr, 16)) : -1; }
+            int want = bt;
+            if (want == -3) {   // auto: the common soldier
+                want = -1;
+                uint32_t lm = *(volatile uint32_t *)(uintptr_t)0x002D1980;
+                for (uint32_t i = 0; lm >= 0x80000000 && lm < 0x84000000 && i < 0x2C && want < 0; i++) {
+                    uint32_t t0 = 0, t2 = 0;
+                    coop_safe_copy(&t0, lm + 0x7A20 + i * 0x40, 4); coop_safe_copy(&t2, lm + 0x7A20 + i * 0x40 + 8, 4);
+                    if (t0 && t2 == 0) want = (int)i;
+                }
             }
+            uint32_t ty = *(volatile uint32_t *)(uintptr_t)(brain + 0xCA8);
+            if (want >= 0 && (ty == 0x1D || ty == 0x1E || ty == 0x1F)) {
+                uint32_t sqn0 = 0; coop_safe_copy(&sqn0, R + 0x22B40 + 0x14, 4);
+                *(volatile uint32_t *)(uintptr_t)(brain + 0xCA8) = (uint32_t)want;
+                uint32_t sqn1 = 0; coop_safe_copy(&sqn1, R + 0x22B40 + 0x14, 4);
+                logf("coop: own spawn: brain %08x type %x -> %x (%s; no squad type for our bodies) | squad formation members %u -> %u",
+                     brain, ty, want, bt == -3 ? "auto: the common soldier" : "COOP_BRAIN_TYPE", sqn0, sqn1);
+            } else if ((ty == 0x1D || ty == 0x1E || ty == 0x1F) && bt == -3) logf("coop: own spawn: brain %08x keeps the squad type %x (no common soldier type found)", brain, ty);
         }
         if (w[4] == 0 && w[12] != 0) {
             *(volatile uint32_t *)(uintptr_t)(brain + 0x1EF0) = 0;
@@ -9968,6 +9988,13 @@ struct PjMsg { uint32_t seq, kind, w1, w2; float mat[16], vel[4]; uint32_t fn; }
 static int g_pj_on = -1;
 volatile uint32_t g_pj_resume, g_pj_ecx, g_pj_edi, g_pj_ebx, g_pj_esp, g_pj_skip, g_pj_replaying;
 volatile uint32_t g_gr_a, g_gr_resume;     // FUN_001e7b60 (grenade throw): EAX at entry = the thrower's anim instance ([EAX] = body)
+// GRENADE LAUNCHER (two-PC play 20261117, owner: "the joiner doesn't spawn grenades from his grenade launcher"): the
+// launcher fires through FUN_001e3000 (EAX = the weapon, the shooter at [weapon + 0xF0]; its only caller 0x1E896E in
+// the weapon fire code), which spawns the grenade with FUN_001dd000 at 0x1E328A - a fourth call site the projectile
+// sync did not hook. On the joiner the blast (FUN_001e3680, ret 0x1E3763) then failed the "our hand-grenade count
+// dropped" test and was skipped as a local enemy copy's -> the host never got the joiner's launcher grenades. The
+// call at 0x1E896E notes the weapon; 0x1E328A goes through the throw thunk; a launch of OUR player counts as ours.
+volatile uint32_t g_gl_w, g_gl_fn;
 static uint32_t g_pj_pool;                                   // the last pool seen in a local call
 static PjMsg g_pj_out[8]; static int g_pj_out_n; static PjMsg g_pj_prev[8]; static int g_pj_prev_n;
 static PjMsg g_pj_in[16]; static int g_pj_in_n; static uint32_t g_pj_seq, g_pj_last_in;
@@ -9990,7 +10017,8 @@ extern "C" void coop_pj_check(void)
     // FUN_001dd000(matrix*, velocity*, kind, flag) with EDI = the pool [0x2D1998], RET 0x10; kind 3 = a player
     // (call 0x1e3464), 1 = an ally (0x1e348b), 0 = an enemy (0x1e34a8). Objects: pool + i*0x120, used flags +0x3700 (32).
     bool thrown = ret == 0x001E3469 || ret == 0x001E3490 || ret == 0x001E34AD;
-    if (ret != 0x001E8794 && ret != 0x001E8802 && !gren && !thrown) return;      // not a weapon rocket / grenade throw
+    bool launched = ret == 0x001E328F;   // the grenade launcher (FUN_001e3000)
+    if (ret != 0x001E8794 && ret != 0x001E8802 && !gren && !thrown && !launched) return;      // not a weapon rocket / grenade throw
     g_pj_pool = g_pj_ecx;
     uint32_t wctx = g_pj_ebx, w = 0, owner = 0;
     if (gren) {
@@ -9999,9 +10027,12 @@ extern "C" void coop_pj_check(void)
         static int gl;
         if (gl++ < 12) logf("coop: projectile sync: GRENADE throw, EAX %08x -> thrower %08x", g_gr_a, owner);
     } else if (thrown) { coop_safe_copy(&owner, wctx + 0xF0, 4); gren = true; }
+    else if (launched) { if (g_gl_w) coop_safe_copy(&owner, g_gl_w + 0xF0, 4); gren = true; thrown = true; }
     else { coop_safe_copy(&w, wctx + 4, 4); if (w) coop_safe_copy(&owner, w + 0xF0, 4); }
     uint32_t me = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
     bool ours = owner && owner == me;
+    if (launched && ours && g_cfg.coop_role == 2) { g_my_gren++; g_my_gren_ms = GetTickCount64(); }   // its blast is ours (the relay test)
+    if (launched) { static int ll; if (ll++ < 20) logf("coop: projectile sync: LAUNCHER grenade of %08x (weapon %08x, %s)", owner, g_gl_w, ours ? "ours" : "not ours"); }
     if (!ours && (g_cfg.coop_role == 2 || owner == g_p10_gdst)) {
         g_pj_skip = 1; g_pj_stats[1]++;
         static int sl;
@@ -10032,6 +10063,41 @@ __declspec(naked) void coop_thunk_grenade_throw()   // FUN_001e7b60 entry: 55 8B
     }
 }
 volatile uint32_t g_pj_resume_gr;
+// GRENADE LAUNCHER, take 2 (two-PC play 20261117 -29: still "the joiner's launcher doesn't fire its round" - no
+// "LAUNCHER grenade" line, FUN_001e3000 / 0x1E328A was not the launcher). The launcher's round: the weapon state
+// machine (0x1EFBA7 / 0x1EFEAA / 0x1EFEC1) -> FUN_001e2b90 (EBX = the weapon context: shooter = [[EBX+4]+0xF0]; side
+// 3 player / 1 ally / 0 enemy) -> FUN_001dce60 at 0x1E2D26 (stdcall 3 args, EDI = the pool [0x2D1998], ret 0xC) = the
+// round. On the joiner a round of OUR player is counted in g_my_gren so its blast passes the explosion relay (it was
+// skipped as "a local enemy copy's grenade" - the host never got it). The call itself runs unchanged.
+volatile uint32_t g_glr_ebx, g_glr_fn;
+extern "C" void coop_gl_round_check(void)
+{
+    if (g_cfg.coop_role != 2) return;
+    uint32_t w = 0, owner = 0;
+    if (!coop_safe_copy(&w, g_glr_ebx + 4, 4) || !coop_safe_copy(&owner, w + 0xF0, 4)) return;
+    uint32_t me = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+    bool ours = owner && owner == me;
+    if (ours) { g_my_gren++; g_my_gren_ms = GetTickCount64(); }
+    static int ll;
+    if (ll++ < 20) logf("coop: projectile sync: LAUNCHER round of %08x (%s)", owner, ours ? "ours - its blast goes to the host" : "not ours");
+}
+__declspec(naked) void coop_thunk_gl_round()
+{
+    __asm {
+        pushad
+        mov dword ptr [g_glr_ebx], ebx
+        call coop_gl_round_check
+        popad
+        jmp dword ptr [g_glr_fn]
+    }
+}
+__declspec(naked) void coop_thunk_gl_fire()    // the call at 0x1E896E -> FUN_001e3000: note the weapon (EAX)
+{
+    __asm {
+        mov dword ptr [g_gl_w], eax
+        jmp dword ptr [g_gl_fn]
+    }
+}
 __declspec(naked) void coop_thunk_throw()      // the thrown-grenade calls -> FUN_001dd000 (EDI = pool)
 {
     __asm {
@@ -10170,6 +10236,16 @@ static void install_projectile_sync(void)
         gc[5] = 0x90;
     }
     g_pj_resume = fn; g_pj_resume_gr = xbe_va(0x001DD000);
+    {   // the grenade launcher round: 0x1E2D26 -> FUN_001dce60 (see coop_gl_round_check)
+        uint32_t c = xbe_va(0x001E2D26);
+        auto *pc = (uint8_t *)(uintptr_t)c;
+        int32_t r = 0; memcpy(&r, pc + 1, 4);
+        if (pc[0] == 0xE8 && c + 5 + r == xbe_va(0x001DCE60)) {
+            g_glr_fn = xbe_va(0x001DCE60);
+            int32_t n = (int32_t)((uintptr_t)coop_thunk_gl_round - (c + 5)); memcpy(pc + 1, &n, 4);
+            logf("coop: projectile sync: grenade launcher round hooked (0x1e2d26 -> FUN_001dce60)");
+        } else logf("coop: projectile sync: grenade launcher call site does not match - not hooked");
+    }
     for (int i = 0; i < 6; i++) {
         auto *c = (uint8_t *)(uintptr_t)calls[i];
         int32_t rel = (int32_t)((uintptr_t)(i < 3 ? (void *)coop_thunk_projectile : (void *)coop_thunk_throw) - (calls[i] + 5));
