@@ -1891,6 +1891,7 @@ static void coop_trig_targets_log(uint32_t o, bool fired)
          o, vt == 0x0028EF88 ? "A" : vt == 0x0028ED40 ? "E" : "relay", o == g_trig_replay_this ? "replay of the partner's" : "fired here",
          coop_world_part(), me[0], me[1], me[2], pa[0], pa[1], pa[2], cnt, buf);
 }
+static void coop_door_pull(uint32_t o);
 extern "C" void coop_on_trigger_fire(void)
 {
     {   // RELAY SOURCE (log only): class vt 0x0028EE28 one-shots fire on the host only (trig_compare, -19 .. -21) - they are
@@ -1911,6 +1912,7 @@ extern "C" void coop_on_trigger_fire(void)
     }
     coop_on_trigger_fire_inner();
     coop_trig_targets_log(g_tf_this, g_tf_skip == 0);   // what a one-shot acts on (the door hunt)
+    if (g_tf_skip == 0) coop_door_pull(g_tf_this);   // mission 8's last door: the player left behind is pulled through
     coop_tl_record(g_tf_this, g_tf_skip == 0);   // the ledger: what really fired here
 }
 __declspec(naked) void coop_thunk_trigger_fire()     // FUN_001bf670 entry: 83 B9 20 01 00 00 02 (cmp [ecx+0x120], 2) re-executed
@@ -5488,6 +5490,51 @@ volatile unsigned long long g_coop_info_msg_until;
 char g_coop_warn_msg[96];                    // fe/coop_menu.cpp sets it (the joiner's save warning); d3d/device.cpp draws it
 volatile unsigned long long g_coop_warn_msg_until;
 static uint64_t g_cp_moved_ms;              // when the checkpoint rule last moved our player
+// THE DOOR PULL (owner 20261118: "have the lagging player teleport in front of the player ahead when that trigger").
+// Mission 8's last room: crossing its threshold (x ~ 440) fires three class-A one-shots (81af43a0 / 81aedb80 /
+// 81aec820 in the -36 logs) and the door behind closes - the player still outside was locked out until the exit
+// countdown. When one of them fires here (our own or the partner's replay), a player who is up and more than 8 m
+// from the partner is moved ~1 m in front of the partner (along the partner's facing), once per load. Matched by the
+// trigger's raw +0xA0 position (as the ledger logs it), 1.5 m tolerance. COOP_DOOR_PULL=0 = off.
+static void coop_door_pull(uint32_t o)
+{
+    static int on = -1; static uint32_t done_seq = 0xFFFFFFFF;
+    if (on < 0) { char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_DOOR_PULL", e, sizeof e) && e[0] == '0'); }
+    if (!on || !g_cfg.coop_role || done_seq == g_load_seq) return;
+    uint32_t vt = 0;
+    if (!coop_safe_copy(&vt, o, 4) || (vt != 0x0028EF88 && vt != 0x0028ED40)) return;
+    float q[3] = {0, 0, 0};
+    if (!coop_safe_copy(q, o + 0xA0, 12)) return;
+    static const float door[3][3] = {{-442.3f, 69.3f, 124.3f}, {-123.5f, -69.3f, 438.8f}, {-124.2f, -69.3f, 443.5f}};
+    int k = -1;
+    for (int i = 0; i < 3 && k < 0; i++) {
+        float dx = q[0] - door[i][0], dy = q[1] - door[i][1], dz = q[2] - door[i][2];
+        if (dx * dx + dy * dy + dz * dz < 1.5f * 1.5f) k = i;
+    }
+    if (k < 0) return;
+    done_seq = g_load_seq;   // one door trigger per load decides; the other two are the same threshold
+    uint32_t po = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+    if (po < 0x80000000 || po >= 0x84000000) { logf("coop: door pull: trigger %08x fired - no player object", o); return; }
+    if (!g_coop_host_pawn_ok) { logf("coop: door pull: trigger %08x fired - no partner position", o); return; }
+    float pf[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
+    const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
+    float dx = f[0] - pf[0], dy = f[1] - pf[1], dz = f[2] - pf[2];
+    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (g_coop_downed || d <= 8.0f) {
+        logf("coop: door pull: trigger %08x fired - we are %.1f m from the partner%s, no pull", o, d, g_coop_downed ? " (downed)" : "");
+        return;
+    }
+    // coop_respawn_at lands 0.8 m BEHIND its feet along the yaw: aim 1.8 m ahead of the partner = ~1 m in front
+    float yaw = g_coop_host_yaw, yr = yaw * 0.0174532925f;
+    float tgt[3] = {pf[0] + 1.8f * sinf(yr), pf[1], pf[2] + 1.8f * cosf(yr)};
+    logf("coop: door pull: trigger %08x fired (door %d) - we are %.1f m behind (%.1f %.1f %.1f), moved in front of the partner (%.1f %.1f %.1f yaw %.0f)",
+         o, k, d, f[0], f[1], f[2], pf[0], pf[1], pf[2], yaw);
+    coop_respawn_at(tgt, yaw, false);
+    uint64_t now = GetTickCount64();
+    g_cp_moved_ms = now;
+    strncpy(g_coop_info_msg, "DOOR AHEAD - TELEPORTED TO YOUR PARTNER", sizeof g_coop_info_msg - 1);
+    g_coop_info_msg_until = now + 4000;
+}
 static void coop_cp_move(const float feet[3], float yaw, const char *why)
 {
     uint32_t ctrl = g_coop_last_ctrl, po = 0;
