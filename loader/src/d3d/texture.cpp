@@ -315,9 +315,66 @@ uint32_t texture_level_offset(const PixelContainer *pc, uint32_t face, uint32_t 
     return off;
 }
 
+// two-PC play 20261116 #22 (co-op joiner, mission 5 part 6): a texture resource held a data address that was not
+// readable (a3008202) and sample_hash faulted. #24 (20261116): a SECOND crash at sample_hash (blackrt+0xc4dea,
+// read 0x8aacf870) with the #22 guard IN PLACE - the guard only probed first / middle / last bytes, and this
+// resource's range had an UNMAPPED HOLE in the middle (the ends read fine).
+// #26 (20261116): a VirtualQuery PAGE WALK caught the hole but cost ~15 FPS - it ran BEFORE the texture-cache
+// skip, so every texture on every draw walked its whole range (hundreds of queries per fragmented heap range).
+// REMOVED. The protection now: the cheap pointer probes here + the hash itself under SEH (hash_texture: a
+// fault - hole, freed mid-frame, anything - skips THAT draw, the session lives).
+static bool texture_readable(const void *p, uint32_t bytes)
+{
+    if (!p) return false;
+    __try {
+        volatile uint8_t a = ((const volatile uint8_t *)p)[0];
+        volatile uint8_t b = bytes ? ((const volatile uint8_t *)p)[bytes - 1] : 0;
+        volatile uint8_t c = bytes > 2 ? ((const volatile uint8_t *)p)[bytes / 2] : 0;
+        (void)a; (void)b; (void)c;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// the hash itself under SEH: a range with a hole (or one that goes unreadable between the check and the walk)
+// faults HERE, under our handler - the draw is skipped, the session lives (#24's and #26's net).
+static bool hash_texture(const uint8_t *p, uint32_t bytes, uint32_t *out)
+{
+    if (!p) return false;
+    __try { *out = sample_hash(p, bytes); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *out = 0; return false; }
+}
+// two-PC play 20261117 (-24, joiner AV blackrt+0xC5B5A in host_texture): a texture's resource sat in a recycled level-part
+// slot; the data probe above skipped it once, then the next call faulted reading the PALETTE pointer itself
+// (pal = a278fe77, garbage) - the resource / palette HEADERS were read without protection. They are read under SEH now.
+static bool tex_headers_readable(const Resource *r, const Palette *pal)
+{
+    __try {
+        volatile uint32_t a = r->Data; (void)a;
+        volatile uint32_t f = ((const PixelContainer *)r)->Format; (void)f;
+        volatile uint32_t z = ((const PixelContainer *)r)->Size; (void)z;
+        if (pal) { volatile uint32_t d = pal->Data; (void)d; }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 IDirect3DBaseTexture9 *host_texture(Resource *r, Palette *pal)
 {
-    if (!r || !r->Data) return nullptr;
+    if (!r) return nullptr;
+    if (!tex_headers_readable(r, pal)) {
+        static std::atomic<int> badr{0};
+        if (badr.fetch_add(1) < 20) logf("d3d: texture %p / palette %p header is not readable - skipped this draw", (void *)r, (void *)pal);
+        return nullptr;
+    }
+    if (!r->Data) return nullptr;
+    {
+        auto *pc0 = (PixelContainer *)r;
+        uint32_t bytes0 = total_bytes(pc0);
+        bool ok = bytes0 < 0x4000000 && texture_readable(phys_to_virt(pc0->Data), bytes0) &&
+                  (!pal || fmt_of(pc0) != XFMT_P8 || texture_readable(phys_to_virt(pal->Data), 1024));
+        if (!ok) {
+            static std::atomic<int> bad{0};
+            if (bad.fetch_add(1) < 20) logf("d3d: texture %p data %08x (%u bytes, format %08x) is not readable - skipped this draw", (void *)r, pc0->Data, bytes0, pc0->Format);
+            return nullptr;
+        }
+    }
     perf::Scope perf_scope(perf::kTexture);
     auto *pc = (PixelContainer *)r;
     EnterCriticalSection(&g_cs);
@@ -332,9 +389,20 @@ IDirect3DBaseTexture9 *host_texture(Resource *r, Palette *pal)
     }
     e.checked_frame = frame;
     uint32_t bytes = total_bytes(pc);
-    uint32_t hash = sample_hash((const uint8_t *)phys_to_virt(pc->Data), bytes);
+    // #24: the hash runs under SEH (a range that goes unreadable between the check and the walk skips this draw)
+    uint32_t hash = 0; bool hashed = hash_texture((const uint8_t *)phys_to_virt(pc->Data), bytes, &hash);
     const void *palptr = pal ? phys_to_virt(pal->Data) : nullptr;
-    if (fmt_of(pc) == XFMT_P8 && pal) hash ^= sample_hash((const uint8_t *)palptr, 1024);
+    if (hashed && fmt_of(pc) == XFMT_P8 && pal) {
+        uint32_t ph = 0;
+        hashed = hash_texture((const uint8_t *)palptr, 1024, &ph);
+        if (hashed) hash ^= ph;
+    }
+    if (!hashed) {
+        static std::atomic<int> badh{0};
+        if (badh.fetch_add(1) < 20) logf("d3d: texture %p data %08x faulted in the hash - skipped this draw", (void *)r, pc->Data);
+        LeaveCriticalSection(&g_cs);
+        return nullptr;
+    }
     bool same_shape = e.tex && e.data == pc->Data && e.format == pc->Format && e.size == pc->Size;
     bool stale = !same_shape || e.dirty || e.hash != hash || (fmt_of(pc) == XFMT_P8 && e.palette != palptr);
     e.stable = stale ? 0 : std::min<uint32_t>(e.stable + 1, kStableChecks);

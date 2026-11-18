@@ -93,7 +93,7 @@ static ShotRay g_shot_in[64];  static int g_shot_in_r, g_shot_in_w;    // remote
 static uint32_t g_shot_stats[5];   // sent, received, used by clone pellets, dropped stale, extra replays
 static void coop_shot_recv(const ShotRay *rays, int n);
 static void coop_shot_catchup(uint32_t body);
-struct EnemyRec { uint32_t body; float hp; float feet[3]; float byaw, lyaw, lpitch; uint32_t fire; uint32_t id; uint32_t tgt; float bear; };   // bear: the host brain's aim bearing (+0x10 - +0x14, deg)   // tgt: 1 = the host player, 2 = the joiner (clone on the host)
+struct EnemyRec { uint32_t body; float hp; float feet[3]; float byaw, lyaw, lpitch; uint32_t fire; uint32_t id; uint32_t tgt; float bear; uint32_t sp; uint8_t tidx, tslot, part, havedef; uint32_t team; uint32_t dw[14]; uint32_t afp[4]; };   // sp/tidx/tslot/part/w10/w11: build-missing (the joiner builds a host enemy its own spawner cannot make)   // bear: the host brain's aim bearing (+0x10 - +0x14, deg)   // tgt: 1 = the host player, 2 = the joiner (clone on the host)
 // ENEMY IDENTITY (day 10, owner play 20261112_183200: "still having enemies syncing issue").
 // Pairing by body ADDRESS only holds while both copies spawn in the same order. In Veblensk the
 // enemies come from level triggers that fire when EACH copy's player gets there -> different
@@ -103,13 +103,25 @@ struct EnemyRec { uint32_t body; float hp; float feet[3]; float byaw, lyaw, lpit
 // enemy's id = (that ctx, its ordinal among the spawns of that ctx). Both copies build the table
 // locally; the host's packets carry ids, and the joiner translates every host body address to ITS
 // body with that id when the packet arrives - the rest of the sync keeps using local addresses.
-struct EnId { uint32_t body, ctx, id; uint8_t live, killing; uint64_t ms; };   // ms: when it appeared here   // killing: the joiner forced its hp to 0.01 for a host-ordered kill
+struct EnId { uint32_t body, ctx, id; uint8_t live, killing, part, built; uint64_t ms; };   // part: the world part when it appeared; built: the joiner built it for a host enemy   // ms: when it appeared here   // killing: the joiner forced its hp to 0.01 for a host-ordered kill
 static EnId g_enid[48]; static int g_enid_n;
+struct CtxWpn { uint32_t ctx, dw[14], afp[4]; }; static CtxWpn g_ctx_wpn[64]; static int g_ctx_wpn_n; static uint32_t g_ctx_wpn_w;
 static uint32_t g_class_objs[24]; static int g_class_objs_n;   // the class (brain) objects seen as spawn owners
 static struct { uint32_t ctx, count; } g_spawn_ctx[128]; static int g_spawn_ctx_n;
 static struct { uint32_t ctx, ord; } g_spawn_pend[32]; static int g_spawn_pend_n;
 static struct { uint32_t host, local; } g_hmap[48]; static int g_hmap_n; static uint32_t g_hmap_w;   // joiner: host body -> our body
 static struct { uint32_t id, host; } g_idhost[48]; static uint32_t g_idhost_w;   // joiner: enemy id -> the host's CURRENT body (latest enemy packet)
+// THE SPAWN-COUNT LEDGER (two-PC play 20261115 #15): the per-index spawn counts die at every part advance
+// (the new part's re-index starts at 0 - the play: the host spawned part 4's enemies 0.1 s BEFORE its
+// advance to part 5, and the joiner never learned them), and the CLSP tag (the LIVE world part) blocks
+// the counts whenever one copy has advanced while the other's table still lags. The ledger keeps every
+// counted spawn by SPAWNER OBJECT + the world part it was counted in; CLSP carries the ledger, and the
+// gate / the catch-up look the host's count up by OUR spawner's object + OUR indexed part. The object
+// addresses are the same on both copies; the part stamp defeats the slot-reuse aliasing. Cleared at
+// every level load / restart (coop_enid_reset).
+static struct { uint32_t obj; uint32_t part; uint32_t cnt; } g_sp_led[160]; static int g_sp_led_n;
+static struct { uint32_t obj; uint32_t part; uint32_t cnt; } g_sp_host_led[160]; static int g_sp_host_led_n;
+static int32_t g_sp_idx_part = -9;   // the world part our spawn table was indexed from
 // KILL DIRECTION (play 20261113_191753: "enemies' death animation knockback is not synced to the joiner"):
 // the joiner's forced kill shot flew from the host's clone to the victim -> the ragdoll / death fell away
 // from the clone, not from the real killer. The host remembers every enemy's LAST hit (the damage call's
@@ -205,9 +217,12 @@ static void coop_enid_mark_killing(uint32_t body)
 static void coop_enid_reset(void)
 {
     g_enid_n = 0; g_spawn_ctx_n = 0; g_spawn_pend_n = 0; g_hmap_n = 0; g_hmap_w = 0; g_class_objs_n = 0; g_pl_n = 0; memset(g_pl_all, 0, sizeof g_pl_all); g_pl_all_w = 0; memset(g_idhost, 0, sizeof g_idhost); g_idhost_w = 0; g_coop_mission_failed = 0;
+    g_sp_led_n = 0; g_sp_host_led_n = 0; g_sp_idx_part = -9;   // the spawn-count ledger: a reload recycles the object addresses
     memset(g_dead_ids, 0, sizeof g_dead_ids); g_dead_w = 0;
 }
 static void coop_enid_update(uint32_t pobj);
+static int coop_logic_list(int k, uint32_t *arr);   // the class list k of the level logic table (count + array)
+// coop_in_mission() is declared in coop.h (the action guard's gate uses it)
 static void coop_enemy_recv(const EnemyRec *e, int n);
 static void coop_enemy_send(uint32_t pobj, uint32_t seq);
 static void coop_enemy_tick(uint32_t pobj);
@@ -249,14 +264,37 @@ static bool coop_crosshair_point(uint32_t obj, float out[3], float *dist);
 static void coop_squad_donor_step();   // squad donor (lobby step 4, part 3)
 static void coop_load_recv(uint32_t seq);   // the loading barrier (day 15)
 static void coop_checkpoint_section();      // a checkpoint section began (day 15)
-static void coop_part_step();               // a level part the partner has and we do not (playtest #4)
+static void coop_part_step();
+// HEARTBEAT (two-PC play 20261117 -25, mission 6: an in-engine CUTSCENE longer than 20 s - neither copy sends its
+// player state while not in play, both quit with "no partner state for 20 s" = CONNECTION LOST). Any packet from the
+// partner counts as alive; "CLHB" goes out once a second from the play tick, cutscenes included.
+static uint64_t g_peer_alive_ms;
+static void coop_heartbeat_send(void);   // "CLHB" once a second - from the play tick AND the video poll
+static void coop_tl_teleport(const float *from, const float *to, const char *why);
+static void coop_tl_dump(const char *why);               // a level part the partner has and we do not (playtest #4)
 static void coop_hm_hit(uint32_t enemy, int who);   // HIT MARKER (owner 20261115): who 1 = the host player, 2 = the joiner
 static volatile int g_coop_teardown;        // the session ended inside a level: the level is being quit (until the next load)
 static uint32_t g_jhit_n; static float g_jhit_dmg;   // host: the JOINER clone's hits on enemies / their damage (playtest #6)
 static uint32_t g_own_brains[4]; static int g_own_brains_n;   // the brains our own spawn popped (the clone, the self model)
 static uint32_t g_cp_sec, g_cp_peer_sec;    // level-part sections started since the level load: ours / the partner's highest
 static int32_t g_cp_part = -1;              // the world's part (+0x5AF0) when our section last started (-1 = not seen yet)
+static int32_t g_cp_peer_part = -1;         // the partner's world part ("CLPA"), -1 = none yet this level
+static uint32_t g_peer_area[2];             // the partner's CURRENT AREA id (world+0x5CA8/+0x5CAC, rides in CLPA)
+static uint64_t g_peer_area_ms;             // when it arrived (the adopt after a teleport: fresh < 2 s)
+static uint64_t g_cp_area_sent_ms;          // our last area-id CLPA send (the area-change rate limit)
+static bool g_adv_lag;                      // our part advanced to one the partner already had: the partner went first
 static uint64_t g_part_ms;                  // when our last section (level part) was set up
+// Two-PC play 20261115 #8 (mission 3, level id 5): the ADVANCE (world part + 1) came 15-22 s before the SECTION start
+// there, and the new part's spawners ran in between - with the tables dropped at the advance both copies spawned on
+// their own. Now the tables are indexed again as soon as the advance has loaded, the counts of the objects still listed
+// are kept on a re-index of the same part, and the packets carry TAG = (world part << 9) | list size instead of the
+// section number: the copies use each other's counts only on the same part with the same list.
+static int32_t coop_world_part()
+{
+    uint32_t W = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+    return (W >= 0x80000000 && W < 0x84000000) ? *(volatile int32_t *)(uintptr_t)(W + 0x5AF0) : -1;
+}
+static uint32_t coop_sync_tag(int n) { return ((uint32_t)(coop_world_part() & 0x7F) << 9) | ((uint32_t)n & 0x1FF); }
 static float g_cp_tpos[3]; static bool g_cp_tpos_ok;
 static uint32_t g_fj_obj; static uint64_t g_fj_ms;   // host: the last trigger its test fired at the JOINER's feet
 static uint64_t g_part_by_joiner_ms;        // host: when a level-part switch was requested by the JOINER's position (its trigger test pass)
@@ -287,6 +325,11 @@ static void coop_downed_test_fire(uint32_t pobj);
 static void coop_update_gates(void);
 static void coop_downed_lifestate(void);
 static void coop_aggro_log(void);
+static void coop_free_class_slot(uint32_t body, uint32_t src, uint32_t priv, const char *who);
+static uint32_t coop_clone_link_from_snap(uint32_t body);
+static bool coop_src_freed(uint32_t src);
+static void coop_retire_step(uint32_t me);
+static uint32_t g_freed_src[4];   // class agents handed back by coop_free_class_slot (this level)
 static void coop_clone_gunshot(void);
 static EnemyRay g_enray_out[64]; static int g_enray_out_n;          // host: this frame's enemy pellets
 static EnemyRay g_enray_in[128]; static uint64_t g_enray_ms[128]; static int g_enray_r, g_enray_w;   // joiner
@@ -527,6 +570,15 @@ static uint32_t coop_make_private_link(uint32_t body, uint32_t src)
     *(volatile uint32_t *)(uintptr_t)(body + 0x324) = cp;
     logf("coop: aim: PRIVATE link %08x <- class %08x (0x%x B, %d self-ptrs rebased, +8C was %08x)",
          cp, src, SZ, reb, back);
+    {   // RE (the agent slots): the class object's vtable, AddRef (+4) / Release (+8), and its first dwords
+        uint32_t vt = *(volatile uint32_t *)(uintptr_t)src, w[8] = {0};
+        coop_safe_copy(w, src, 32);
+        uint32_t f4 = 0, f8 = 0;
+        if (vt >= 0x10000 && vt < 0x84000000) { coop_safe_copy(&f4, vt + 4, 4); coop_safe_copy(&f8, vt + 8, 4); }
+        logf("coop: agent RE: class %08x vt %08x AddRef %08x Release %08x | %08x %08x %08x %08x %08x %08x %08x %08x | +88 %u +90 %u +1F04 %d",
+             src, vt, f4, f8, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], *(volatile uint8_t *)(uintptr_t)(src + 0x88),
+             *(volatile uint32_t *)(uintptr_t)(src + 0x90), *(volatile int32_t *)(uintptr_t)(src + 0x1F04));
+    }
     if (body == g_p10_gdst) {   // ISOLATION survey: pointers the clone still SHARES with the donor's class
         char buf[1600]; int o = snprintf(buf, sizeof buf, "coop: clone isolation: shared pointers in the private link:");
         int n = 0;
@@ -673,6 +725,7 @@ static void coop_aim_body(uint32_t body, float yaw, float pitch)
         // shot catch-up, explosion replay, our grenade tracking and the ENTIRE enemy sync tick.
         // The clone always gets its private link now (a class object is shared sooner or later).
         g_aim_link_src = o; g_aim_link = coop_make_private_link(body, o);
+        if (body == g_p10_gdst) coop_free_class_slot(body, o, g_aim_link, "the clone");
         if (g_aim_link) return;
         logf("coop: aim: private link could not be made for %08x (class %08x) - driving the class link", body, o);
     }
@@ -1368,6 +1421,7 @@ static void coop_respawn_at(const float *feet, float yaw, bool refill = true)
     float yr = yaw * 0.0174532925f;
     float tgt[3] = {feet[0] - 0.8f * sinf(yr), feet[1], feet[2] - 0.8f * cosf(yr)};
     feet = tgt;
+    { float fr[3] = {f[0], f[1], f[2]}; coop_tl_teleport(fr, tgt, refill ? "respawn / move" : "move"); }
     float dx = feet[0] - f[0], dy = feet[1] - f[1], dz = feet[2] - f[2];
     f[0] += dx; f[1] += dy; f[2] += dz;
     snap[0] += dx; snap[1] += dy; snap[2] += dz;   // speed-spike fix: the game's speed = (+0xA0 - +0x190)/dt
@@ -1376,6 +1430,25 @@ static void coop_respawn_at(const float *feet, float yaw, bool refill = true)
     *(volatile float *)(uintptr_t)(po + 0x2F0) = full;   // full health as learned from this player object
     *(volatile float *)(uintptr_t)(ctrl + 0x18) = yaw;      // look = the survivor's yaw
     g_coop_downed = 0;
+    // THE AREA ADOPT (20261116 #28): after a teleport both copies stand in the same spot - adopt the partner's
+    // CURRENT AREA id (world+0x5CA8/+0x5CAC, carried in CLPA) so the area-driven logic (the zone state, the
+    // spawner gating) matches what the partner sees. Only when fresh (< 2 s). The zone FLAGS are not touched -
+    // the toggles were the #17/#28 undraw; walking across the boundary self-heals those.
+    if (g_peer_area_ms && GetTickCount64() - g_peer_area_ms < 2000 &&
+        g_peer_area[0] >= 0x80000000 && g_peer_area[0] < 0x84000000 &&
+        g_peer_area[1] >= 0x80000000 && g_peer_area[1] < 0x84000000) {
+        uint32_t W = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+        if (W >= 0x80000000 && W < 0x84000000) {
+            *(volatile uint32_t *)(uintptr_t)(W + 0x5CA8) = g_peer_area[0];
+            *(volatile uint32_t *)(uintptr_t)(W + 0x5CAC) = g_peer_area[1];
+            static int aa; if (aa++ < 20) logf("coop: RESPAWN: the partner's area id adopted (%08x %08x)", g_peer_area[0], g_peer_area[1]);
+        }
+    }
+    // THE AREA RE-ARM (20261115 #17) is REMOVED (20261116 #28): the area-trigger activations are TOGGLES -
+    // re-arming them after a teleport re-fired the zone switches and FLIPPED zones off (the owner: "a
+    // part-switch repeated one more time that undrew a stair, a player stuck in the void" - the stair undrew
+    // right after a teleport pull). The stale-zones-after-teleport case self-heals: walking back across the
+    // boundary re-fires the area trigger naturally (arm/disarm per entry).
     logf("coop: RESPAWNED at survivor feet %.1f %.1f %.1f yaw %.1f (health %.0f)", feet[0], feet[1], feet[2], yaw, full);
 }
 
@@ -1564,6 +1637,21 @@ static uint16_t g_trig_cnt[512], g_trig_host_cnt[512];   // activations: ours (h
 // 117 s and from then on the joiner never replayed it again. Now 2 bytes that WRAP (no cap); the joiner replays while
 // (uint16)(host - ours) is 1..32767, i.e. any number of activations as long as it is less than 32767 behind)
 static uint32_t g_trig_obj[512]; static int g_trig_n; static uint32_t g_trig_T; static int g_trig_host_n;
+static int g_trig_n_kept;   // the list size at the last index (g_trig_n is cleared on a drop)
+// GAP BUFFER (owner 20261115: "apply the fix" for the enemies missing after a teleport): the host's trigger list is
+// empty for ~0.3-1 s around a part switch (dropped, then indexed from the new part) and a player teleported INTO the new
+// part sets its triggers off at once - those activations had no index, the host never counted them and the joiner never
+// replayed them (route runs: an enemy from a scripted spawn existed on the host only). The host records them by OBJECT
+// here and credits them to their new index right after the re-index.
+static uint32_t g_trig_gap[64]; static int g_trig_gap_n;
+// JOINER GAP DEBT (two-PC play 20261117 -21, trig_compare: one-shots 81d7f820 (part 2) / 81d7fd40 (part 6) fired on the
+// JOINER ONLY): the joiner's own activations in the rebuild gap ran locally and were credited to the new index - the
+// host never heard of them, so whatever they start (a new part's first spawns) happened on the joiner only. The
+// credited one-shots are owed to the host: once the host's counts for the same list arrive, each one the host has not
+// fired yet is requested (every 0.4 s, 10 tries); the host fires it, both counts read 1, nothing is replayed twice.
+static uint16_t g_gap_owed[64]; static uint8_t g_gap_owed_tries[64]; static int g_gap_owed_n;
+static bool g_trig_gap_arm;   // armed at a PART-SWITCH drop only (gap1: at the level start trigger #36 - enter/leave, every
+                              // frame - filled the buffer before the first index; that gap was never synced and stays so)
 static uint32_t g_trig_replay_this; static uint32_t g_trig_stats[4];   // host-fired-for-joiner, counted, suppressed, replayed
 static int g_trig_sync = -1;
 static void coop_trig_table(void)
@@ -1571,7 +1659,13 @@ static void coop_trig_table(void)
     uint32_t T = *(volatile uint32_t *)(uintptr_t)0x002D45D0;
     if (T == g_trig_T && g_trig_n) return;
     if (!g_trig_T && g_part_ms && GetTickCount64() - g_part_ms < 300) return;   // a level part is being set up: index it after
-    if (T != g_trig_T) { memset(g_trig_cnt, 0, sizeof g_trig_cnt); memset(g_trig_host_cnt, 0, sizeof g_trig_host_cnt); g_trig_host_n = 0; }
+    static uint32_t old_obj[512]; static uint16_t old_cnt[512]; static int old_n; static int32_t idx_part = -9;
+    int32_t wp = coop_world_part();
+    old_n = (wp == idx_part) ? g_trig_n_kept : 0;   // the same part: keep the counts of the objects still listed
+    if (old_n) { memcpy(old_obj, g_trig_obj, old_n * 4); memcpy(old_cnt, g_trig_cnt, old_n * 2); }
+    memset(g_trig_cnt, 0, sizeof g_trig_cnt); memset(g_trig_host_cnt, 0, sizeof g_trig_host_cnt); g_trig_host_n = 0;
+    g_gap_owed_n = 0;
+    idx_part = wp;
     g_trig_T = T; g_trig_n = 0;
     static const int ks[4] = {0, 1, 18, 19};
     for (int li = 0; li < 4; li++) {
@@ -1582,7 +1676,25 @@ static void coop_trig_table(void)
             g_trig_obj[g_trig_n++] = (o >= 0x80000000 && o < 0x84000000) ? o : 0;
         }
     }
-    if (g_trig_n) logf("coop: trigger sync: table %08x, %d class A/E triggers indexed", T, g_trig_n);
+    int kept = 0;
+    for (int i = 0; i < g_trig_n; i++) for (int j = 0; j < old_n; j++) if (old_obj[j] && old_obj[j] == g_trig_obj[i]) { g_trig_cnt[i] = old_cnt[j]; kept++; break; }
+    g_trig_n_kept = g_trig_n;
+    if (g_trig_n) logf("coop: trigger sync: table %08x, %d class A/E triggers indexed (world part %d, %d counts kept)", T, g_trig_n, wp, kept);
+    if (g_trig_n && g_trig_gap_n) {   // the host's activations from the rebuild gap, credited to their new index
+        int credited = 0;
+        for (int k = 0; k < g_trig_gap_n; k++)
+            for (int i = 0; i < g_trig_n; i++)
+                if (g_trig_obj[i] == g_trig_gap[k]) {
+                    g_trig_cnt[i]++; credited++;
+                    logf("coop: trigger sync: %s trigger #%d %08x activated in the rebuild gap - counted (count %u)", g_cfg.coop_role == 1 ? "HOST" : "JOINER", i, g_trig_gap[k], g_trig_cnt[i]);
+                    uint32_t gty = 1; coop_safe_copy(&gty, g_trig_gap[k] + 0x120, 4);
+                    if (g_cfg.coop_role == 2 && gty == 0 && g_gap_owed_n < 64) { g_gap_owed_tries[g_gap_owed_n] = 0; g_gap_owed[g_gap_owed_n++] = (uint16_t)i; }
+                    break;
+                }
+        if (credited < g_trig_gap_n) logf("coop: trigger sync: %d gap activation(s) not in the new list - dropped", g_trig_gap_n - credited);
+        g_trig_gap_n = 0;
+    }
+    if (g_trig_n) g_trig_gap_arm = false;
 }
 static int coop_trig_index(uint32_t o)
 {
@@ -1594,6 +1706,15 @@ static bool coop_trig_synced(uint32_t o)            // class A / E, ANY type (on
     uint32_t vt = 0;
     return o >= 0x80000000 && o < 0x84000000 && coop_safe_copy(&vt, o, 4) && (vt == 0x0028EF88 || vt == 0x0028ED40);
 }
+// SUPPRESSED ONE-SHOTS AT A PART BOUNDARY (two-PC play 20261117 -24): the joiner walked into one-shot 81abf5d0 (part 4)
+// at 266.2 s - suppressed, requested; the host fired it (262.5 host clock) and its targets started the part-5 timers
+// (relays 81ac0630 / 81ac0810 fired exactly 2.0 s / 10.0 s later on the host). 0.4 s after the request the joiner's
+// world switched to part 5, the list was rebuilt WITHOUT the part-4 trigger, the host's count was never replayed - the
+// joiner never ran it nor anything it starts. A one-shot the joiner held back is remembered here; the host's replay
+// clears it; at a list drop the ones still waiting (< 3 s old) are fired HERE (the host already has).
+struct SuppPend { uint32_t obj; uint64_t ms; };
+static SuppPend g_supp_pend[16]; static int g_supp_pend_n;
+static void coop_supp_flush(const char *why);
 static uint16_t g_trig_req[256]; static int g_trig_req_n;        // joiner: activations to ask the host for (this frame)
 static uint16_t g_trig_req_in[512]; static int g_trig_req_in_n; // host: requests received
 static bool coop_trig_oneshot(uint32_t o)
@@ -1603,8 +1724,63 @@ static bool coop_trig_oneshot(uint32_t o)
     coop_safe_copy(&ty, o + 0x120, 4);
     return ty == 0;
 }
+// TRIGGER LEDGER (owner 20261117: "log every trigger each copy fires, list the ones the other copy never sees").
+// Every trigger fire that GOES THROUGH on this copy (FUN_001BF670 entry, not suppressed) is counted per (load, world
+// part, object) - the trigger objects sit at the same addresses on both copies. Suppressed = the joiner's own entries
+// sent to the host instead. Each copy logs the whole table ("coop: TRIGSUM ...") at a part change, every 60 s, at a
+// level change and when the window closes; local\trig_compare.py compares the host and joiner logs (the last table of
+// each load) and lists the triggers that fired on one copy only or a different number of times, with the teleports
+// ("coop: TRIGSUM teleport ...") that may have carried a player past them. Log only: nothing in play changes.
+// COOP_TRIG_LEDGER=0 = off.
+struct TrigLed { uint32_t obj, vt; int8_t part; uint8_t type; uint16_t fired, supp; uint64_t first, last; float pos[3]; };
+static TrigLed g_tl[512]; static int g_tl_n; static uint32_t g_tl_seq = 0xFFFFFFFF; static int g_tl_on = -1;
+static uint64_t g_tl_dump_ms; static int32_t g_tl_part = -9;
+static void coop_tl_dump(const char *why)
+{
+    if (g_tl_on != 1 || !g_tl_n) return;
+    uint64_t now = GetTickCount64();
+    logf("coop: TRIGSUM begin load %u part %d entries %d (%s)", g_tl_seq, coop_world_part(), g_tl_n, why);
+    for (int i = 0; i < g_tl_n; i++) {
+        const TrigLed &t = g_tl[i];
+        logf("coop: TRIGSUM load %u part %d obj %08x vt %08x type %u fired %u supp %u first %.1f last %.1f pos %.1f %.1f %.1f",
+             g_tl_seq, (int)t.part, t.obj, t.vt, t.type, t.fired, t.supp,
+             -(float)(now - t.first) / 1000.0f, -(float)(now - t.last) / 1000.0f, t.pos[0], t.pos[1], t.pos[2]);
+    }
+    logf("coop: TRIGSUM end load %u", g_tl_seq);
+    g_tl_dump_ms = now;
+}
+static void coop_tl_record(uint32_t o, bool fired)
+{
+    if (g_tl_on < 0) { char e[8] = {0}; g_tl_on = !(GetEnvironmentVariableA("COOP_TRIG_LEDGER", e, sizeof e) && e[0] == '0'); logf("coop: trigger ledger %s", g_tl_on ? "ON" : "OFF"); }
+    if (g_tl_on != 1 || !g_cfg.coop_role || o < 0x80000000 || o >= 0x84000000) return;
+    if (g_tl_seq != g_load_seq) { coop_tl_dump("level change"); g_tl_seq = g_load_seq; g_tl_n = 0; g_tl_part = -9; }
+    int32_t wp = coop_world_part();
+    if (wp != g_tl_part) { if (g_tl_part != -9) coop_tl_dump("part change"); g_tl_part = wp; }
+    uint64_t now = GetTickCount64();
+    int k = -1;
+    for (int i = 0; i < g_tl_n; i++) if (g_tl[i].obj == o && g_tl[i].part == (int8_t)wp) { k = i; break; }
+    if (k < 0) {
+        if (g_tl_n >= 512) return;
+        k = g_tl_n++;
+        TrigLed &t = g_tl[k];
+        memset(&t, 0, sizeof t);
+        t.obj = o; t.part = (int8_t)wp; t.first = now;
+        uint32_t ty = 0; coop_safe_copy(&t.vt, o, 4); coop_safe_copy(&ty, o + 0x120, 4); t.type = (uint8_t)ty;
+        coop_safe_copy(t.pos, o + 0xA0, 12);
+    }
+    TrigLed &t = g_tl[k];
+    if (fired) { if (t.fired < 65535) t.fired++; } else if (t.supp < 65535) t.supp++;
+    t.last = now;
+    if (now - g_tl_dump_ms > 60000) coop_tl_dump("60 s");
+}
+static void coop_tl_teleport(const float *from, const float *to, const char *why)
+{
+    if (g_tl_on != 1 || !g_cfg.coop_role) return;
+    logf("coop: TRIGSUM teleport load %u part %d from %.1f %.1f %.1f to %.1f %.1f %.1f (%s)", g_load_seq, coop_world_part(),
+         from[0], from[1], from[2], to[0], to[1], to[2], why);
+}
 volatile uint32_t g_tf_resume, g_tf_this, g_tf_skip;
-extern "C" void coop_on_trigger_fire(void)
+static void coop_on_trigger_fire_inner(void)
 {
     g_tf_skip = 0;
     if (g_trig_sync != 1 || !g_cfg.coop_role) return;
@@ -1619,7 +1795,27 @@ extern "C" void coop_on_trigger_fire(void)
         return;
     }
     int id = coop_trig_index(o);
-    if (id < 0) return;
+    if (id < 0) {
+        // the JOINER keeps its own gap activations too: they ran locally (no index = no request), so they count as
+        // done here - without that the host's count of the same trigger would replay it a second time
+        if (g_cfg.coop_role && !g_trig_n && g_trig_gap_arm && g_trig_gap_n < 64) {   // a part-switch rebuild: keep it
+            uint32_t ty0 = 0, vt0 = 0; coop_safe_copy(&ty0, o + 0x120, 4); coop_safe_copy(&vt0, o, 4);
+            if (!(ty0 == 4 && vt0 == 0x0028EF88)) {   // area triggers stay local (see below)
+                // play 20261116 #25 (owner: "part-switch events got repeated"): an ENTER/LEAVE trigger AT the
+                // part boundary fires EVERY FRAME the player stands in it - the rebuild gap (~0.3 s of dropped
+                // tables) captured 12+ activations of trigger #59, the host credited all of them and the joiner
+                // REPLAYED the part-switch event a dozen times. One keep per object per gap.
+                bool dup = false;
+                for (int k = 0; k < g_trig_gap_n; k++) if (g_trig_gap[k] == o) { dup = true; break; }
+                if (!dup) {
+                    g_trig_gap[g_trig_gap_n++] = o;
+                    logf("coop: trigger sync: %s activation of %08x (type %u) while the list is rebuilt - kept for the re-index",
+                         g_cfg.coop_role == 1 ? "HOST" : "JOINER", o, ty0);
+                }
+            }
+        }
+        return;
+    }
     uint32_t ty = 0, tvt = 0; coop_safe_copy(&ty, o + 0x120, 4); coop_safe_copy(&tvt, o, 4);
     if (ty == 4 && tvt == 0x0028EF88) {   // class A area triggers (FUN_001C9370 is class A's test)
         // two-PC play 20261114 (owner: "the host draws trees, a tree trunk and a sign post the joiner doesn't draw - a
@@ -1649,10 +1845,37 @@ extern "C" void coop_on_trigger_fire(void)
         // (owner: "have the joiner send a signal to the host so the host triggers events for all")
         g_tf_skip = 1; g_trig_stats[2]++;
         if (g_trig_req_n < 256) g_trig_req[g_trig_req_n++] = (uint16_t)id;
+        if (ty == 0) {   // remembered until the host's replay (or 3 s)
+            uint64_t nw = GetTickCount64(); int w = 0; bool have = false;
+            for (int k = 0; k < g_supp_pend_n; k++) if (nw - g_supp_pend[k].ms <= 3000) { if (g_supp_pend[k].obj == o) have = true; g_supp_pend[w++] = g_supp_pend[k]; }
+            g_supp_pend_n = w;
+            if (!have && g_supp_pend_n < 16) { g_supp_pend[g_supp_pend_n].obj = o; g_supp_pend[g_supp_pend_n].ms = nw; g_supp_pend_n++; }
+        }
         g_cp_req_id[g_cp_req_w & 7] = (uint16_t)id; g_cp_req_ms[g_cp_req_w & 7] = GetTickCount64(); g_cp_req_w++;
         static int sl;
         if (sl++ < 5000) logf("coop: trigger sync: JOINER activation of trigger #%d %08x (type %u) -> request to the host (host count %u, ours %u)", id, o, ty, g_trig_host_cnt[id], g_trig_cnt[id]);
     }
+}
+extern "C" void coop_on_trigger_fire(void)
+{
+    {   // RELAY SOURCE (log only): class vt 0x0028EE28 one-shots fire on the host only (trig_compare, -19 .. -21) - they are
+        // fired by other events; log the game's return addresses on the stack so the source can be found (60 lines)
+        uint32_t rvt = 0;
+        static int rl;
+        if (rl < 60 && coop_safe_copy(&rvt, g_tf_this, 4) && rvt == 0x0028EE28) {
+            rl++;
+            const uint32_t *sp = (const uint32_t *)_AddressOfReturnAddress();
+            char buf[400]; int bo = 0, cnt = 0;
+            for (int i = 0; i < 0x200 && cnt < 16 && bo < 360; i++) {
+                uint32_t v = 0;
+                if (!coop_safe_copy(&v, (uint32_t)(uintptr_t)(sp + i), 4)) break;
+                if (v >= 0x00011000 && v < 0x00230000) { bo += snprintf(buf + bo, sizeof buf - bo, " %06x", v); cnt++; }
+            }
+            logf("coop: relay fire: %08x (class 0028ee28) on the %s, part %d - game returns:%s", g_tf_this, g_cfg.coop_role == 1 ? "HOST" : "JOINER", coop_world_part(), buf);
+        }
+    }
+    coop_on_trigger_fire_inner();
+    coop_tl_record(g_tf_this, g_tf_skip == 0);   // the ledger: what really fired here
 }
 __declspec(naked) void coop_thunk_trigger_fire()     // FUN_001bf670 entry: 83 B9 20 01 00 00 02 (cmp [ecx+0x120], 2) re-executed
 {
@@ -1697,6 +1920,26 @@ __declspec(naked) void coop_thunk_trig_fire()         // vt+4: thiscall (&player
         popad
         ret
     }
+}
+
+static void coop_supp_flush(const char *why)
+{
+    if (g_cfg.coop_role != 2 || !g_supp_pend_n) return;
+    uint32_t world = *(volatile uint32_t *)(uintptr_t)0x2D45D4;
+    uint64_t now = GetTickCount64();
+    for (int k = 0; k < g_supp_pend_n; k++) {
+        uint32_t o = g_supp_pend[k].obj, vt = 0; uint8_t armed = 1;
+        if (now - g_supp_pend[k].ms > 3000) continue;
+        if (world < 0x80000000 || world >= 0x84000000 || !coop_trig_synced(o) || !coop_safe_copy(&vt, o, 4)) continue;
+        coop_safe_copy(&armed, o + 0x11C, 1);
+        g_tc_fn = *(volatile uint32_t *)(uintptr_t)(vt + 4); g_tc_this = o; g_tc_a1 = world + 0x30;
+        g_trig_replay_this = o;
+        coop_thunk_trig_fire();
+        g_trig_replay_this = 0;
+        *(volatile uint8_t *)(uintptr_t)(o + 0x11C) = 0;
+        logf("coop: trigger sync: our held-back one-shot %08x had no replay yet when the list was dropped (%s) - fired here (the host has it)", o, why);
+    }
+    g_supp_pend_n = 0;
 }
 static void install_trigger_sync(void)
 {
@@ -1745,8 +1988,38 @@ static void coop_spawner_dump(void)
 // host's 23). HOST-AUTHORITATIVE: the host counts each spawner's spawns (+0x24 changing to a new
 // body) and sends the counts ("CLSP"); the joiner's spawner may only spawn while its own count is
 // behind the host's. Env COOP_SPAWN_SYNC=0 = off.
-static uint32_t g_sp_obj[256]; static int g_sp_n; static uint32_t g_sp_T;
+static uint32_t g_sp_obj[256]; static int g_sp_n; static uint32_t g_sp_T; static int g_sp_n_kept;
 static uint8_t g_sp_cnt[256], g_sp_host_cnt[256]; static uint32_t g_sp_last[256]; static int g_sp_host_n;
+// Two-PC play 20261115 #9 (mission 5, "enemies only on one PC"): the joiner's spawner #36 made its enemy at 326 s, the
+// kill sync killed it at 337 s, and the host's copy spawned 3 more (343 / 376 / 421 s) - the joiner's catch-up waited
+// until 507 s: it tests the spawner's enemy (+0x24) by its life state, and the game had REUSED that body for another,
+// living enemy. g_sp_gone[i] = the enemy this spawner made was seen dead (health <= 0 or life state past 1) - the
+// spawner is free from then on, whatever its old body became, until it spawns again.
+static uint8_t g_sp_gone[256];
+// TELEPORT-WINDOW SPAWN COUNT (two-PC play 20261115 #9, OPEN "missing enemies at teleportation"): the
+// trigger / spawn tables drop at a part advance and at a section start and are indexed again 300 ms
+// later; the per-frame count walk is off during that window, and a spawn whose new body lands on the
+// address the spawner's +0x24 already held (the pool REUSES addresses - gone1: 801e5f20 was spawner
+// #13's enemy at 80.4 s, then spawner #23's bfdd4ca2 at 142.3 s on the SAME address) stays invisible
+// to the walk forever (b == g_sp_last). Snapshot each indexed spawner's +0x24 and that body's spawn
+// ctx (+0x31C) at the DROP; the re-index compares: same address but a different ctx = a new enemy
+// made during the switch -> count it there (the walk can never see it); the unchanged body goes into
+// g_sp_last so a FRESH re-index does not count an old enemy as a new spawn. A different address is
+// left to the walk (kept counts) or the fresh baseline, as before.
+static uint32_t g_gaps_obj[256], g_gaps_last[256], g_gaps_ctx[256]; static int g_gaps_n;
+static void coop_spawn_gap_snapshot(void)
+{
+    if (!g_sp_n) return;   // already dropped (an advance re-drops every frame while a slot loads): keep the FIRST baseline
+    g_gaps_n = 0;
+    for (int i = 0; i < g_sp_n && g_gaps_n < 256; i++) {
+        uint32_t o = g_sp_obj[i], b = 0;
+        if (!o || !coop_safe_copy(&b, o + 0x24, 4)) continue;
+        uint32_t c = 0;
+        if (b >= 0x80000000 && b < 0x84000000) coop_safe_copy(&c, b + 0x31C, 4);
+        g_gaps_obj[g_gaps_n] = o; g_gaps_last[g_gaps_n] = b; g_gaps_ctx[g_gaps_n] = c;
+        g_gaps_n++;
+    }
+}
 static int g_sp_sync = -1; static uint32_t g_sp_stats[3];   // denied, allowed (joiner), counted
 volatile uint32_t g_sg_resume, g_sg_esi, g_sg_deny;
 static void coop_spawn_table(void)
@@ -1754,13 +2027,48 @@ static void coop_spawn_table(void)
     uint32_t T = *(volatile uint32_t *)(uintptr_t)0x002D45D0;
     if (T == g_sp_T && g_sp_n) return;
     if (!g_sp_T && g_part_ms && GetTickCount64() - g_part_ms < 300) return;   // a level part is being set up: index it after
-    if (T != g_sp_T) { memset(g_sp_cnt, 0, sizeof g_sp_cnt); memset(g_sp_host_cnt, 0, sizeof g_sp_host_cnt); memset(g_sp_last, 0, sizeof g_sp_last); g_sp_host_n = 0; }
+    static uint32_t old_obj[256], old_last[256]; static uint8_t old_cnt[256]; static int old_n; static int32_t idx_part = -9;
+    int32_t wp = coop_world_part();
+    old_n = (wp == idx_part) ? g_sp_n_kept : 0;
+    if (old_n) { memcpy(old_obj, g_sp_obj, old_n * 4); memcpy(old_cnt, g_sp_cnt, old_n); memcpy(old_last, g_sp_last, old_n * 4); }
+    static uint8_t old_gone[256];
+    if (old_n) memcpy(old_gone, g_sp_gone, old_n);
+    memset(g_sp_cnt, 0, sizeof g_sp_cnt); memset(g_sp_host_cnt, 0, sizeof g_sp_host_cnt); memset(g_sp_last, 0, sizeof g_sp_last); g_sp_host_n = 0;
+    memset(g_sp_gone, 0, sizeof g_sp_gone);
+    idx_part = wp;
+    g_sp_idx_part = wp;
     g_sp_T = T; g_sp_n = 0;
     for (int k = 12; k <= 13; k++) {
         uint32_t arr = 0; int n = coop_logic_list(k, &arr);
         for (int i = 0; i < n && g_sp_n < 256; i++) { uint32_t o = 0; coop_safe_copy(&o, arr + 4 * i, 4); g_sp_obj[g_sp_n++] = o; }
     }
-    if (g_sp_n) logf("coop: spawn sync: %d spawners indexed (table %08x)", g_sp_n, T);
+    int kept = 0;
+    for (int i = 0; i < g_sp_n; i++) for (int j = 0; j < old_n; j++) if (old_obj[j] && old_obj[j] == g_sp_obj[i]) { g_sp_cnt[i] = old_cnt[j]; g_sp_last[i] = old_last[j]; g_sp_gone[i] = old_gone[j]; kept++; break; }
+    if (g_gaps_n && g_cfg.coop_role) {   // the teleport-window compare (see coop_spawn_gap_snapshot)
+        int credited = 0;
+        for (int i = 0; i < g_sp_n; i++) {
+            int j = -1;
+            for (int k = 0; k < g_gaps_n; k++) if (g_gaps_obj[k] == g_sp_obj[i]) { j = k; break; }
+            if (j < 0) continue;
+            uint32_t b = 0;
+            if (!coop_safe_copy(&b, g_sp_obj[i] + 0x24, 4) || !b || b != g_gaps_last[j]) continue;   // another address: the walk counts it
+            uint32_t c = 0;
+            if (b >= 0x80000000 && b < 0x84000000) coop_safe_copy(&c, b + 0x31C, 4);
+            if (c != g_gaps_ctx[j]) {   // a NEW enemy on the same body address during the table switch
+                if (g_sp_cnt[i] < 255) g_sp_cnt[i]++;
+                g_sp_stats[2]++;
+                g_sp_last[i] = b; g_sp_gone[i] = 0;
+                credited++;
+                logf("coop: spawn sync: %s spawner %08x made a NEW enemy on the same body %08x during the table switch - counted (count %u)",
+                     g_cfg.coop_role == 1 ? "HOST" : "JOINER", g_sp_obj[i], b, g_sp_cnt[i]);
+            } else {
+                g_sp_last[i] = b;   // the SAME enemy as before the drop: a fresh re-index must not count it as a new spawn
+            }
+        }
+        g_gaps_n = 0;
+    }
+    g_sp_n_kept = g_sp_n;
+    if (g_sp_n) logf("coop: spawn sync: %d spawners indexed (table %08x, world part %d, %d counts kept)", g_sp_n, T, wp, kept);
 }
 // POOL GUARD (play 20261113_175243 joiner crash 0x189a33): a spawn takes a kind-1 entity pool entry
 // (FUN_001df440 -> FUN_001899f0; R+0x22C48+0x7C {entries, used flags, count 16}). The clone holds one
@@ -1776,9 +2084,11 @@ static bool coop_pool_full(void)
     return true;
 }
 static uint32_t g_pool_holds;
+static bool coop_build_test(void);
 extern "C" void coop_spawn_gate_check(void)
 {
     g_sg_deny = 0;
+    if (g_cfg.coop_role == 2 && coop_build_test() && g_p10_done) { g_sg_deny = 1; return; }
     if (g_cfg.coop_role && coop_pool_full()) {
         g_sg_deny = 1;
         if ((g_pool_holds++ % 300) == 0) logf("coop: pool guard: entity pool full - spawner %08x held (%u holds so far)", g_sg_esi, g_pool_holds);
@@ -1789,10 +2099,13 @@ extern "C" void coop_spawn_gate_check(void)
     int i = -1;
     for (int k = 0; k < g_sp_n; k++) if (g_sp_obj[k] == sp) { i = k; break; }
     if (i < 0) return;                                            // not an indexed spawner: leave it alone
-    if (i >= g_sp_host_n || g_sp_cnt[i] >= g_sp_host_cnt[i]) {
+    uint32_t hcnt = 0;                                            // the host's ledger count for THIS object + OUR part
+    for (int k = 0; k < g_sp_host_led_n; k++)
+        if (g_sp_host_led[k].obj == sp && (int32_t)g_sp_host_led[k].part == g_sp_idx_part) { hcnt = g_sp_host_led[k].cnt; break; }
+    if (g_sp_cnt[i] >= hcnt) {
         g_sg_deny = 1; g_sp_stats[0]++;
         static uint32_t dl;
-        if ((dl++ % 600) == 0) logf("coop: spawn sync: JOINER spawner #%d %08x held (ours %u, host %u) - %u holds so far", i, sp, g_sp_cnt[i], i < g_sp_host_n ? g_sp_host_cnt[i] : 0, g_sp_stats[0]);
+        if ((dl++ % 600) == 0) logf("coop: spawn sync: JOINER spawner #%d %08x held (ours %u, host %u) - %u holds so far", i, sp, g_sp_cnt[i], hcnt, g_sp_stats[0]);
     } else g_sp_stats[1]++;
 }
 __declspec(naked) void coop_thunk_spawn_gate()       // FUN_001b3030 entry: 8B 46 44 8B 56 40 re-executed
@@ -1852,7 +2165,7 @@ static void coop_spawn_force(void)
 {
     static int on = -1;
     if (on < 0) { char e[8] = {0}; on = (GetEnvironmentVariableA("COOP_FORCE_SPAWN", e, sizeof e) && e[0] == '0') ? 0 : 1; logf("coop: forced spawn %s", on ? "ON (joiner spawners follow the host's counts)" : "OFF"); }
-    if (!on || g_sp_sync != 1 || g_cfg.coop_role != 2 || !g_sp_host_n) return;
+    if (!on || g_sp_sync != 1 || g_cfg.coop_role != 2 || !g_sp_host_led_n) return;
     static uint64_t last[256];
     static uint32_t nforced;
     uint64_t now = GetTickCount64();
@@ -1863,14 +2176,31 @@ static void coop_spawn_force(void)
     static uint64_t behind[256], seen_part;
     if (seen_part != g_part_ms) { seen_part = g_part_ms; memset(behind, 0, sizeof behind); memset(last, 0, sizeof last); }
     if (g_part_ms && now - g_part_ms < 2000) return;
-    for (int i = 0; i < g_sp_n && i < g_sp_host_n && budget > 0; i++) {
-        if (g_sp_cnt[i] >= g_sp_host_cnt[i]) { behind[i] = 0; continue; }
+    for (int i = 0; i < g_sp_n && budget > 0; i++) {
+        uint32_t hcnt = 0;                                          // the host's ledger count for this object + our part
+        for (int k = 0; k < g_sp_host_led_n; k++)
+            if (g_sp_host_led[k].obj == g_sp_obj[i] && (int32_t)g_sp_host_led[k].part == g_sp_idx_part) { hcnt = g_sp_host_led[k].cnt; break; }
+        if (g_sp_cnt[i] >= hcnt) { behind[i] = 0; continue; }
         if (!behind[i]) behind[i] = now;
         if (now - behind[i] < 1500 || now - last[i] < 500) continue;
         uint32_t o = g_sp_obj[i], cur = 0;
         if (!o || !coop_safe_copy(&cur, o + 0x24, 4)) continue;
-        if (cur) { uint32_t life = 0; if (!coop_safe_copy(&life, cur + 0x384, 4) || life == 0 || life == 1) continue; }   // its enemy still lives
-        if (coop_pool_full()) return;
+        if (cur && !g_sp_gone[i]) { uint32_t life = 0; if (!coop_safe_copy(&life, cur + 0x384, 4) || life == 0 || life == 1) continue; }   // its enemy still lives
+        if (coop_pool_full()) {
+            // gone1 (two-PC play 20261115 #9 OPEN): the catch-up used to give up SILENTLY while the pool was
+            // full - the "missing enemies at the teleport" runs left no trace of WHY. Say it (every 10 s).
+            static uint64_t pl; static uint32_t pb;
+            if (now - pl > 10000) {
+                pl = now; pb = 0;
+                for (int k = 0; k < g_sp_n; k++) {
+                    uint32_t hc2 = 0;
+                    for (int j = 0; j < g_sp_host_led_n; j++) if (g_sp_host_led[j].obj == g_sp_obj[k] && (int32_t)g_sp_host_led[j].part == g_sp_idx_part) { hc2 = g_sp_host_led[j].cnt; break; }
+                    if (g_sp_cnt[k] < hc2) pb++;
+                }
+                if (pb) logf("coop: forced spawn: the entity pool is full - %u spawner(s) behind the host wait for a free entry", pb);
+            }
+            return;
+        }
         {   // two-PC play 20261114 (joiner crash 0x1B2B09, [0 + 0x20]): the host had entered the next section, where these
             // spawners live; on the joiner that section was not set up yet - the spawner's spawn record (+0x18) had no
             // object at +4 (FUN_001B2BC0 -> FUN_001B2AF0 reads [[rec+4]+0x20]). The game never runs such a spawner;
@@ -1889,7 +2219,7 @@ static void coop_spawn_force(void)
         coop_call_spawn();
         nforced++;
         if (nforced <= 60 || (nforced % 50) == 0)
-            logf("coop: forced spawn: JOINER spawner #%d %08x behind the host (ours %u, host %u) -> spawn %s (%u forced)", i, o, g_sp_cnt[i], g_sp_host_cnt[i], g_fs_ret ? "OK" : "refused", nforced);
+            logf("coop: forced spawn: JOINER spawner #%d %08x behind the host (ours %u, host %u) -> spawn %s (%u forced)", i, o, g_sp_cnt[i], hcnt, g_fs_ret ? "OK" : "refused", nforced);
     }
 }
 static void coop_spawn_track(void)   // both roles: count each spawner's spawns (+0x24 -> a new body)
@@ -1902,12 +2232,24 @@ static void coop_spawn_track(void)   // both roles: count each spawner's spawns 
         if (b && b != g_sp_last[i]) {
             if (g_sp_cnt[i] < 255) g_sp_cnt[i]++;
             g_sp_stats[2]++;
+            g_sp_gone[i] = 0;
+            if (g_cfg.coop_role == 1) {   // the ledger: the host's counts survive part switches (see the block at the top)
+                int q = -1;
+                for (int k = 0; k < g_sp_led_n; k++) if (g_sp_led[k].obj == o && (int32_t)g_sp_led[k].part == g_sp_idx_part) { q = k; break; }
+                if (q < 0 && g_sp_led_n < 160) { q = g_sp_led_n++; g_sp_led[q].obj = o; g_sp_led[q].part = (uint32_t)g_sp_idx_part; g_sp_led[q].cnt = 0; }
+                if (q >= 0 && g_sp_led[q].cnt < 255) g_sp_led[q].cnt++;
+            }
             static int cl;
             if (cl++ < 150) logf("coop: spawn sync: %s spawner #%d %08x spawned %08x (count %u)", g_cfg.coop_role == 1 ? "HOST" : "JOINER", i, o, b, g_sp_cnt[i]);
+        }
+        if (b && b == g_sp_last[i] && !g_sp_gone[i]) {
+            float hp = 1.0f; uint32_t life = 0;
+            if ((coop_safe_copy(&hp, b + 0x2F0, 4) && hp <= 0.0f) || (coop_safe_copy(&life, b + 0x384, 4) && life > 1)) g_sp_gone[i] = 1;
         }
         g_sp_last[i] = b;
     }
 }
+
 // COOP_REG_DUMP=<sec>[,<sec>]: the AI TARGET REGISTRY (*0x2D1988: entries of 12 B from +0xFB0 =
 // {type, object, x}; FUN_001aed40 reads type 0/1/2) - which objects the enemies can target (RE)
 // ENTITY POOL WATCH (play 20261113 joiner crash at 0x189a33): FUN_001df440 (spawn) registers the body
@@ -2262,11 +2604,22 @@ static void coop_anim_replay(uint32_t hostbody, uint32_t hash, int which, int a3
 {
     uint32_t b = coop_host_to_local(hostbody);
     if (!b || !coop_anim_puppet_live(b)) { g_an_stats[4]++; return; }
+    // play 20261115 #14 (joiner crash 0x988d6 in the replay, a null-node read ~0.6 s after the puppet's
+    // own spawn): the host's anim call reached a FRESH puppet whose block's clip tree is not built yet.
+    // A body younger than 1.5 s skips the replay (the 2 Hz snapshot corrects it later, the same wait the
+    // kill orders use), and the replay itself runs under SEH: a fault skips THIS call.
+    uint64_t born = 0;
+    for (int q = 0; q < g_enid_n; q++) if (g_enid[q].live && g_enid[q].body == b) born = g_enid[q].ms;
+    if (born && GetTickCount64() - born < 1500) { g_an_stats[4]++; return; }
     uint32_t blk = coop_anim_blk(b);
     if (!blk) { g_an_stats[4]++; return; }
     g_an_replay = 1;
-    if (which == 0) ((an_play_fn)(uintptr_t)xbe_va(0x00091E00))(blk, hash, a3, a4);
-    else ((an_now_fn)(uintptr_t)xbe_va(0x00091E70))(blk, hash);
+    __try {
+        if (which == 0) ((an_play_fn)(uintptr_t)xbe_va(0x00091E00))(blk, hash, a3, a4);
+        else ((an_now_fn)(uintptr_t)xbe_va(0x00091E70))(blk, hash);
+    } __except (1) {
+        static int af; if (af++ < 30) logf("coop: anim sync: the replay on puppet %08x (hash %08x) FAULTED - skipped (the session lives)", b, hash);
+    }
     g_an_replay = 0;
     g_an_stats[2]++;
 }
@@ -2796,8 +3149,31 @@ static void coop_trig_step(uint32_t obj)
                 if (dl++ < 100) logf("coop: trigger sync: joiner request for one-shot #%d %08x - already fired here", i, o);
                 continue;
             }
+            // THE SPAWN POSITION (20261115 #17/#18 RE): the activation's arg = world+0x30; the trigger's
+            // targets include the SPAWN-POINT markers, whose vt+8 copies the position row from [arg+0x10]
+            // (= world+0x40, the game's per-frame PLAYER position) into their own +0x10 - and the spawn
+            // later builds its request pos from it (FUN_001b3030 passes [spawner+0x1C]; FUN_001b2af0 /
+            // FUN_001af880 movaps the record object's +0x10 row). Per-copy state = the LOCAL player's
+            // position -> the two copies spawned the same wave at DIFFERENT spawn points (the final-part
+            // desync). Write the JOINER'S position row (our clone's feet) into world+0x40 before firing,
+            // restore after. (The trigger's own +0x10 is the TARGET-ARRAY pointer - the first attempt
+            // crashed there, 0x1b48b9.)
+            __declspec(align(16)) static float jrow[4], orow[4];
+            bool row_saved = false;
+            {
+                uint32_t c2 = g_p10_gdst;
+                if (c2 >= 0x80000000 && c2 < 0x84000000) {
+                    coop_safe_copy(orow, world + 0x40, 16);
+                    coop_safe_copy(jrow, c2 + 0xA0, 12); jrow[3] = orow[3];
+                    memcpy((void *)(uintptr_t)(world + 0x40), jrow, 16);
+                    row_saved = true;
+                    static int sw;
+                    if (sw++ < 40) logf("coop: trigger sync: request #%d %08x fired at the JOINER's feet %.1f %.1f %.1f (the player row written)", i, o, jrow[0], jrow[1], jrow[2]);
+                }
+            }
             g_tc_fn = *(volatile uint32_t *)(uintptr_t)(vt + 4); g_tc_this = o; g_tc_a1 = world + 0x30;
             coop_thunk_trig_fire();                                                   // the hook counts it
+            if (row_saved) memcpy((void *)(uintptr_t)(world + 0x40), orow, 16);
             if (ty == 0) *(volatile uint8_t *)(uintptr_t)(o + 0x11C) = 0;
             g_trig_stats[0]++;
             logf("coop: trigger sync: HOST fired trigger #%d %08x (type %u) on the JOINER's request", i, o, ty);
@@ -2845,6 +3221,26 @@ static void coop_trig_step(uint32_t obj)
             logf("coop: level part: the switch to the next part was asked for at the JOINER's position (request %u)", *(volatile uint32_t *)(uintptr_t)(world + 0x5AE8));
         }
     } else {
+        static uint64_t owed_ms;
+        uint64_t nowo = GetTickCount64();
+        if (g_gap_owed_n && g_trig_host_n && nowo - owed_ms >= 400) {
+            owed_ms = nowo;
+            int w = 0;
+            for (int k = 0; k < g_gap_owed_n; k++) {
+                int i = g_gap_owed[k];
+                if (i >= g_trig_n || i >= g_trig_host_n) continue;
+                if ((uint16_t)(g_trig_host_cnt[i] - g_trig_cnt[i]) < 32768u) {   // the host has it (as many as we do)
+                    logf("coop: trigger sync: gap one-shot #%d %08x - the host has fired it too (host %u, ours %u)", i, g_trig_obj[i], g_trig_host_cnt[i], g_trig_cnt[i]);
+                    continue;
+                }
+                if (g_gap_owed_tries[k] >= 10) { logf("coop: trigger sync: gap one-shot #%d %08x - the host never fired it (10 requests) - given up", i, g_trig_obj[i]); continue; }
+                g_gap_owed_tries[k]++;
+                if (g_trig_req_n < 256) g_trig_req[g_trig_req_n++] = (uint16_t)i;
+                logf("coop: trigger sync: gap one-shot #%d %08x ran only here - requested from the host (try %u)", i, g_trig_obj[i], g_gap_owed_tries[k]);
+                g_gap_owed[w] = g_gap_owed[k]; g_gap_owed_tries[w] = g_gap_owed_tries[k]; w++;
+            }
+            g_gap_owed_n = w;
+        }
         // perform the host's activations we have not done yet (at most 16 a frame)
         int budget = 16;
         for (int i = 0; i < g_trig_n && i < g_trig_host_n && budget > 0; i++) {
@@ -2857,6 +3253,7 @@ static void coop_trig_step(uint32_t obj)
                 g_trig_replay_this = o;
                 coop_thunk_trig_fire();
                 g_trig_replay_this = 0;
+                for (int k = 0; k < g_supp_pend_n; k++) if (g_supp_pend[k].obj == o) { g_supp_pend[k] = g_supp_pend[--g_supp_pend_n]; break; }
                 if (ty == 0) {   // the checkpoint rule (one-shots only): our own request coming back = we set it off; else the host's player did
                     uint64_t nw = GetTickCount64(); bool ours = false;
                     for (int q = 0; q < 8; q++) if (g_cp_req_id[q] == (uint16_t)i && g_cp_req_ms[q] && nw - g_cp_req_ms[q] < 3000) ours = true;
@@ -2962,6 +3359,29 @@ static void coop_route_step(uint32_t ctrl, uint32_t obj)
     float total = cum[npts - 1] - stop;
     if (total < 0.0f) total = 0.0f;
     if (!arrived) {
+        {   // owner 20261116 ("adjust the speed once the ghost accomplishes the cross-the-border objective"): a fast
+            // ghost outruns the part set-up and the spawners' "player near" start (the tunnel's spawns never came).
+            // COOP_ROUTE_SPEED2=<speed> from the moment COOP_ROUTE_SLOW_AFTER (default 1) objectives of this copy's
+            // list (world +0x930 {records, count}, record +8 state, 3 = done) are complete.
+            static float speed2 = -2.0f; static int after = 1; static bool switched;
+            if (speed2 == -2.0f) {
+                char v2[32] = {0};
+                speed2 = GetEnvironmentVariableA("COOP_ROUTE_SPEED2", v2, sizeof v2) ? (float)atof(v2) : -1.0f;
+                if (GetEnvironmentVariableA("COOP_ROUTE_SLOW_AFTER", v2, sizeof v2)) after = atoi(v2);
+                if (speed2 > 0.0f) logf("coop: route: speed %.1f, then %.1f after %d completed objective(s)", speed, speed2, after);
+            }
+            if (speed2 > 0.0f && !switched) {
+                uint32_t W2 = *(volatile uint32_t *)(uintptr_t)0x002D45D4, arr = 0, cnt = 0;
+                int done = 0;
+                if (W2 >= 0x80000000 && W2 < 0x84000000 && coop_safe_copy(&arr, W2 + 0x930, 4) && coop_safe_copy(&cnt, W2 + 0x934, 4) && arr && cnt <= 64)
+                    for (uint32_t k = 0; k < cnt; k++) { uint32_t st = 0; if (coop_safe_copy(&st, arr + k * 12 + 8, 4) && st == 3) done++; }
+                if (done >= after) {
+                    switched = true;
+                    logf("coop: route: %d objective(s) complete - speed %.1f -> %.1f (at %.0f m along the route)", done, speed, speed2, dist);
+                    speed = speed2;
+                }
+            }
+        }
         dist += speed * dt;
         if (dist >= total) { dist = total; arrived = 1; logf("coop: route: ARRIVED at the end of the route (%.0f m) - %.1f %.1f %.1f", total, f[0], f[1], f[2]); }
     }
@@ -3050,6 +3470,7 @@ static void coop_self_model_step(uint32_t ctrl)
         if (src < 0x80000000 || src >= 0x84000000) return;
         g_self_link_src = src;
         g_self_link = coop_make_private_link(b, src);
+        coop_free_class_slot(b, src, g_self_link, "the self model");
         logf("coop: self model: %08x private link %08x (class %08x)", b, g_self_link, src);
         if (!g_self_link) { g_coop_self_body = 0; return; }
     }
@@ -3158,6 +3579,7 @@ static void coop_clone_disarm_early(void)
         if (o < 0x80000000 || o >= 0x84000000) return;
         g_aim_shared_checked = 1; g_aim_link_src = o;
         g_aim_link = coop_make_private_link(b, o);
+        if (b == g_p10_gdst) coop_free_class_slot(b, o, g_aim_link, "the clone");
         logf("coop: clone %08x disarmed early: private link %08x (class %08x) before the drive - its donor AI no longer fires it", b, g_aim_link, o);
         if (!g_aim_link) return;
     }
@@ -3202,6 +3624,8 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             static union { uint8_t raw[65536]; uint32_t magic; } buf;   // CLAI packets reach tens of KB
             int r = recvfrom(g_coop_listens, (char *)buf.raw, sizeof buf.raw, 0, (sockaddr *)&from, &fl);
             if (r < 4) break;
+            g_peer_alive_ms = GetTickCount64();
+            if (buf.magic == 0x42484C43) continue;   // "CLHB" heartbeat
             if (buf.magic == 0x54484C43 && r >= 12) {             // "CLHT" host-decided hits on our player (phase 3)
                 uint32_t n = *(const uint32_t *)(buf.raw + 8);
                 if (n <= 16 && r >= (int)(12 + n * sizeof(HitMsg)))
@@ -3225,7 +3649,7 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
                 uint32_t qn = *(const uint32_t *)(buf.raw + 4), cnt = *(const uint32_t *)(buf.raw + 8);
                 uint32_t qsec = cnt >> 16; cnt &= 0xFFFF;   // the joiner's level-part section: its indices are only ours when equal
                 static uint32_t last_seq = 0xFFFFFFFF;
-                if (g_cfg.coop_role == 1 && qn != last_seq && qsec == (g_cp_sec & 0xFFFF) && cnt <= 256 && r >= (int)(12 + cnt * 2)) {
+                if (g_cfg.coop_role == 1 && qn != last_seq && qsec == coop_sync_tag(g_trig_n_kept) && cnt <= 256 && r >= (int)(12 + cnt * 2)) {
                     last_seq = qn;
                     for (uint32_t i = 0; i < cnt && g_trig_req_in_n < 512; i++) g_trig_req_in[g_trig_req_in_n++] = ((const uint16_t *)(buf.raw + 12))[i];
                 }
@@ -3240,6 +3664,15 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             if (buf.magic == 0x524C4C43 && r >= 8) { coop_load_recv(*(const uint32_t *)(buf.raw + 4)); continue; }
             if (buf.magic == 0x54514C43) { coop_quit_recv(); continue; }   // "CLQT" the partner left the session
             if (buf.magic == 0x50434C43 && r >= 20) { coop_cp_recv(buf.raw, r); continue; }   // "CLCP" the partner's level-part section
+            if (buf.magic == 0x41504C43 && r >= 16) {   // "CLPA" the partner's world part + its CURRENT AREA id
+                int32_t pp; memcpy(&pp, buf.raw + 4, 4);
+                uint32_t a0 = *(const uint32_t *)(buf.raw + 8), a1 = *(const uint32_t *)(buf.raw + 12);
+                if (pp > g_cp_peer_part) { g_cp_peer_part = pp; logf("coop: level part: the partner's world is at part %d", pp); }
+                if (a0 >= 0x80000000 && a0 < 0x84000000 && a1 >= 0x80000000 && a1 < 0x84000000) {
+                    g_peer_area[0] = a0; g_peer_area[1] = a1; g_peer_area_ms = GetTickCount64();
+                }
+                continue;
+            }
             if (buf.magic == 0x4B434C43 && r >= 20) { coop_real_cp_recv(buf.raw, r); continue; }   // "CLCK" the partner reached a real checkpoint
             if (buf.magic == 0x4D484C43 && r >= 8) { coop_hm_recv(buf.raw, r); continue; }          // "CLHM" the host saw our hit / kill
             if ((buf.magic == 0x54584C43 || buf.magic == 0x45584C43) && r >= 8) { coop_exit_recv(buf.raw, r); continue; }   // "CLXT" / "CLXE" the level exit (timer / end)   // "CLLR" the partner finished a level load
@@ -3289,14 +3722,14 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
                 }
                 continue;
             }
-            if (buf.magic == 0x50534C43 && r >= 12) {             // "CLSP" the host's spawn counts per spawner
-                uint32_t sn = *(const uint32_t *)(buf.raw + 8), ssec = sn >> 16; sn &= 0xFFFF;
-                if (g_cfg.coop_role == 2 && ssec == (g_cp_sec & 0xFFFF) && sn <= 256 && r >= (int)(12 + sn)) { memcpy(g_sp_host_cnt, buf.raw + 12, sn); g_sp_host_n = (int)sn; }
+            if (buf.magic == 0x50534C43 && r >= 12) {             // "CLSP" the host's spawn-count LEDGER
+                uint32_t ln = *(const uint32_t *)(buf.raw + 8);
+                if (g_cfg.coop_role == 2 && ln <= 160 && r >= (int)(12 + ln * 12)) { memcpy(g_sp_host_led, buf.raw + 12, ln * 12); g_sp_host_led_n = (int)ln; }
                 continue;
             }
             if (buf.magic == 0x47544C43 && r >= 12) {             // "CLTG" the host's trigger activation counts
                 uint32_t tn = *(const uint32_t *)(buf.raw + 8), tsec = tn >> 16; tn &= 0xFFFF;
-                if (g_cfg.coop_role == 2 && tsec == (g_cp_sec & 0xFFFF) && tn <= 512 && r >= (int)(12 + tn * 2)) { memcpy(g_trig_host_cnt, buf.raw + 12, tn * 2); g_trig_host_n = (int)tn; }
+                if (g_cfg.coop_role == 2 && tsec == coop_sync_tag(g_trig_n) && tn <= 512 && r >= (int)(12 + tn * 2)) { memcpy(g_trig_host_cnt, buf.raw + 12, tn * 2); g_trig_host_n = (int)tn; }
                 continue;
             }
             if (buf.magic == 0x58454C43 && r >= 12) {             // "CLEX" the peer's explosions
@@ -3534,6 +3967,8 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             coop_shot_catchup(g_p10_gdst);   // hit sync: fire the remote rays the clone missed
             coop_xd_test();                  // --xd-test (host)
             coop_aggro_log();                // host: who each enemy is targeting
+            {   uint32_t me0 = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+                coop_retire_step(me0 >= 0x80000000 && me0 < 0x84000000 ? me0 : 0); }
             if (g_cfg.coop_role == 2) coop_enemy_tick(*(volatile uint32_t *)(uintptr_t)(ctrl + 0x8C));   // ENEMY SYNC (joiner)
             if (g_cfg.coop_role == 1 && trig) coop_clone_gunshot();   // the joiner's shots ALERT the AI
             static uint8_t ltrig = 0xFF;
@@ -4171,26 +4606,26 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
         }
         if (g_cfg.coop_role == 2 && g_trig_req_n) {          // CLTQ: the joiner's trigger requests (sent 3 times: UDP)
             struct { uint32_t magic, seq, n; uint16_t id[256]; } rq;
-            rq.magic = 0x51544C43; rq.seq = n; rq.n = (uint32_t)g_trig_req_n | ((g_cp_sec & 0xFFFF) << 16);
+            rq.magic = 0x51544C43; rq.seq = n; rq.n = (uint32_t)g_trig_req_n | (coop_sync_tag(g_trig_n_kept) << 16);
             memcpy(rq.id, g_trig_req, g_trig_req_n * 2);
             for (int r3 = 0; r3 < 3; r3++)
                 sendto(g_coop_sock, (const char *)&rq, 12 + g_trig_req_n * 2, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
             g_trig_req_n = 0;
         }
-        if (g_cfg.coop_role == 1 && g_sp_sync == 1 && g_sp_n) {       // CLSP: the host's spawn counts per spawner (every 6th frame)
+        if (g_cfg.coop_role == 1 && g_sp_sync == 1 && g_sp_led_n) {   // CLSP: the host's spawn-count LEDGER (every 6th frame)
             static uint32_t sf;
             if ((sf++ % 6) == 3) {
-                struct { uint32_t magic, seq, n; uint8_t cnt[256]; } sp2;
-                sp2.magic = 0x50534C43; sp2.seq = n; sp2.n = (uint32_t)g_sp_n | ((g_cp_sec & 0xFFFF) << 16);
-                memcpy(sp2.cnt, g_sp_cnt, g_sp_n);
-                sendto(g_coop_sock, (const char *)&sp2, 12 + g_sp_n, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
+                struct { uint32_t magic, seq, n; struct { uint32_t obj, part, cnt; } e[160]; } sp2;
+                sp2.magic = 0x50534C43; sp2.seq = n; sp2.n = (uint32_t)g_sp_led_n;
+                memcpy(sp2.e, g_sp_led, g_sp_led_n * 12);
+                sendto(g_coop_sock, (const char *)&sp2, 12 + g_sp_led_n * 12, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
             }
         }
         if (g_cfg.coop_role == 1 && g_trig_sync == 1 && g_trig_n) {   // CLTG: the host's trigger activation counts (every 6th frame)
             static uint32_t tf;
             if ((tf++ % 6) == 0) {
                 struct { uint32_t magic, seq, n; uint16_t cnt[512]; } tp;
-                tp.magic = 0x47544C43; tp.seq = n; tp.n = (uint32_t)g_trig_n | ((g_cp_sec & 0xFFFF) << 16);
+                tp.magic = 0x47544C43; tp.seq = n; tp.n = (uint32_t)g_trig_n | (coop_sync_tag(g_trig_n) << 16);
                 memcpy(tp.cnt, g_trig_cnt, g_trig_n * 2);
                 sendto(g_coop_sock, (const char *)&tp, 12 + g_trig_n * 2, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
             }
@@ -4244,6 +4679,55 @@ __declspec(naked) void coop_thunk_raycast()
         popad
         ret
     }
+}
+// SAME PART (owner 20261116: "make the part-switch not teleport players if they stand in the same part of the level").
+// The line test FUN_001DAFF0 tests each loaded part slot's geometry (world + 0x49D0 + k * 0x880, tested when +0x38 is
+// set) and writes the PART NUMBER of the slot it hit to out + 0x30 (-1 = no part geometry; 0x1DB045 / 0x1DB104 /
+// 0x1DB219). A ray straight down from a player's feet (+0.5 m .. -3 m) = the part he stands in. A lagging player
+// standing in the partner's part (or a later one) is not teleported at a part switch: his ground stays loaded.
+// -2 = no ground found / no test possible (the old rules apply). COOP_SAME_PART=0 = off (always the old rules).
+static int coop_floor_part(uint32_t po)
+{
+    static int on = -1;
+    if (on < 0) { char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_SAME_PART", e, sizeof e) && e[0] == '0'); logf("coop: same-part rule %s", on ? "ON" : "OFF"); }
+    if (!on || po < 0x80000000 || po >= 0x84000000) return -2;
+    uint32_t world = *(volatile uint32_t *)(uintptr_t)0x2D45D4;
+    if (world < 0x80000000 || world >= 0x84000000) return -2;
+    __declspec(align(16)) static float a[4], b[4], res[16];
+    const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
+    a[0] = f[0]; a[1] = f[1] + 0.5f; a[2] = f[2]; a[3] = 1.0f;
+    b[0] = f[0]; b[1] = f[1] - 3.0f; b[2] = f[2]; b[3] = 1.0f;
+    memset(res, 0, sizeof res); res[8] = 2.0f; ((int32_t *)res)[12] = -1;
+    g_rc_world = world; g_rc_mask = 0x21; g_rc_ign = po; g_rc_flag = 1;
+    g_rc_start = (uint32_t)(uintptr_t)a; g_rc_end = (uint32_t)(uintptr_t)b; g_rc_out = (uint32_t)(uintptr_t)res;
+    g_rc_ret = 0;
+    coop_thunk_raycast();
+    int32_t part = ((int32_t *)res)[12];
+    bool hit = g_rc_ret && res[8] >= 0.0f && res[8] <= 1.0f;
+    return hit && part >= 0 && part < 64 ? part : -2;
+}
+// the partner is a part ahead: do we already stand in their part (or later)?
+// play 20261116 #28 (owner: "a part-switch repeated one more time that undrew a stair, a player stuck in the
+// void"): the part-7 load recycled part 5's slot - the stair undrew under a player who had walked onto it, and
+// the floor test returned NO GROUND (-2) -> the old part-number rules saw "equal parts" and left them there.
+// NO GROUND under our feet while the partner has ground = we are in the void: teleport.
+static bool coop_same_part(uint32_t po, int32_t peer_part, const char *where)
+{
+    int fp = coop_floor_part(po);
+    bool same = fp >= 0 && peer_part >= 0 && fp >= peer_part;
+    static uint64_t lt; uint64_t now = GetTickCount64();
+    if (now - lt > 3000) { lt = now; logf("coop: level part: %s - we stand on part %d's ground, the partner's part is %d -> %s", where, fp, peer_part, same ? "SAME PART, no teleport" : "teleport rule"); }
+    return same;
+}
+// our player has NO ground under their feet but the partner does = we stand in a recycled part's void
+static bool coop_in_void(uint32_t po, int32_t peer_part)
+{
+    if (peer_part < 0) return false;
+    int fp = coop_floor_part(po);
+    if (fp >= 0) return false;
+    static uint64_t lt; uint64_t now = GetTickCount64();
+    if (now - lt > 3000) { lt = now; logf("coop: level part: we have NO ground under our feet (the part's geometry was recycled), the partner stands on part %d - the void rule", peer_part); }
+    return true;
 }
 // trace from obj's eye along its look; out = the point the crosshair sits on (or 120 m out)
 static bool coop_crosshair_point(uint32_t obj, float out[3], float *dist)
@@ -4524,6 +5008,7 @@ static void coop_clone_state_reset(void)
     g_p10_done = 0; g_p10_gdst = 0; g_p10_tries = 0;
     g_coop_self_body = 0; g_self_link = 0; g_self_link_src = 0;
     g_aim_link = 0; g_aim_link_src = 0; g_aim_shared_checked = 0; g_aim_shared_with = 0;
+    memset(g_freed_src, 0, sizeof g_freed_src);
     g_coop_clone_on = 0;
     memset(g_clone_w, 0, sizeof g_clone_w);
 }
@@ -4804,9 +5289,12 @@ static uint32_t coop_squad_type(uint32_t *idx_out)
     *idx_out = fidx;
     return fallback;   // no squad type at all: the level's common soldier
 }
+static uint32_t g_build_ovr[24], g_build_ovr_mask;   // build-missing: def words taken from the host enemy's own spawn
+static uint32_t g_build_brain;   // build-missing: the brain coop_pop_brain_any found (0 = pop the list head as before)
 static uint32_t coop_build_one(uint32_t type, uint32_t tidx, const float pos[3], float yawdeg, uint32_t tag)
 {
-    uint32_t brain = coop_pop_brain();
+    uint32_t brain = g_build_brain ? g_build_brain : coop_pop_brain();
+    g_build_brain = 0;
     if (brain && g_own_brains_n < 4) g_own_brains[g_own_brains_n++] = brain;
     if (!brain) { logf("coop: own spawn: no free brain"); return 0; }
     uint32_t d = (uint32_t)(uintptr_t)_aligned_malloc(0x400, 16);
@@ -4818,6 +5306,7 @@ static uint32_t coop_build_one(uint32_t type, uint32_t tidx, const float pos[3],
     f[4] = pos[0]; f[5] = pos[1]; f[6] = pos[2]; f[7] = yawdeg;
     w[8] = 0x504F4F43; w[9] = tag;               // "COOP" + tag: a name no script knows
     w[10] = 0x97C60000; w[11] = 0x54461272;       // the common soldier's rifle (every surveyed level spawns it)
+    for (int k = 0; k < 24; k++) if (g_build_ovr_mask & (1u << k)) w[k] = g_build_ovr[k];   // build-missing: the host enemy's team / name / look
     w[12] = 0xFFFFFFFF; w[13] = 0xFF;            // no group
     w[14] = 0; w[15] = 0; w[16] = tidx;
     g_fact_mgr = *(volatile uint32_t *)(uintptr_t)0x002D1980;
@@ -5028,6 +5517,14 @@ static void coop_cp_recv(const uint8_t *raw, int len)
 // switch, and a player moved next to the partner by the checkpoint rule may stand PAST the area -> his copy never
 // switched. Now the copy that is behind (the partner reported a higher section) does what FUN_001C7620 does itself,
 // half a second after the move, as soon as the next part is streamed in; again for each section it is behind.
+// A part slot (world + 0x49D0 + k * 0x880) is LOADING when its state is not 0x1C (loaded) AND it holds a part. Two-PC
+// play 20261117 (-21): at the level's LAST part the spare slot sits at state 0x37 with part -1 (nothing left to load) -
+// every teleport / enter rule waited for "no slot loading" forever and the host was never pulled (424 s - the end).
+static bool coop_slot_loading(uint32_t W, int k)
+{
+    uint32_t sl = W + 0x49D0 + k * 0x880;
+    return *(volatile uint32_t *)(uintptr_t)sl != 0x1C && *(volatile int32_t *)(uintptr_t)(sl + 8) >= 0;
+}
 static void coop_part_step()
 {
     {   // once per level load: how many level parts this level streams (1 = none: the part rules never act)
@@ -5051,8 +5548,41 @@ static void coop_part_step()
         if (W0 >= 0x80000000 && W0 < 0x84000000) {
             int32_t cur0 = *(volatile int32_t *)(uintptr_t)(W0 + 0x5AF0);
             if (g_cp_part < 0) g_cp_part = cur0;
+            {   // mission 4 (20261115 #7): the joiner's checkpoint (replayed here) advanced the host's part while the host
+                // stood 200 m back; the teleport waited for the joiner's SECTION, 21 s later - the host fell through the
+                // void meanwhile. Each copy tells the other its world part when it changes ("CLPA"); when ours advances to
+                // a part the partner already reported, the partner went first and we lag (g_adv_lag).
+                static int32_t last_cur = -1; static uint32_t last_seq = 0xFFFFFFFF;
+                if (last_seq != g_load_seq) { last_seq = g_load_seq; last_cur = -1; }
+                // the CURRENT AREA id rides with CLPA too (20261116 #28: after a teleport the partner's area id is
+                // adopted - both copies stand in the same spot). Sent on the part change AND when the area changes.
+                static uint32_t last_a0 = 0; static uint32_t last_a1 = 0; static bool area_ok = false;
+                uint32_t cur_a0 = 0, cur_a1 = 0;
+                if (W0 >= 0x80000000 && W0 < 0x84000000) {
+                    coop_safe_copy(&cur_a0, W0 + 0x5CA8, 4); coop_safe_copy(&cur_a1, W0 + 0x5CAC, 4);
+                    area_ok = cur_a0 >= 0x80000000 && cur_a0 < 0x84000000 && cur_a1 >= 0x80000000 && cur_a1 < 0x84000000;
+                }
+                bool area_changed = area_ok && (cur_a0 != last_a0 || cur_a1 != last_a1);
+                if (cur0 != last_cur || (area_changed && g_coop_sock != INVALID_SOCKET && now - (g_cp_area_sent_ms | 0) > 500)) {
+                    // two-PC play 20261117 (-21): "the partner's: -1" on every advance - last_cur was updated BEFORE the send
+                    // test (cur0 != last_cur), so CLPA went out only with a valid area id, i.e. never. The part change is
+                    // taken first.
+                    bool part_changed = cur0 != last_cur;
+                    g_adv_lag = last_cur >= 0 && cur0 > last_cur && g_cp_peer_part >= cur0;
+                    if (last_cur >= 0 && cur0 != last_cur) logf("coop: level part: our world advanced to part %d (the partner's: %d) - %s", cur0, g_cp_peer_part,
+                                            g_adv_lag ? "the partner went first" : "we went first");
+                    if (area_changed) { last_a0 = cur_a0; last_a1 = cur_a1; g_cp_area_sent_ms = now; }
+                    if (cur0 != last_cur) last_cur = cur0;
+                    if (g_coop_sock != INVALID_SOCKET && (area_ok || part_changed)) {
+                        struct { uint32_t magic; int32_t part; uint32_t a0, a1; } m = {0x41504C43, cur0, cur_a0, cur_a1};
+                        for (int r = 0; r < 3; r++) sendto(g_coop_sock, (const char *)&m, (int)sizeof m, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
+                    }
+                }
+            }
             if (cur0 != g_cp_part) {
                 static int32_t noted = -1;
+                static uint64_t switch_ms;   // when this advance was first seen (the ENTER fallback below)
+                static uint32_t switch_moves;   // teleports made during this switching state: repeats need real distance
                 {   static uint64_t tl; if (now - tl > 2000) { tl = now;
                     logf("coop: level part: switching state: part %d (ours %d), world state %x request %u, slots %x/%d/%u %x/%d/%u", cur0, g_cp_part,
                          *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE0), *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE8),
@@ -5060,9 +5590,21 @@ static void coop_part_step()
                          *(volatile uint32_t *)(uintptr_t)(W0 + 0x5250), *(volatile int32_t *)(uintptr_t)(W0 + 0x5258), *(volatile uint8_t *)(uintptr_t)(W0 + 0x5288)); } }
                 if (noted != cur0) {
                     noted = cur0;
+                    switch_ms = now;
+                    switch_moves = 0;
                     logf("coop: level part: the game switches part %d -> %d here (our section %u) - sync tables dropped until the section starts", g_cp_part, cur0, g_cp_sec);
                 }
-                g_trig_T = 0; g_trig_n = 0; g_sp_T = 0; g_sp_n = 0; g_part_ms = now;
+                {
+                    static int32_t dropped_for = -9; static uint32_t dropped_seq = 0xFFFFFFFF;
+                    bool ld = false;
+                    for (int k = 0; k < 2; k++) if (coop_slot_loading(W0, k)) ld = true;
+                    if (dropped_for != cur0 || dropped_seq != g_load_seq || ld) {   // indexed again once the advance has loaded
+                        dropped_for = cur0; dropped_seq = g_load_seq;
+                        coop_spawn_gap_snapshot();   // teleport window: keep the pre-drop +0x24 baseline (the re-drops while a slot loads keep the first)
+                        coop_supp_flush("part switch");
+                        g_trig_T = 0; g_trig_n = 0; g_sp_T = 0; g_sp_n = 0; g_part_ms = now; g_trig_gap_arm = true;
+                    }
+                }
                 // parttp5 (mission 1): a part switch is two steps. ADVANCE: the world's part goes up (request 1, or the
                 // partner's synced trigger) and the old slot starts streaming the part after it; ENTER: an area trigger
                 // inside the new part (FUN_001C7620: the slot holding part current + 1 loaded with +0x38 == 0) sets
@@ -5070,27 +5612,81 @@ static void coop_part_step()
                 // never enters: the host sat at "part 2 (ours 1)" for 40 s. With the partner a section ahead, once no
                 // slot is loading: a far player is moved next to the partner (not when downed), and the ENTER request is
                 // made here - for a player near the partner or just moved.
-                if (g_cp_peer_sec > g_cp_sec && now - g_cp_moved_ms > 500) {
+                // the teleport no longer waits for OUR advance: the lagging copy's own advance trigger can be
+                // crossed very late (two-PC play 20261115 #10, Naszran Foundry: the host's part 4->5 and 5->6
+                // advances came 74 / 73 s after the joiner's, because the joiner crossed them BEFORE the host's
+                // table indexed that part's triggers) or not at all while both copies wait for the section.
+                // When the partner reported a later part (CLPA) and we are far, teleport at once.
+                // #11 (owner, same level): "the host didn't teleport when the joiner hit a part-switch trigger -
+                // perhaps because the host was considered too close". Right: the 40-m rule skipped the move at
+                // the part 2->3 switch (all other conditions held) - and close-but-behind-the-boundary is
+                // exactly the case the switch must move. The distance gate is now 3 m (skip only when we are
+                // already at the partner); the switch decides, not the distance.
+                if ((g_adv_lag || g_cp_peer_part > cur0) && now - g_cp_moved_ms > 8000 && !g_coop_downed && g_coop_host_pawn_ok) {
+                    bool ld = false;
+                    for (int k = 0; k < 2; k++) if (coop_slot_loading(W0, k)) ld = true;
+                    uint32_t ctrl = g_coop_last_ctrl, po = 0;
+                    if (ctrl >= 0x80000000 && ctrl < 0x84000000) coop_safe_copy(&po, ctrl + 0x8C, 4);
+                    if (!ld && po >= 0x80000000 && po < 0x84000000) {
+                        const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
+                        float pf[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
+                        float dx = f[0] - pf[0], dy = f[1] - pf[1], dz = f[2] - pf[2];
+                        // the FIRST move of a switch fires from 3 m (the #11 owner case); a REPEAT (8 s later,
+                        // play #12: 332.2 / 647.8) needs the old 40 m - the joiner is almost always > 3 m away,
+                        // so an unconditional repeat snapped the host twice per switching state.
+                        // #28: the void rule overrides the same-part rule - NO ground under our feet (the part's
+                        // geometry was recycled) while the partner stands somewhere = the void, teleport.
+                        if (dx * dx + dy * dy + dz * dz >= (switch_moves ? 1600.0f : 9.0f) &&
+                            (coop_in_void(po, g_cp_peer_part > cur0 ? g_cp_peer_part : cur0) ||
+                             !coop_same_part(po, g_cp_peer_part > cur0 ? g_cp_peer_part : cur0, "switching state"))) {
+                            logf("coop: level part: the partner is at part %d (ours %d%s) and we are far - teleported to the partner",
+                                 g_cp_peer_part, cur0, g_adv_lag ? ", they advanced it first" : "");
+                            coop_respawn_at(pf, g_coop_host_yaw, false);
+                            g_cp_moved_ms = now;
+                            switch_moves++;
+                            strncpy(g_coop_info_msg, "GETTING TOO FAR - TELEPORTED TO YOUR PARTNER", sizeof g_coop_info_msg - 1);
+                            g_coop_info_msg_until = now + 4000;
+                        }
+                    }
+                }
+                if ((g_cp_peer_sec > g_cp_sec || now - switch_ms > 10000) && now - g_cp_moved_ms > 500) {
+                    // The ENTER request no longer needs the partner a SECTION ahead: Naszran Foundry part 3
+                    // (20261115 #10) sat BOTH copies in the switching state for ~480 s - the game's own ENTER
+                    // area trigger never passed on either copy, the sections stayed equal, the checkpoint /
+                    // teleport bookkeeping froze and the finale's spawn waves never armed on either side.
+                    // 10 s after the advance we make the request ourselves (the game's own trigger may still
+                    // fire later; a made request is consumed by the driver either way).
                     uint32_t st0 = *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE0), fl0 = *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE8);
                     int nx = -1; bool loading0 = false;
                     for (int k = 0; k < 2; k++) {
                         uint32_t sl = W0 + 0x49D0 + k * 0x880;
-                        if (*(volatile uint32_t *)(uintptr_t)sl != 0x1C) loading0 = true;
+                        if (coop_slot_loading(W0, k)) loading0 = true;
                         if (*(volatile int32_t *)(uintptr_t)(sl + 8) == cur0 + 1 && *(volatile uint32_t *)(uintptr_t)sl == 0x1C &&
                             *(volatile uint8_t *)(uintptr_t)(sl + 0x38) == 0) nx = k;
                     }
                     if (st0 == 0x1C && fl0 == 0 && !loading0 && nx >= 0) {
-                        bool is_near0 = false;
+                        bool is_near0 = false; bool adjacent0 = false;
                         float pf[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
                         uint32_t ctrl = g_coop_last_ctrl, po = 0;
                         if (ctrl >= 0x80000000 && ctrl < 0x84000000) coop_safe_copy(&po, ctrl + 0x8C, 4);
                         if (po >= 0x80000000 && po < 0x84000000 && g_coop_host_pawn_ok) {
                             const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
                             float dx = f[0] - pf[0], dy = f[1] - pf[1], dz = f[2] - pf[2];
-                            is_near0 = dx * dx + dy * dy + dz * dz < 40.0f * 40.0f;
-                        }
+                            float dd2 = dx * dx + dy * dy + dz * dz;
+                            is_near0 = dd2 < 40.0f * 40.0f;
+                            adjacent0 = dd2 < 9.0f;   // #16: the switch decides, not the distance - only an
+                        }                              // already-ADJACENT player is not pulled (the void rule)
+                        if (!adjacent0 && coop_same_part(po, cur0 + 1, "entering")) { adjacent0 = true; is_near0 = true; }   // standing in the next part already
                         bool moved0 = now - g_cp_moved_ms < 8000;
-                        if (!is_near0 && !moved0 && !g_coop_downed && g_coop_host_pawn_ok) {
+                        // two-PC play 20261117 (-25, owner: "the joiner kept getting teleported back to the host even though
+                        // the joiner was the one triggering part switches and checkpoints"): this block also runs on the
+                        // 10-s fallback with EQUAL sections, and moved the player who had gone FIRST back to the one behind
+                        // (5 times: the joiner advanced at 806.5, pulled to the host at 816.5). Only a player whose partner
+                        // is AHEAD (a section further, or the partner advanced first) is moved; the leader is never pulled
+                        // back - it gets the ENTER request in place after 30 s if its own enter trigger has not fired.
+                        bool partner_ahead0 = g_cp_peer_sec > g_cp_sec || g_adv_lag;
+                        bool leader_wait0 = !partner_ahead0 && now - switch_ms > 30000;
+                        if (!adjacent0 && !moved0 && partner_ahead0 && !g_coop_downed && g_coop_host_pawn_ok) {
                             logf("coop: level part: part %d here (our section %u), the partner is at section %u and we are far - teleported to the partner", cur0, g_cp_sec, g_cp_peer_sec);
                             coop_respawn_at(pf, g_coop_host_yaw, false);
                             g_cp_moved_ms = now;
@@ -5099,7 +5695,7 @@ static void coop_part_step()
                             moved0 = true;
                         }
                         static uint64_t t_enter;
-                        if ((is_near0 || moved0) && now - t_enter > 5000) {
+                        if ((is_near0 || moved0 || leader_wait0) && now - t_enter > 5000) {
                             t_enter = now;
                             *(volatile uint32_t *)(uintptr_t)(W0 + 0x5AE8) = 2;
                             logf("coop: level part: part %d here, part %d loaded (slot %d) - entering it as the partner did (+0x5AE8 = 2)", cur0, cur0 + 1, nx);
@@ -5110,6 +5706,63 @@ static void coop_part_step()
             }
         }
     }
+    // THE PART-SWITCH TELEPORT, outside the switching state too (two-PC play 20261115 #16: the joiner went
+    // ahead and activated the part switch; the lagging copy was NOT in a switching state yet - its own world
+    // part had not moved - so the teleport branch inside the block above never ran, and the host stayed at
+    // the checkpoint while the joiner ran on; no further part event came, so nothing ever pulled it). The
+    // partner reporting a LATER part (CLPA) IS the switch signal: more than 3 m from them -> teleport (once
+    // per 8 s; the switch decides, not the distance - #11). The same block is the VOID watchdog: a player
+    // deep below the partner is standing (or lying downed) in a dropped part's geometry - pulled out.
+    if (g_cfg.coop_role && g_coop_host_pawn_ok) {
+        uint32_t W = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+        if (W >= 0x80000000 && W < 0x84000000) {
+            int32_t cur2 = *(volatile int32_t *)(uintptr_t)(W + 0x5AF0);
+            if (cur2 == g_cp_part) {   // the switching state is handled by the block above
+                uint32_t ctrl = g_coop_last_ctrl, po = 0;
+                if (ctrl >= 0x80000000 && ctrl < 0x84000000) coop_safe_copy(&po, ctrl + 0x8C, 4);
+                if (po >= 0x80000000 && po < 0x84000000) {
+                    const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
+                    float pf[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
+                    float dx = f[0] - pf[0], dy = f[1] - pf[1], dz = f[2] - pf[2];
+                    float d2 = dx * dx + dy * dy + dz * dz;
+                    bool peer_ahead = g_cp_peer_part > cur2 && d2 >= 9.0f;            // the switch signal, near or far
+                    bool deep_void = f[1] < pf[1] - 60.0f;                            // a dropped part's geometry: far below
+                    static uint64_t dvoid_ms;                                         // the downed-in-void timer
+                    if (g_coop_downed && f[1] < pf[1] - 25.0f) {
+                        if (!dvoid_ms) dvoid_ms = now;
+                        if (now - dvoid_ms > 8000) {   // unrevivable down there: what a checkpoint would do
+                            logf("coop: level part: we are DOWNED deep below the partner (the void) - respawned at their feet");
+                            coop_respawn_at(pf, g_coop_host_yaw, true);
+                            g_cp_moved_ms = now; dvoid_ms = 0;
+                            strncpy(g_coop_info_msg, "CHECKPOINT REACHED - BACK IN THE FIGHT", sizeof g_coop_info_msg - 1);
+                            g_coop_info_msg_until = now + 4000;
+                        }
+                    } else dvoid_ms = 0;
+                    bool ld = false;
+                    for (int k = 0; k < 2; k++) if (coop_slot_loading(W, k)) ld = true;
+                    if (peer_ahead && !deep_void && !ld && g_cp_peer_part == cur2 + 1 && coop_same_part(po, g_cp_peer_part, "not switched yet")) {
+                        // we already stand in the partner's part: our world switches as the game's advance trigger would
+                        // (FUN_001B73B0: request 1 when current == target - 1) - the old part unloads behind us
+                        static uint64_t t_adv;
+                        if (*(volatile uint32_t *)(uintptr_t)(W + 0x5AE0) == 0x1C && *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8) == 0 && now - t_adv > 3000) {
+                            t_adv = now;
+                            *(volatile uint32_t *)(uintptr_t)(W + 0x5AE8) = 1;
+                            logf("coop: level part: the partner is at part %d and we stand in it - our world advances here (+0x5AE8 = 1), no teleport", g_cp_peer_part);
+                        }
+                        peer_ahead = false;
+                    }
+                    if (!g_coop_downed && !ld && now - g_cp_moved_ms > 8000 && (peer_ahead || deep_void)) {
+                        logf("coop: level part: the partner is at part %d (ours %d, we had not switched yet)%s - teleported to the partner",
+                             g_cp_peer_part, cur2, deep_void ? " - we are deep below them (the void)" : "");
+                        coop_respawn_at(pf, g_coop_host_yaw, false);
+                        g_cp_moved_ms = now;
+                        strncpy(g_coop_info_msg, "GETTING TOO FAR - TELEPORTED TO YOUR PARTNER", sizeof g_coop_info_msg - 1);
+                        g_coop_info_msg_until = now + 4000;
+                    }
+                }
+            }
+        }
+    }
     if (g_cp_peer_sec <= g_cp_sec) return;
     if (now - g_cp_moved_ms < 500) return;
     // playtest #7 (owner: "one time the host was in the void"): switching parts drops the oldest part - a player still
@@ -5117,7 +5770,7 @@ static void coop_part_step()
     // follows; a player more than 40 m from the partner is first moved next to them (once the part is streamed in
     // here) with "GETTING TOO FAR - TELEPORTED TO YOUR PARTNER", the switch half a second later. A downed player is not
     // moved (spectating; back at the next main objective as before).
-    bool is_near = false;
+    bool is_near = false; bool adjacent = false;
     float pfeet[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
     {
         uint32_t ctrl = g_coop_last_ctrl, po = 0;
@@ -5125,8 +5778,13 @@ static void coop_part_step()
         if (po >= 0x80000000 && po < 0x84000000 && g_coop_host_pawn_ok) {
             const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
             float dx = f[0] - pfeet[0], dy = f[1] - pfeet[1], dz = f[2] - pfeet[2];
-            is_near = dx * dx + dy * dy + dz * dz < 40.0f * 40.0f;
-        }
+            float dd2 = dx * dx + dy * dy + dz * dz;
+            is_near = dd2 < 40.0f * 40.0f;
+            adjacent = dd2 < 9.0f;   // #16: the switch decides, not the distance - only an already-ADJACENT
+        }                            // player is not pulled (the void rule)
+        uint32_t W1 = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+        int32_t cur1 = (W1 >= 0x80000000 && W1 < 0x84000000) ? *(volatile int32_t *)(uintptr_t)(W1 + 0x5AF0) : -1;
+        if (!adjacent && po >= 0x80000000 && po < 0x84000000 && cur1 >= 0 && coop_same_part(po, cur1 + 1, "section rule")) { adjacent = true; is_near = true; }
     }
     bool moved_recently = now - g_cp_moved_ms < 8000;
     static uint64_t t_req, t_log; static uint32_t req_for;
@@ -5144,7 +5802,7 @@ static void coop_part_step()
         uint32_t sl = W + 0x49D0 + k * 0x880;
         sd[k][0] = *(volatile uint32_t *)(uintptr_t)sl; sd[k][1] = *(volatile uint32_t *)(uintptr_t)(sl + 8);
         sd[k][2] = *(volatile uint8_t *)(uintptr_t)(sl + 0x38);
-        if (sd[k][0] != 0x1C) loading = true;
+        if (sd[k][0] != 0x1C && (int32_t)sd[k][1] >= 0) loading = true;
         if ((int32_t)sd[k][1] == cur + 1 && sd[k][0] == 0x1C) ready = k;
     }
     uint32_t parts = 0;
@@ -5154,7 +5812,7 @@ static void coop_part_step()
     }
     if (loading || (parts && cur >= (int32_t)parts)) ready = -1;
     uint32_t req = ready >= 0 && sd[ready][2] == 0 ? 2u : 1u;
-    if (state == 0x1C && flag == 0 && ready >= 0 && !is_near && !moved_recently && !g_coop_downed && g_coop_host_pawn_ok) {
+    if (state == 0x1C && flag == 0 && ready >= 0 && !adjacent && !moved_recently && !g_coop_downed && g_coop_host_pawn_ok) {
         logf("coop: level part: the partner is at section %u, we at %u and far from them - teleported to the partner, switching to part %d (+0x5AE8 = %u)",
              g_cp_peer_sec, g_cp_sec, cur + 1, req);
         coop_respawn_at(pfeet, g_coop_host_yaw, false);
@@ -5319,7 +5977,9 @@ static void coop_checkpoint_section()
     // tables again (300 ms later: the part is being built now); counts start at 0 for the new objects on both copies,
     // and the CLTG / CLSP / CLTQ packets carry the section number, so a copy only uses the partner's counts while both
     // are in the same part.
-    g_trig_T = 0; g_trig_n = 0; g_trig_host_n = 0; g_trig_req_n = 0; g_trig_req_in_n = 0;
+    coop_spawn_gap_snapshot();   // teleport window: keep the pre-drop +0x24 baseline (credited at the re-index)
+    coop_supp_flush("section start");
+    g_trig_T = 0; g_trig_n = 0; g_trig_host_n = 0; g_trig_req_n = 0; g_trig_req_in_n = 0; g_trig_gap_arm = true;
     g_sp_T = 0; g_sp_n = 0; g_sp_host_n = 0;
     g_part_ms = GetTickCount64();
     {
@@ -5373,13 +6033,20 @@ extern "C" void coop_level_prepare(uint32_t obj)
         coop_clone_state_reset();
         g_pawncap_n = 0;
         coop_enid_reset();
-        g_cp_sec = 0; g_cp_peer_sec = 0; g_cp_part = -1;   // checkpoint section numbers start again
+        g_cp_sec = 0; g_cp_peer_sec = 0; g_cp_part = -1; g_cp_peer_part = -1; g_adv_lag = false;   // checkpoint section numbers start again
         // rc1: the trigger / spawn sync tables stayed indexed (same table pointer 0x2D45D0) -> the joiner's
         // level-start triggers (the intro script) and its first spawns were held as requests to the host,
         // which was still in its intro: the intro message came 15 s late and spawn #3/#4 (the clone's chained
         // factory) never ran. Drop the tables: as on a first load the level start runs locally on both copies
         // and the tables are indexed again once play begins.
-        g_trig_T = 0; g_trig_n = 0; g_sp_T = 0; g_sp_n = 0;
+        g_trig_T = 0; g_trig_n = 0; g_sp_T = 0; g_sp_n = 0; g_gaps_n = 0;   // a reload: the old bodies are gone, no baseline
+        g_trig_n_kept = 0; g_sp_n_kept = 0; g_trig_gap_n = 0; g_trig_gap_arm = false;   // no count survives a reload (see below)
+        // two-PC play 20261117 (-19, owner: "the level stops syncing after a restart, many things don't spawn for the joiner
+        // and host"): this branch returned without noting the load, so the NEXT section start (the same routine, 79 s
+        // later, mid-play) failed the section test below (g_load_seq != g_prep_load_seq) and ran as a new LEVEL LOAD on both
+        // copies: a second clone + self model (the old pair stayed - 4 of the 16 pool entries), the enemy ids and the sync
+        // tables reset -> the pool stayed full ("pool guard ... held" for minutes) and nothing spawned. Note the load here.
+        g_prep_load_seq = g_load_seq;
         return;
     }
     loads++;
@@ -5408,7 +6075,16 @@ extern "C" void coop_level_prepare(uint32_t obj)
         }
         g_pawncap_n = 0;
         coop_enid_reset();          // enemy identity: spawn-point counters and ids start fresh in every level
-        g_cp_sec = 0; g_cp_peer_sec = 0; g_cp_part = -1;   // checkpoint section numbers start again
+        g_gaps_n = 0;               // a fresh level: a pending teleport-window baseline is meaningless
+        g_cp_sec = 0; g_cp_peer_sec = 0; g_cp_part = -1; g_cp_peer_part = -1; g_adv_lag = false;   // checkpoint section numbers start again
+        // two-PC play 20261117 (owner: "we died, the host restarted, after both restarted the enemies no longer synced for
+        // the joiner"): the restart came through THIS branch ("level load #3", not the RESTART one above) and the trigger /
+        // spawn tables stayed indexed (the same table pointer 0x2D45D0 after the reload) with the first attempt's counts:
+        // the joiner's one-shots read "host count 1, ours 1" before anyone touched them, the host refused its one-shot
+        // requests as already fired (0 host-fired-for-joiner after the restart) -> the joiner's spawn triggers never ran.
+        // The same-part keep (g_trig_n_kept / g_sp_n_kept) would carry them over a drop too. A real load drops it all.
+        g_trig_T = 0; g_trig_n = 0; g_trig_n_kept = 0; g_sp_T = 0; g_sp_n = 0; g_sp_n_kept = 0;
+        g_trig_gap_n = 0; g_trig_gap_arm = false;
     }
 
     uint32_t size = (cnt + 1) * 0x1D0;
@@ -5541,7 +6217,10 @@ extern "C" void coop_log_pawn_def(void)
             // sp5: resetting and waiting for coop_aim_body left the clone brainless for good (its +0x324 still
             // held the old native-memory copy, which coop_aim_body will not copy) -> no aim / fire / enemy tick.
             // Make the new copy now, from the original class.
-            uint32_t nl = (g_aim_link_src >= 0x80000000 && g_aim_link_src < 0x84000000 && g_p10_gdst) ? coop_make_private_link(g_p10_gdst, g_aim_link_src) : 0;
+            // free slots: the class agent was handed back to the game - it may be another enemy's brain now; the new
+            // copy comes from the snapshot taken when it was freed
+            uint32_t nl = coop_src_freed(g_aim_link_src) ? coop_clone_link_from_snap(g_p10_gdst)
+                        : (g_aim_link_src >= 0x80000000 && g_aim_link_src < 0x84000000 && g_p10_gdst) ? coop_make_private_link(g_p10_gdst, g_aim_link_src) : 0;
             logf("coop: spawn #%u: the clone's private brain %08x was reused by the game - the clone got a new copy %08x", n, o, nl);
             if (nl) g_aim_link = nl;
             o = 0;
@@ -5606,6 +6285,17 @@ extern "C" void coop_log_pawn_def(void)
         bool have = false;
         for (int i = 0; i < g_class_objs_n; i++) if (g_class_objs[i] == owner) have = true;
         if (!have && g_class_objs_n < 24) g_class_objs[g_class_objs_n++] = owner;
+    }
+    if (ctx >= 0x80000000 && ctx < 0x84000000 && def >= 0x10000 && def < 0x84000000) {   // build-missing: the def words per spawn point (the def sits on the stack)
+        uint32_t ww[14] = {0};
+        if (coop_safe_copy(ww, def + 0x20, sizeof ww)) {
+            int q = -1;
+            for (int i = 0; i < g_ctx_wpn_n; i++) if (g_ctx_wpn[i].ctx == ctx) q = i;
+            if (q < 0) q = g_ctx_wpn_n < 64 ? g_ctx_wpn_n++ : (int)(g_ctx_wpn_w++ % 64);
+            g_ctx_wpn[q].ctx = ctx; memcpy(g_ctx_wpn[q].dw, ww, sizeof ww); memset(g_ctx_wpn[q].afp, 0, 16);
+            uint32_t ap = ww[18 - 8];
+            if (ap >= 0x80000000 && ap < 0x84000000) coop_safe_copy(g_ctx_wpn[q].afp, ap, 16);
+        }
     }
     if (ctx >= 0x80000000 && ctx < 0x84000000) {   // enemy identity: the ordinal of this spawn at its spawn point
         int k = -1;
@@ -7022,6 +7712,36 @@ static void coop_threat_add(uint32_t enemy, uint32_t attacker, float dmg)
     if (ln++ < 40 || (ln % 20) == 0) logf("coop: aggro: %s hit enemy %08x for %.1f -> threat host %.0f joiner %.0f",
                         attacker == me ? "HOST" : "JOINER", enemy, dmg, t->host, t->clone);
 }
+// SIGHT (owner 20261115: "modify the priorities: 1. hear the player 2. see the player 3. get hurt by the player").
+// The game's own perception only knows the host's player (the clone is outside the AI roster): an enemy never SAW the
+// joiner. coop_enemy_sees: within 40 m, in front of the enemy (or within 6 m), and the game's line test (FUN_001DAFF0,
+// mask 0x21, ignoring the enemy) from the enemy's eye to the target's chest is clear (or stops within 1 m of it).
+static bool coop_enemy_sees(uint32_t enemy, uint32_t target)
+{
+    if (enemy < 0x80000000 || enemy >= 0x84000000 || target < 0x80000000 || target >= 0x84000000) return false;
+    uint32_t world = *(volatile uint32_t *)(uintptr_t)0x2D45D4;
+    if (world < 0x80000000 || world >= 0x84000000) return false;
+    const volatile float *ef = (const volatile float *)(uintptr_t)(enemy + 0xA0), *tf = (const volatile float *)(uintptr_t)(target + 0xA0);
+    float dx = tf[0] - ef[0], dy = tf[1] - ef[1], dz = tf[2] - ef[2];
+    float d2 = dx * dx + dz * dz;
+    if (d2 > 40.0f * 40.0f || fabsf(dy) > 12.0f) return false;
+    if (d2 > 36.0f) {   // in front: the body's forward row (+0x90), horizontal, within ~70 degrees
+        const volatile float *F = (const volatile float *)(uintptr_t)(enemy + 0x90);
+        float fl = sqrtf(F[0] * F[0] + F[2] * F[2]), dl = sqrtf(d2);
+        if (fl > 0.1f && (F[0] * dx + F[2] * dz) / (fl * dl) < 0.34f) return false;
+    }
+    __declspec(align(16)) static float a[4], b[4], res[16];
+    a[0] = ef[0]; a[1] = ef[1] + 1.6f; a[2] = ef[2]; a[3] = 1.0f;
+    b[0] = tf[0]; b[1] = tf[1] + 1.3f; b[2] = tf[2]; b[3] = 1.0f;
+    memset(res, 0, sizeof res); res[8] = 2.0f;
+    g_rc_world = world; g_rc_mask = 0x21; g_rc_ign = enemy; g_rc_flag = 1;
+    g_rc_start = (uint32_t)(uintptr_t)a; g_rc_end = (uint32_t)(uintptr_t)b; g_rc_out = (uint32_t)(uintptr_t)res;
+    g_rc_ret = 0;
+    coop_thunk_raycast();
+    if (!g_rc_ret || !(res[8] >= 0.0f && res[8] <= 1.0f)) return true;   // nothing in between
+    float len = sqrtf(dx * dx + (dy - 0.3f) * (dy - 0.3f) + dz * dz);
+    return res[8] * len >= len - 1.0f;                                    // it stopped at the target itself
+}
 // release the enemy's current combat behaviour (+0x648) like FUN_001ab4a0 does on a switch
 volatile uint32_t g_bh_obj, g_bh_fn, g_bh_esp;
 __declspec(naked) void coop_thunk_behaviour_release()
@@ -7049,6 +7769,169 @@ static void coop_set_enemy_target(uint32_t link, int idx)
     }
     *(volatile int *)(uintptr_t)(link + 0x2A8) = idx;
     *(volatile uint8_t *)(uintptr_t)(link + 0x2A1) = 1;   // FUN_001ab4a0's "plan again" flag
+}
+
+// FREE OUR 2 SLOTS (owner 20261116: "do both, retire stragglers and free our 2 slots"). The clone and the self model
+// run on PRIVATE copies of their brains (coop_make_private_link); the class agents they were built with stayed
+// ATTACHED (agent+0x88 = 1) and their kind-1 pool entries stayed taken - co-op had 14 enemy slots. Now, right after the
+// private copy: the class agent's DETACH (vt+8 = FUN_001cc980, ECX = the agent; the game's own call when a body lets
+// its brain go) and the pool release FUN_00189970 (ECX = R+0x22C48, push body; it clears body+0x344 too). The registry
+// slot stays (enemies must still target the clone). COOP_FREE_SLOTS=0 = off.
+static int coop_free_slots_on()
+{
+    static int on = -1;
+    // slots1 (route test): both copies crashed - the joiner in an AI update 28 s later (0x1955A1, another agent), the host
+    // in the game's own pool release of one of our bodies (0x1899BF, +0x344 already 0). The game still treats both
+    // bodies as normal pawns: OFF by default, COOP_FREE_SLOTS=1 to experiment.
+    if (on < 0) { char e[8] = {0}; on = GetEnvironmentVariableA("COOP_FREE_SLOTS", e, sizeof e) && e[0] == '1'; }
+    return on;
+}
+volatile uint32_t g_fs2_agent, g_fs2_fn, g_fs2_body, g_fs2_pool, g_fs2_esp;
+__declspec(naked) static void coop_thunk_agent_detach()
+{
+    __asm {
+        pushad
+        mov dword ptr [g_fs2_esp], esp
+        mov ecx, dword ptr [g_fs2_agent]
+        call dword ptr [g_fs2_fn]
+        mov esp, dword ptr [g_fs2_esp]
+        popad
+        ret
+    }
+}
+__declspec(naked) static void coop_thunk_pool_release()
+{
+    __asm {
+        pushad
+        mov dword ptr [g_fs2_esp], esp
+        mov ecx, dword ptr [g_fs2_pool]
+        push dword ptr [g_fs2_body]
+        mov eax, 0x00189970
+        call eax
+        mov esp, dword ptr [g_fs2_esp]
+        popad
+        ret
+    }
+}
+static uint8_t *g_clone_link_snap;   // the clone's private brain as it was when its class agent was freed
+static uint32_t g_clone_link_snap_base;
+static bool coop_src_freed(uint32_t src) { for (int i = 0; i < 4; i++) if (src && g_freed_src[i] == src) return true; return false; }
+static void coop_free_class_slot(uint32_t body, uint32_t src, uint32_t priv, const char *who)
+{
+    if (!coop_free_slots_on() || !body || src < 0x80000000 || src >= 0x84000000 || coop_src_freed(src)) return;
+    uint32_t R = *(volatile uint32_t *)(uintptr_t)0x002D1988;
+    if (R < 0x80000000 || R >= 0x84000000) return;
+    uint32_t vt = *(volatile uint32_t *)(uintptr_t)src, fn = 0;
+    if (vt != 0x0028BEF0 || !coop_safe_copy(&fn, vt + 8, 4) || fn != 0x001CC980) {
+        logf("coop: free slots: %s class %08x is not a plain agent (vt %08x) - left as it is", who, src, vt);
+        return;
+    }
+    if (priv && body == g_p10_gdst) {   // the clone: keep a copy of its private brain for the re-copy path (spawn reuse)
+        if (!g_clone_link_snap) g_clone_link_snap = (uint8_t *)_aligned_malloc(0x1FE0, 16);
+        if (g_clone_link_snap) { memcpy(g_clone_link_snap, (const void *)(uintptr_t)priv, 0x1FE0); g_clone_link_snap_base = priv; }
+    }
+    uint8_t att = *(volatile uint8_t *)(uintptr_t)(src + 0x88);
+    uint32_t pe = *(volatile uint32_t *)(uintptr_t)(body + 0x344);
+    if (att) { g_fs2_agent = src; g_fs2_fn = fn; coop_thunk_agent_detach(); }
+    if (pe) { g_fs2_pool = R + 0x22C48; g_fs2_body = body; coop_thunk_pool_release(); }
+    for (int i = 0; i < 4; i++) if (!g_freed_src[i]) { g_freed_src[i] = src; break; }
+    logf("coop: free slots: %s %08x - class agent %08x detached (was %u, now %u), pool entry %08x released (body +0x344 now %08x)",
+         who, body, src, att, *(volatile uint8_t *)(uintptr_t)(src + 0x88), pe, *(volatile uint32_t *)(uintptr_t)(body + 0x344));
+}
+// a new private brain for the clone from the snapshot (self-pointers rebased from the snapshot's old address)
+static uint32_t coop_clone_link_from_snap(uint32_t body)
+{
+    if (!g_clone_link_snap || !body) return 0;
+    const uint32_t SZ = 0x1FE0;
+    uint32_t cp = (uint32_t)(uintptr_t)_aligned_malloc(SZ, 16);
+    if (!cp) return 0;
+    memcpy((void *)(uintptr_t)cp, g_clone_link_snap, SZ);
+    for (uint32_t off = 0; off < SZ; off += 4) {
+        uint32_t v = *(volatile uint32_t *)(uintptr_t)(cp + off);
+        if (v >= g_clone_link_snap_base && v < g_clone_link_snap_base + SZ) *(volatile uint32_t *)(uintptr_t)(cp + off) = cp + (v - g_clone_link_snap_base);
+    }
+    *(volatile uint32_t *)(uintptr_t)(cp + 0x8C) = body;
+    *(volatile uint32_t *)(uintptr_t)(body + 0x324) = cp;
+    return cp;
+}
+
+// RETIRE STRAGGLERS (host; owner 20261116 "retire stragglers"): two-PC play #19 - the host's kind-1 pool sat at 16 / 16
+// for 90 s (378-468 s) with enemies the players had walked past; the next area's spawners were refused 3000+ times until
+// the part switch flushed the old part. When the pool has <= 1 free entry: the farthest live enemy more than 70 m from
+// BOTH players that targets neither of them is despawned the game's own way (FUN_001e68b0, ECX = *0x2D1980, EAX = the
+// body: brain detach, cleanup, unregister + pool release - what the game does on a part switch); the spawner that made
+// it is switched off first (no refill behind the players). One per 2 s. The joiner mirrors it ("left the host's enemy
+// list -> dead"). COOP_RETIRE=0 = off, COOP_RETIRE_M=<m>.
+volatile uint32_t g_rt_body, g_rt_esp;
+__declspec(naked) static void coop_thunk_despawn()
+{
+    __asm {
+        pushad
+        mov dword ptr [g_rt_esp], esp
+        mov ecx, dword ptr ds:[0x002D1980]
+        mov eax, dword ptr [g_rt_body]
+        mov edx, 0x001E68B0
+        call edx
+        mov esp, dword ptr [g_rt_esp]
+        popad
+        ret
+    }
+}
+static void coop_retire_step(uint32_t me)
+{
+    static int on = -1; static float dist = 70.0f;
+    if (on < 0) {
+        char e[16] = {0};
+        // retire1 (route test): the game's despawn FUN_001e68b0 called on a LIVE enemy mid-frame crashed the host at once
+        // (0x19FD97: FUN_001a2230 reads the brain the despawn had just released) - the part flush despawns after other
+        // cleanup. OFF by default until it retires by a kill instead; COOP_RETIRE=1 to experiment.
+        on = GetEnvironmentVariableA("COOP_RETIRE", e, sizeof e) && e[0] == '1';
+        if (GetEnvironmentVariableA("COOP_RETIRE_M", e, sizeof e)) dist = (float)atof(e);
+        logf("coop: retire stragglers %s (%.0f m)", on ? "ON" : "OFF", dist);
+    }
+    if (!on || g_cfg.coop_role != 1 || !me || !g_p10_gdst || g_coop_teardown) return;
+    static uint64_t last;
+    uint64_t now = GetTickCount64();
+    if (now - last < 2000) return;
+    uint32_t R = *(volatile uint32_t *)(uintptr_t)0x002D1988, pl[3] = {0};
+    if (R < 0x80000000 || R >= 0x84000000 || !coop_safe_copy(pl, R + 0x22C48 + 0x7C, 12) || pl[2] == 0 || pl[2] > 256) return;
+    uint8_t used[256]; if (!coop_safe_copy(used, pl[1], pl[2])) return;
+    uint32_t nused = 0; for (uint32_t i = 0; i < pl[2]; i++) if (used[i]) nused++;
+    if (nused + 1 < pl[2]) return;                                   // room left: nothing to do
+    last = now;
+    const volatile float *hp = (const volatile float *)(uintptr_t)(me + 0xA0), *cp = (const volatile float *)(uintptr_t)(g_p10_gdst + 0xA0);
+    uint32_t s[16]; uint32_t ns = enemy_slots(s);
+    uint32_t pick = 0; float best = dist * dist;
+    for (uint32_t i = 0; i < ns; i++) {
+        uint32_t b = s[i];
+        if (!is_enemy(b, me) || b == g_p10_gdst || b == g_coop_self_body) continue;
+        if (*(volatile uint32_t *)(uintptr_t)(b + 0x384) != 0) continue;
+        uint32_t link = *(volatile uint32_t *)(uintptr_t)(b + 0x324);
+        if (link >= 0x80000000 && link < 0x84000000) {   // fighting one of us: never
+            int idx = *(volatile int *)(uintptr_t)(link + 0x2A8);
+            uint32_t ent = 0;
+            if (idx >= 0 && idx < 4096 && *(volatile uint32_t *)(uintptr_t)(R + 0xFB0 + idx * 0xC) == 0)
+                ent = *(volatile uint32_t *)(uintptr_t)(R + 0xFB4 + idx * 0xC);
+            if (ent == me || ent == g_p10_gdst) continue;
+        }
+        const volatile float *e = (const volatile float *)(uintptr_t)(b + 0xA0);
+        float dh = (e[0] - hp[0]) * (e[0] - hp[0]) + (e[1] - hp[1]) * (e[1] - hp[1]) + (e[2] - hp[2]) * (e[2] - hp[2]);
+        float dc = (e[0] - cp[0]) * (e[0] - cp[0]) + (e[1] - cp[1]) * (e[1] - cp[1]) + (e[2] - cp[2]) * (e[2] - cp[2]);
+        float d = dh < dc ? dh : dc;
+        if (d > best) { best = d; pick = b; }
+    }
+    if (!pick) {
+        static uint64_t nl;
+        if (now - nl > 20000) { nl = now; logf("coop: retire stragglers: pool %u / %u full, no enemy past %.0f m from both of us", nused, pl[2], dist); }
+        return;
+    }
+    for (int i = 0; i < g_sp_n; i++) {   // its spawner stays off (no refill behind us)
+        uint32_t cur = 0;
+        if (g_sp_obj[i] && coop_safe_copy(&cur, g_sp_obj[i] + 0x24, 4) && cur == pick) { *(volatile uint8_t *)(uintptr_t)(g_sp_obj[i] + 0x28) = 0; break; }
+    }
+    logf("coop: retire stragglers: pool %u / %u full - enemy %08x %.0f m from the nearer of us is despawned", nused, pl[2], pick, sqrtf(best));
+    g_rt_body = pick;
+    coop_thunk_despawn();
 }
 static void coop_aggro_log(void)
 {
@@ -7100,6 +7983,13 @@ static void coop_aggro_log(void)
         else if (!e) snprintf(buf, n, "none");
         else snprintf(buf, n, "%08x", e);
     };
+    static uint64_t hshot_ms;   // the host's own shots (its weapon in the fire state) - level 3 "heard" for the host
+    {
+        uint32_t W = *(volatile uint32_t *)(uintptr_t)(me + 0x278 + 0x28);
+        if (W >= 0x80000000 && W < 0x84000000 && *(volatile int *)(uintptr_t)(W + 0xD8) == 1) hshot_ms = GetTickCount64();
+    }
+    struct Sight { uint32_t body; uint64_t at; bool j, h; };
+    static Sight sight[16];
     for (uint32_t i = 0; i < ns; i++) {
         uint32_t b = s[i];
         if (!is_enemy(b, me)) continue;
@@ -7142,48 +8032,72 @@ static void coop_aggro_log(void)
         // broadcast reaches them, but an enemy that is IDLE or fighting a SQUADMATE stayed with the game's pick (the
         // manager below only touched enemies already on a player). The joiner fired in the last 0.6 s within 30 m
         // of this enemy and it is not on a player -> it engages the joiner (the threat rules then decide as before).
-        bool heard = false;
-        if (!g_aggro_off && g_p10_gdst && ent != me && ent != g_p10_gdst && g_jshot_ms && GetTickCount64() - g_jshot_ms < 600 &&
-            *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) == 0) {
-            const volatile float *eb = (const volatile float *)(uintptr_t)(b + 0xA0), *cb = (const volatile float *)(uintptr_t)(g_p10_gdst + 0xA0);
+        // PRIORITIES (owner 20261115): 1 HEAR (the player fired within 30 m in the last 0.6 s) > 2 SEE (line of sight,
+        // coop_enemy_sees; for the host also the game's own pick, its perception) > 3 HURT (threat). An enemy goes for
+        // the player with the higher level; a higher level takes over at once (at most one switch a second); on a tie
+        // it keeps its target, and between two "hurt" players the old threat rule decides.
+        uint64_t nowp = GetTickCount64();
+        bool clone_up = g_p10_gdst && *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) == 0;
+        auto near30 = [&](uint32_t who) {
+            const volatile float *eb = (const volatile float *)(uintptr_t)(b + 0xA0), *cb = (const volatile float *)(uintptr_t)(who + 0xA0);
             float hx = eb[0] - cb[0], hy = eb[1] - cb[1], hz = eb[2] - cb[2];
-            heard = hx * hx + hy * hy + hz * hz < 30.0f * 30.0f;
+            return hx * hx + hy * hy + hz * hz < 50.0f * 50.0f;
+        };
+        // two-PC play #8 (owner: "enemies don't seem to react to the joiner's gunfire"): 12 enemies switched on "heard",
+        // all within 30 m. Now 50 m and the last 1.5 s.
+        bool heard = !g_aggro_off && clone_up && g_jshot_ms && nowp - g_jshot_ms < 1500 && near30(g_p10_gdst);
+        bool heard_h = hshot_ms && nowp - hshot_ms < 1500 && near30(me);
+        Sight *sg = &sight[i & 15];
+        if (sg->body != b) { sg->body = b; sg->at = 0; sg->j = sg->h = false; }
+        if (!g_aggro_off && nowp - sg->at >= 300) {   // a line test per enemy and player at most every 0.3 s
+            sg->at = nowp;
+            sg->j = clone_up && coop_enemy_sees(b, g_p10_gdst);
+            sg->h = *(volatile uint32_t *)(uintptr_t)(me + 0x384) == 0 && coop_enemy_sees(b, me);
         }
-        if (!g_aggro_off && (idle_hit || heard || (ent && (ent == me || ent == g_p10_gdst))) && idx_host >= 0 && idx_clone >= 0) {
+        bool seen = sg->j;
+        if (!g_aggro_off && (idle_hit || heard || seen || (ent && (ent == me || ent == g_p10_gdst))) && idx_host >= 0 && idx_clone >= 0) {
             bool host_ok = *(volatile uint32_t *)(uintptr_t)(me + 0x384) == 0;
             bool clone_ok = *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) == 0;
             Threat *th = coop_threat_get(b, true);
             coop_threat_decay(th);
-            if (idle_hit && !th->chosen) { th->chosen = g_p10_gdst; th->chosen_ms = GetTickCount64();
-                logf("coop: aggro: idle enemy %08x was shot by the JOINER -> engages the joiner", b); }
-            if (heard) {
-                if (th->chosen != g_p10_gdst) {
-                    static uint32_t hl;
-                    if (hl++ < 60) logf("coop: aggro: enemy %08x (on %s) HEARD the joiner's shots -> engages the joiner",
-                                        b, ent ? "a squadmate" : "nobody");
-                }
-                th->chosen = g_p10_gdst; th->chosen_ms = GetTickCount64();
-            }
-            uint64_t now = GetTickCount64();
+            int lvJ = heard ? 3 : seen ? 2 : th->clone > 5.0f ? 1 : 0;
+            // two-PC play #21 (owner: "some spawned enemies only target the host"): the host counted as SEEN whenever the
+            // enemy's current target was the host (ent == me) - its own pick, or the one this manager set - while the
+            // joiner needed the real line test: 106 switches back to the host on "seen" vs 5 for the joiner; an enemy left
+            // the joiner 1-3 s after his last shot. Both players now need the same sight test.
+            int lvH = heard_h ? 3 : sg->h ? 2 : th->host > 5.0f ? 1 : 0;
+            if (!host_ok) lvH = -1;
+            if (!clone_ok) lvJ = -1;
+            uint64_t now = nowp;
             uint32_t want = th->chosen;
-            if (!want) {   // FIRST NOTICED = the game's own first pick (it heard / saw that player first)
-                want = (ent == me || ent == g_p10_gdst) ? ent : g_p10_gdst;
+            if (!want) {   // FIRST NOTICED: the higher level; a tie -> the game's own pick (else the joiner)
+                // owner (#22): "some enemies still target the host on spawn - maybe a spawn logic aims them at the host".
+                // A tie went to the game's own pick, and the game (spawn scripts, its perception) only knows the host's
+                // player. A tie now goes to the NEARER player (both up).
+                bool tie = lvJ == lvH;
+                if (tie && lvJ >= 0) {
+                    const volatile float *eb = (const volatile float *)(uintptr_t)(b + 0xA0), *hb = (const volatile float *)(uintptr_t)(me + 0xA0),
+                                         *cb = (const volatile float *)(uintptr_t)(g_p10_gdst + 0xA0);
+                    float dh = (eb[0] - hb[0]) * (eb[0] - hb[0]) + (eb[1] - hb[1]) * (eb[1] - hb[1]) + (eb[2] - hb[2]) * (eb[2] - hb[2]);
+                    float dc = (eb[0] - cb[0]) * (eb[0] - cb[0]) + (eb[1] - cb[1]) * (eb[1] - cb[1]) + (eb[2] - cb[2]) * (eb[2] - cb[2]);
+                    want = dc <= dh ? g_p10_gdst : me;
+                } else want = lvJ > lvH ? g_p10_gdst : me;
                 th->chosen = want; th->chosen_ms = now;
-                logf("coop: aggro: enemy %08x FIRST NOTICES the %s", b, want == me ? "HOST" : "JOINER");
-            } else if ((ent == me || ent == g_p10_gdst) && ent != want && th->host < 10.0f && th->clone < 10.0f) {
-                // the game switched on its own and nobody has a clear threat lead: follow it
-                logf("coop: aggro: enemy %08x game switch %s -> %s accepted (threat host %.0f joiner %.0f)", b,
-                     want == me ? "HOST" : "JOINER", ent == me ? "HOST" : "JOINER", th->host, th->clone);
-                want = ent; th->chosen = want; th->chosen_ms = now;
+                logf("coop: aggro: enemy %08x FIRST NOTICES the %s (%s%s; game pick %s)", b, want == me ? "HOST" : "JOINER",
+                     (want == me ? lvH : lvJ) == 3 ? "heard" : (want == me ? lvH : lvJ) == 2 ? "seen" : (want == me ? lvH : lvJ) == 1 ? "hurt" : "none",
+                     tie ? ", tie -> the nearer" : "", ent == me ? "host" : ent == g_p10_gdst ? "joiner" : "none");
             } else {
-                float cur = want == me ? th->host : th->clone, oth = want == me ? th->clone : th->host;
+                int lvCur = want == me ? lvH : lvJ, lvOth = want == me ? lvJ : lvH;
                 uint32_t other = want == me ? g_p10_gdst : me;
-                bool cur_ok = want == me ? host_ok : clone_ok, oth_ok = want == me ? clone_ok : host_ok;
-                if ((!cur_ok && oth_ok) ||
-                    (oth_ok && now - th->chosen_ms >= 3000 && oth > cur * 1.5f + 10.0f)) {
-                    logf("coop: aggro: enemy %08x switches %s -> %s (threat host %.0f joiner %.0f%s)", b,
-                         want == me ? "HOST" : "JOINER", other == me ? "HOST" : "JOINER", th->host, th->clone,
-                         cur_ok ? "" : ", target downed");
+                float cur = want == me ? th->host : th->clone, oth = want == me ? th->clone : th->host;
+                bool sw = false; const char *why = "";
+                if (lvCur < 0 && lvOth >= 0) { sw = true; why = "target downed"; }
+                else if (lvOth > lvCur && now - th->chosen_ms >= 1000) { sw = true; why = lvOth == 3 ? "heard" : lvOth == 2 ? "seen" : "hurt"; }
+                else if (lvOth == lvCur && lvCur <= 1 && now - th->chosen_ms >= 3000 && oth > cur * 1.5f + 10.0f) { sw = true; why = "more threat"; }
+                if (sw) {
+                    static uint32_t sl;
+                    if (sl++ < 200) logf("coop: aggro: enemy %08x switches %s -> %s (%s; levels host %d joiner %d, threat host %.0f joiner %.0f)", b,
+                                         want == me ? "HOST" : "JOINER", other == me ? "HOST" : "JOINER", why, lvH, lvJ, th->host, th->clone);
                     want = other; th->chosen = want; th->chosen_ms = now;
                 }
             }
@@ -7215,8 +8129,280 @@ static void coop_aggro_log(void)
              on_host, on_clone, other, none, *(volatile float *)(uintptr_t)(me + 0x2F0), g_hit_stats[0]);
 }
 static EnemyRec g_en_host[16]; static int g_en_host_n; static uint32_t g_en_host_seq;
+// ADOPT a host id for a local body: the id encodes the spawn point (cx * 2654435761 + ord * 0x10001 + 1)
+// and the ctx sits ON OUR BODIES (+0x31C). A host id that decodes cleanly (a whole division, ord 1..255)
+// against exactly one live local body's ctx = the SAME spawn point: the copies' ordinals diverged (the
+// joiner's forced catch-up spawns at another moment), not the enemy. Adopt the host's id for that body -
+// the host never uses the joiner's own ids, so nothing else breaks. Several candidates -> the nearest to
+// the record's feet (a wrong ctx decodes cleanly only 1/65536 of the time, and then it is far away).
+static uint32_t coop_enid_adopt(uint32_t id, const float *feet)
+{
+    uint32_t cand[16]; float cd[16]; int nc = 0;
+    for (int i = 0; i < g_enid_n && nc < 16; i++) {
+        EnId &en = g_enid[i];
+        if (!en.live || en.id == id) continue;
+        uint64_t d = (uint64_t)id - (uint64_t)en.ctx * 2654435761ull - 1ull;
+        if (d % 0x10001ull) continue;
+        uint32_t ord = (uint32_t)(d / 0x10001ull);
+        if (ord < 1 || ord > 255) continue;
+        cand[nc] = en.body; cd[nc] = 0.0f;
+        if (feet) {
+            const volatile float *fb = (const volatile float *)(uintptr_t)(en.body + 0xA0);
+            float dx = fb[0] - feet[0], dy = fb[1] - feet[1], dz = fb[2] - feet[2];
+            cd[nc] = dx * dx + dy * dy + dz * dz;
+        }
+        nc++;
+    }
+    if (!nc) return 0;
+    int best = 0;
+    if (nc > 1) {
+        if (feet) { for (int i = 1; i < nc; i++) if (cd[i] < cd[best]) best = i; if (cd[best] > 625.0f) return 0; }
+        else return 0;   // several candidates and no position to decide: skip
+    }
+    for (int i = 0; i < g_enid_n; i++) if (g_enid[i].live && g_enid[i].body == cand[best]) {
+        uint32_t ord = (uint32_t)(((uint64_t)id - (uint64_t)g_enid[i].ctx * 2654435761ull - 1ull) / 0x10001ull);
+        static int al;
+        if (al++ < 60) logf("coop: enemy id: ADOPTED the host's id %08x for body %08x (spawn point %08x, host ord %u, ours was %08x)",
+                            id, cand[best], g_enid[i].ctx, ord, g_enid[i].id);
+        g_enid[i].id = id;
+        return cand[best];
+    }
+    return 0;
+}
+// BUILD MISSING HOST ENEMIES ON THE JOINER (two-PC play 20261115 #19, mission 5; owner: "go with option 1"). The host's
+// part-4 spawners fired at the very moment the joiner advanced to part 5 - the joiner's part-4 spawners were streamed
+// out, so those enemies could never spawn here ("not spawned here yet" for the rest of the level). The host now sends
+// each enemy's level part (when it appeared), its spawner and its type index. A host enemy with no body here, from a
+// part BEHIND ours (its spawner is gone here) or whose spawner is not in our table for 10 s, is BUILT here with the
+// clone's factory call (the same type record, at the host's feet) and takes the host's id - the enemy sync drives it
+// like any other puppet, hits go to the host's body, the host's death kills it. A joiner that is BEHIND the host's part
+// waits (the teleport and the forced catch-up make the real one). COOP_BUILD_MISSING=0 turns it off;
+// COOP_BUILD_WPN=1 builds with the host enemy's own weapon words (default: the common rifle, loaded on every level).
+// BRAIN FOR A BUILT ENEMY (two-PC play 20261116 #20, mission 5: 40+ "no free brain" with 4 of 16 bodies in use). The
+// free list (*0x2D1988 + 0x22CDC, next at +0x1F00) gets back whatever the detach (FUN_001CC980, 0x1CCA42) finds at a
+// dying body's +0x324 - for a puppet that is OUR private link copy (heap, 0x0Dxxxxxx), not the game's brain. The game's
+// own spawns take it and the spawn hook swaps in the class (coop_log_pawn_def); coop_pop_brain() refused it. Here: walk
+// the list (32 nodes), take the first node that is a game brain, or one of our private links whose class is free (not
+// a live body's brain, not behind another live link, not our own bodies', not on the list itself), unlink that node.
+static bool coop_brain_in_use(uint32_t c)
+{
+    for (int q = 0; q < g_own_brains_n; q++) if (g_own_brains[q] == c) return true;
+    uint32_t mgr = *(volatile uint32_t *)(uintptr_t)0x2D1980, arr = 0;
+    if (mgr >= 0x80000000 && mgr < 0x84000000) arr = *(volatile uint32_t *)(uintptr_t)(mgr + 0x79BC);
+    for (int i = 0; arr >= 0x80000000 && arr < 0x84000000 && i < 16; i++) {
+        uint32_t b = *(volatile uint32_t *)(uintptr_t)(arr + 4 * i);
+        if (b < 0x80000000 || b >= 0x84000000 || !(*(volatile float *)(uintptr_t)(b + 0x2F0) > 0.0f)) continue;
+        uint32_t l = *(volatile uint32_t *)(uintptr_t)(b + 0x324);
+        if (l == c) return true;
+        for (int q = 0; q < g_pl_n; q++) if (g_pl[q].body == b && g_pl[q].link == l && g_pl[q].orig == c) return true;
+    }
+    if (g_aim_link_src == c || g_self_link_src == c) return true;
+    return false;
+}
+static uint32_t coop_pop_brain_any(const char **how)
+{
+    uint32_t R = *(volatile uint32_t *)(uintptr_t)0x002D1988;
+    if (R < 0x80000000 || R >= 0x84000000) return 0;
+    uint32_t lo = R + 0x2B00, hi = R + 0x2B00 + 16 * 0x1FE0;
+    uint32_t nodes[32]; int nn = 0;
+    for (uint32_t o = *(volatile uint32_t *)(uintptr_t)(R + 0x22CDC); o && nn < 32; ) {
+        nodes[nn++] = o;
+        uint32_t nx = 0;
+        if (!coop_safe_copy(&nx, o + 0x1F00, 4)) break;
+        o = nx;
+    }
+    for (int i = 0; i < nn; i++) {
+        uint32_t o = nodes[i], use = 0;
+        if (o == g_aim_link || o == g_self_link) continue;
+        if (o >= lo && o < hi && (o - lo) % 0x1FE0 == 0) { if (!coop_brain_in_use(o)) { use = o; *how = "a game brain"; } }
+        else {
+            uint32_t c = 0;
+            for (int q = 0; q < g_pl_n && !c; q++) if (g_pl[q].link == o) c = g_pl[q].orig;
+            for (int q = 0; q < 128 && !c; q++) if (g_pl_all[q].link == o) c = g_pl_all[q].orig;
+            bool listed = false;
+            for (int k = 0; k < nn; k++) if (nodes[k] == c) listed = true;
+            if (c >= lo && c < hi && (c - lo) % 0x1FE0 == 0 && !listed && !coop_brain_in_use(c)) { use = c; *how = "the class behind our private link"; }
+        }
+        if (!use) continue;
+        uint32_t nx = *(volatile uint32_t *)(uintptr_t)(o + 0x1F00);
+        if (i == 0) *(volatile uint32_t *)(uintptr_t)(R + 0x22CDC) = nx;
+        else *(volatile uint32_t *)(uintptr_t)(nodes[i - 1] + 0x1F00) = nx;
+        static int bl;
+        if (bl++ < 40) logf("coop: build missing: brain %08x = %s (free-list node %d of %d: %08x)", use, *how, i, nn, o);
+        return use;
+    }
+    static uint64_t lt; uint64_t now = GetTickCount64();
+    if (now - lt > 5000) {
+        lt = now;
+        char buf[200]; int bo = 0; buf[0] = 0;
+        for (int i = 0; i < nn && i < 12 && bo < 180; i++) bo += snprintf(buf + bo, sizeof buf - bo, " %08x", nodes[i]);
+        logf("coop: build missing: no usable brain on the free list (%d nodes:%s)", nn, buf);
+    }
+    return 0;
+}
+// BUILT BODIES LEAVE THE CULLING TREE (two-PC play 20261117 -23, joiner AV 0x1C6196 at 671.6 s - the 4th time: #21, #23,
+// #28, this one). The crashing call is NOT a level script: the world update (0x1EE8E7) walks the SPATIAL CULLING TREE
+// (world + 0x4960, FUN_000D1500; FUN_000D0510 = the view test) and calls FUN_001B7440(node, visibility) for every
+// node; node + 0x34 = the object, its vtable +0x14 (FUN_001C6150 for a pawn) = "visible yes / no", which walks the
+// TYPE's part data. Natural bodies of a part leave the tree before its slot is reloaded; the bodies WE built (build-
+// missing, a part-P type) stay - once part P + 2 streams into P's slot, the next visibility pass on them (alive or a
+// corpse) reads garbage. Here: when our world reaches part P + 2, each built body still carrying our name gets its
+// visibility call with "no" once (the data is still intact in that frame - the load only starts) and its culling
+// node's object pointer cleared (FUN_001B7440 skips a node whose +0x34 is 0 - the game's own test). The node is found
+// in the body: the offset k where [body + k + 0x34] == body (logged). COOP_BUILT_HIDE_TEST=1 (tests): at part P + 1.
+struct BuiltBody { uint32_t body, id; int8_t tpart; uint8_t done; };
+static BuiltBody g_bb[32]; static int g_bb_n; static uint32_t g_bb_seq = 0xFFFFFFFF;
+static void coop_bb_note(uint32_t body, uint32_t id, int tpart)
+{
+    if (g_bb_seq != g_load_seq) { g_bb_seq = g_load_seq; g_bb_n = 0; }
+    if (g_bb_n < 32) { g_bb[g_bb_n].body = body; g_bb[g_bb_n].id = id; g_bb[g_bb_n].tpart = (int8_t)tpart; g_bb[g_bb_n].done = 0; g_bb_n++; }
+}
+volatile uint32_t g_vis_body, g_vis_flag, g_vis_esp;
+__declspec(naked) static void coop_thunk_vis()
+{
+    __asm {
+        pushad
+        mov dword ptr [g_vis_esp], esp
+        mov ecx, dword ptr [g_vis_body]
+        mov edx, dword ptr [ecx]
+        push dword ptr [g_vis_flag]
+        call dword ptr [edx + 0x14]
+        mov esp, dword ptr [g_vis_esp]
+        popad
+        ret
+    }
+}
+static void coop_bb_step(void)
+{
+    if (g_cfg.coop_role != 2 || g_bb_seq != g_load_seq || !g_bb_n) return;
+    static int test = -1;
+    if (test < 0) { char e[8] = {0}; test = GetEnvironmentVariableA("COOP_BUILT_HIDE_TEST", e, sizeof e) && e[0] == '1'; }
+    int32_t wp = coop_world_part();
+    if (wp < 0) return;
+    for (int i = 0; i < g_bb_n; i++) {
+        BuiltBody &bb = g_bb[i];
+        if (bb.done || bb.tpart < 0 || wp < bb.tpart + (test ? 1 : 2)) continue;
+        bb.done = 1;
+        uint32_t b = bb.body, vt = 0, n8 = 0, nc = 0;
+        if (!coop_safe_copy(&vt, b, 4) || vt != 0x0028C1E8 || !coop_safe_copy(&n8, b + 8, 4) || !coop_safe_copy(&nc, b + 0xC, 4) ||
+            n8 != 0x504F4F43 || nc != 0x4D495353) {
+            logf("coop: built body %08x (part %d) is no longer ours (a new spawn took the slot) - left alone", b, bb.tpart);
+            continue;
+        }
+        int k = -1;
+        for (int o = 0; o <= 0x3C0; o += 4) { uint32_t v = 0; if (coop_safe_copy(&v, b + o + 0x34, 4) && v == b) { k = o; break; } }
+        uint32_t life = 0; float hp = 0; coop_safe_copy(&life, b + 0x384, 4); coop_safe_copy(&hp, b + 0x2F0, 4);
+        g_vis_body = b; g_vis_flag = 0;
+        coop_thunk_vis();
+        if (k >= 0) *(volatile uint32_t *)(uintptr_t)(b + k + 0x34) = 0;
+        for (int q = 0; q < g_enid_n; q++) if (g_enid[q].live && g_enid[q].body == b) { g_enid[q].live = 0; }
+        logf("coop: built body %08x (type of part %d, %s, hp %.0f) - our world is at part %d: hidden, culling node at +%x %s",
+             b, bb.tpart, life ? "dead" : "alive", hp, wp, k, k >= 0 ? "detached" : "NOT FOUND (only hidden)");
+    }
+}
+static uint64_t g_miss_ms; static uint32_t g_miss_built;
+// COOP_BUILD_TEST=1 (test only): the joiner's own spawners never spawn (the spawn gate refuses them) and every host
+// enemy without a body here is built after 3 s - exercises the build, the pairing, the puppet drive and the kills.
+static int g_build_test = -1;
+static bool coop_build_test(void) { if (g_build_test < 0) { char e[8] = {0}; g_build_test = GetEnvironmentVariableA("COOP_BUILD_TEST", e, sizeof e) && e[0] == '1'; } return g_build_test == 1; }
+static uint32_t coop_build_missing(const EnemyRec &r)
+{
+    static int on = -1, wpn = -1;
+    if (on < 0) {
+        char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_BUILD_MISSING", e, sizeof e) && e[0] == '0');
+        char w[8] = {0}; wpn = !(GetEnvironmentVariableA("COOP_BUILD_WPN", w, sizeof w) && w[0] == '0');   // #23: default ON (the rifle showed as an invisible gun on shotgunners)
+        logf("coop: build missing: %s (weapon: %s)", on ? "ON" : "OFF", wpn ? "the host's" : "the common rifle");
+    }
+    if (!on || g_cfg.coop_role != 2 || !r.id || !(r.hp > 0.0f) || !g_p10_done) return 0;
+    if (g_bb_seq == g_load_seq) for (int i = 0; i < g_bb_n; i++) if (g_bb[i].done && g_bb[i].id == r.id) return 0;   // hidden: its part is gone here
+    struct Miss { uint32_t id; uint64_t first, tried; };
+    static Miss ms[32]; static uint32_t mw, seen_seq = 0xFFFFFFFF;
+    if (seen_seq != g_load_seq) { seen_seq = g_load_seq; memset(ms, 0, sizeof ms); }
+    uint64_t now = GetTickCount64();
+    int k = -1;
+    for (int i = 0; i < 32; i++) if (ms[i].id == r.id) { k = i; break; }
+    if (k < 0) {
+        k = -1;
+        for (int i = 0; i < 32 && k < 0; i++) if (!ms[i].id || (now - ms[i].first > 60000 && now - ms[i].tried > 60000)) k = i;
+        if (k < 0) k = (int)(mw++ % 32);
+        ms[k].id = r.id; ms[k].first = now; ms[k].tried = 0;
+    }
+    Miss &m = ms[k];
+    if (now - m.first < 3000 || (m.tried && now - m.tried < 2000) || now - g_miss_ms < 500) return 0;
+    if (g_part_ms && now - g_part_ms < 2000) return 0;
+    int32_t ours = coop_world_part();
+    bool sp_here = false;
+    for (int i = 0; i < g_sp_n; i++) if (r.sp && g_sp_obj[i] == r.sp) sp_here = true;
+    const char *why = nullptr;
+    if (r.part != 0xFF && ours >= 0 && ours > (int32_t)r.part + 1) {   // -23 crash RE: a part two behind ours = its type data is being reloaded
+        static uint32_t fl; if ((fl++ % 50) == 0) logf("coop: build missing: host enemy id %08x is from part %u, ours is %d - too far behind to build safely", r.id, r.part, ours);
+        return 0;
+    }
+    if (r.part != 0xFF && ours >= 0 && ours > (int32_t)r.part) why = "its part is behind ours (the spawner is gone here)";
+    else if (!sp_here && now - m.first >= 10000 && (r.part == 0xFF || ours >= (int32_t)r.part)) why = "its spawner is not in our table";
+    else if (coop_build_test()) why = "COOP_BUILD_TEST";
+    if (!why) return 0;
+    m.tried = now;
+    if (coop_pool_full()) { static uint32_t pl; if ((pl++ % 20) == 0) logf("coop: build missing: host enemy id %08x - the entity pool is full, waiting", r.id); return 0; }
+    uint32_t lm = *(volatile uint32_t *)(uintptr_t)0x002D1980;
+    if (lm < 0x80000000 || lm >= 0x84000000 || r.tidx >= 0x2C) { static uint32_t tl; if (tl++ < 20) logf("coop: build missing: host enemy id %08x - no type index (%u)", r.id, r.tidx); return 0; }
+    uint32_t type = lm + 0x7A20 + r.tidx * 0x40, w0 = 0, w2 = 0;
+    coop_safe_copy(&w0, type, 4); coop_safe_copy(&w2, type + 8, 4);
+    {   // the same readiness test as the clone's own spawn (a type record can still hold a previous level's resource)
+        uint32_t res = w0, blk = 0, len = 0, probe = 0;
+        bool ok = res >= 0x80000000 && res < 0x84000000 && (uint8_t)w2 == r.tslot &&
+                  coop_safe_copy(&blk, res + 0x38, 4) && coop_safe_copy(&len, res + 0x3C, 4) &&
+                  len < 0x10000 && (len == 0 || (blk >= 0x80000000 && blk < 0x84000000 && coop_safe_copy(&probe, blk, 4) &&
+                                                  coop_safe_copy(&probe, blk + len - 1 - ((len - 1) & 3), 4)));
+        if (!ok) { static uint32_t nl; if (nl++ < 20) logf("coop: build missing: host enemy id %08x - type %02x not usable here (resource %08x, slot %u vs host %u)", r.id, r.tidx, res, w2, r.tslot); return 0; }
+    }
+    int before = g_own_brains_n;
+    // the def words: TEAM (15) always from the host body; with the host's spawn def: the name hash (8, 9), +0xCAC (17),
+    // the look record (18; team 1's enemy head - only when its bytes here match the host's: level data at the same
+    // address), the weapon (10, 11; COOP_BUILD_WPN=1). Group (12, 13) and patrol (20, 21) stay none: we drive it.
+    g_build_ovr_mask = 1u << 15; g_build_ovr[15] = r.team;
+    const char *look = "default";
+    if (r.havedef) {
+        // NOT the name hash (8, 9): two-PC play #21 crashed the joiner at 0x1C6196 - a part-6 trigger action (FUN_001B7440,
+        // target cached at +0x34 by NAME when the part loaded) found our built part-4 enemy by the host soldier's name and
+        // ran vtable +0x14 -> FUN_001C6150 on its type record, whose part-4 data the part-6 load had overwritten. Our
+        // "MISS" name is one no script knows (like the clone's).
+        // NOT word 17 (+0xCAC) either: #23 crashed the same way with the "MISS" name - the same host enemy (481dcb92,
+        // spawner 81abfc60) both times, its corpse found by a part-6 trigger action. Word 17 was the last per-soldier
+        // field we copied; a built enemy now carries nothing a level script can match.
+        if (wpn && r.dw[10 - 8]) { g_build_ovr[10] = r.dw[2]; g_build_ovr[11] = r.dw[3]; g_build_ovr_mask |= 3u << 10; }
+        uint32_t ap = r.dw[18 - 8], here[4] = {0};
+        if (ap >= 0x80000000 && ap < 0x84000000 && coop_safe_copy(here, ap, 16) && !memcmp(here, r.afp, 16)) { g_build_ovr[18] = ap; g_build_ovr_mask |= 1u << 18; look = "the host's"; }
+        else if (ap) look = "default (the host's look record does not match here)";
+    }
+    const char *bhow = "";
+    g_build_brain = coop_pop_brain_any(&bhow);
+    if (!g_build_brain) { g_build_ovr_mask = 0; return 0; }
+    uint32_t b = coop_build_one(type, r.tidx, r.feet, r.byaw, 0x4D495353);   // "MISS"
+    uint32_t g_build_ovr_mask_was = g_build_ovr_mask;
+    g_build_ovr_mask = 0;
+    g_own_brains_n = before;   // an enemy's brain, not one of our own bodies' (the think-step guard keeps those)
+    g_miss_ms = now;
+    if (!b) { logf("coop: build missing: host enemy id %08x - the build failed", r.id); return 0; }
+    // the request's team word did not reach the body (bm3: team 1 asked, team 0 built - friendly, so is_enemy() left it
+    // undriven and the host's kills never reached it): the host body's team goes on directly.
+    if (*(volatile uint32_t *)(uintptr_t)(b + 0x39C) != r.team) *(volatile uint32_t *)(uintptr_t)(b + 0x39C) = r.team;
+    int slot = -1;
+    for (int i = 0; i < g_enid_n; i++) if (!g_enid[i].live) { slot = i; break; }
+    if (slot < 0 && g_enid_n < 48) slot = g_enid_n++;
+    if (slot < 0) { logf("coop: build missing: built %08x but the id table is full", b); return 0; }
+    EnId &en = g_enid[slot];
+    en.body = b; en.ctx = 0; en.id = r.id; en.live = 1; en.killing = 0; en.ms = now; en.part = (uint8_t)ours; en.built = 1;
+    g_miss_built++;
+    coop_bb_note(b, r.id, ours - 1);   // the type data lives until our world passes the part we built in
+    logf("coop: build missing: host enemy %08x (id %08x, part %u, spawner %08x, type %02x, team %u, def %s, look %s, weapon %08x %08x) has no body here - %s - BUILT %08x team %u at %.1f %.1f %.1f (our part %d, %u built)",
+         r.body, r.id, r.part, r.sp, r.tidx, r.team, r.havedef ? "the host's" : "none", look, (g_build_ovr_mask_was & (1u << 10)) ? r.dw[2] : 0x97C60000u, (g_build_ovr_mask_was & (1u << 10)) ? r.dw[3] : 0x54461272u,
+         why, b, *(volatile uint32_t *)(uintptr_t)(b + 0x39C), r.feet[0], r.feet[1], r.feet[2], ours, g_miss_built);
+    return b;
+}
 static void coop_enemy_recv(const EnemyRec *e, int n)
 {
+    coop_bb_step();
     // en122: a body the host killed LEAVES the host's pawn slots (it never reports hp 0)
     // -> an id present in the previous update and missing now = dead (kept as hp 0)
     // ENEMY IDENTITY: each host record -> OUR body with the same id (the address the host sent is
@@ -7235,6 +8421,18 @@ static void coop_enemy_recv(const EnemyRec *e, int n)
         for (int k = 0; k < g_hmap_n; k++) if (g_hmap[k].host == e[i].body) hk = k;
         if (hk < 0) { hk = g_hmap_n < 48 ? g_hmap_n++ : (int)(g_hmap_w++ % 48); g_hmap[hk].host = e[i].body; }
         g_hmap[hk].local = local;
+        if (!local) {
+            // play 20261115 #14 (the later-part desync): the copies' spawn ordinals at a shared spawn point
+            // diverge (the forced catch-up spawns at another moment) and the host's id then never matches
+            // any local body - "not spawned here yet" for the rest of the level (the play: the host's
+            // 801e5f20 / id 0fd88e22 for 90 s). A host id that decodes against a live local body's ctx =
+            // the same spawn point -> adopt it (see coop_enid_adopt).
+            local = coop_enid_adopt(e[i].id, e[i].feet);
+        }
+        if (!local) {
+            local = coop_build_missing(e[i]);
+            if (local) g_hmap[hk].local = local;
+        }
         if (!local) {
             static uint32_t ml;
             if ((ml++ % 600) == 0) logf("coop: enemy sync: host enemy %08x (id %08x) is not spawned here yet - skipped", e[i].body, e[i].id);
@@ -7468,6 +8666,15 @@ static void coop_enid_update(uint32_t pobj)
         if (slot < 0) continue;
         EnId &e = g_enid[slot];
         e.body = b; e.ctx = cx; e.id = cx * 2654435761u + ord * 0x10001u + 1u; e.live = 1; e.killing = 0; e.ms = GetTickCount64();
+        e.part = (uint8_t)coop_world_part(); e.built = 0;
+        for (int q = 0; q < g_enid_n; q++) {   // build-missing: our own spawner made the real one after all -> park the built stand-in
+            EnId &o = g_enid[q];
+            if (q == slot || !o.live || !o.built || o.id != e.id) continue;
+            volatile float *f = (volatile float *)(uintptr_t)(o.body + 0xA0);
+            f[1] -= 200.0f;
+            o.id = 0xB1D00000u | (uint32_t)q;   // an id the host never sends
+            logf("coop: build missing: our spawner made id %08x after all (body %08x) - the built stand-in %08x is parked", e.id, b, o.body);
+        }
         static int il;
         if (il++ < 80) logf("coop: enemy id: body %08x = spawn point %08x #%u -> id %08x (%s)", b, cx, ord, e.id, how);
     }
@@ -7513,6 +8720,20 @@ static void coop_enemy_send(uint32_t pobj, uint32_t seq)
         uint32_t W = *(volatile uint32_t *)(uintptr_t)(s[i] + 0x278 + 0x28);
         r.fire = (W >= 0x80000000 && W < 0x84000000 && *(volatile int *)(uintptr_t)(W + 0xD8) == 1) ? 1u : 0u;
         r.id = coop_enid_of(s[i]);
+        {   // build-missing: the level part it appeared in, its spawner, its type index and weapon words
+            r.part = 0xFF; r.sp = 0; r.tidx = 0xFF; r.tslot = 0xFF; r.havedef = 0; memset(r.dw, 0, sizeof r.dw); memset(r.afp, 0, sizeof r.afp);
+            r.team = *(volatile uint32_t *)(uintptr_t)(s[i] + 0x39C);
+            for (int q = 0; q < g_enid_n; q++) if (g_enid[q].live && g_enid[q].body == s[i]) r.part = g_enid[q].part;
+            for (int q = 0; q < g_sp_n && !r.sp; q++) { uint32_t cur = 0; if (g_sp_obj[q] && coop_safe_copy(&cur, g_sp_obj[q] + 0x24, 4) && cur == s[i]) r.sp = g_sp_obj[q]; }
+            uint32_t lm = *(volatile uint32_t *)(uintptr_t)0x002D1980, ty = 0, cx = 0;
+            coop_safe_copy(&ty, s[i] + 0x320, 4);
+            if (lm >= 0x80000000 && lm < 0x84000000 && ty >= lm + 0x7A20 && ty < lm + 0x7A20 + 0x2C * 0x40 && ((ty - lm - 0x7A20) & 0x3F) == 0) {
+                r.tidx = (uint8_t)((ty - lm - 0x7A20) >> 6);
+                uint32_t sl = 0; coop_safe_copy(&sl, ty + 8, 4); r.tslot = (uint8_t)sl;
+            }
+            coop_safe_copy(&cx, s[i] + 0x31C, 4);
+            for (int q = 0; q < g_ctx_wpn_n; q++) if (cx && g_ctx_wpn[q].ctx == cx) { memcpy(r.dw, g_ctx_wpn[q].dw, sizeof r.dw); memcpy(r.afp, g_ctx_wpn[q].afp, 16); r.havedef = 1; }
+        }
         r.tgt = 0;
         {   // the enemy's chosen target (brain +0x2A8 = registry index) -> who it is
             uint32_t br = *(volatile uint32_t *)(uintptr_t)(s[i] + 0x324), ti = 0xFFFFFFFF, ci = 0xFFFFFFFE, pi = 0xFFFFFFFD;
@@ -7779,6 +9000,19 @@ static void coop_enemy_tick(uint32_t pobj)
             pend[k] = pend[--npend]; k--;
             continue;
         }
+        // play 20261116 #28: the forced pellet's damage lands ONE FRAME LATE (the impact processes on the
+        // next world step) - by then the death chain has started (life 1, the ragdoll playing) while the body
+        // still sits in the pawn slots at hp 0.010. The kill LANDED: stop the tries (the old loop kept
+        // shooting the ragdoll, and with the dying-puppet shield the deferred damage was refused entirely -
+        // the host's dead enemies stayed alive here for minutes).
+        uint32_t life28 = 0;
+        if (coop_safe_copy(&life28, b + 0x384, 4) && life28 != 0) {
+            static int dl9;
+            if (dl9++ < 60) logf("coop: enemy sync: %08x kill landed (life %u, the ragdoll is playing) - done", b, life28);
+            coop_pup_release(b, "kill landed");
+            pend[k] = pend[--npend]; k--;
+            continue;
+        }
         if (!(hp > 0.0f) || pend[k].tries >= 8) {
             logf("coop: enemy sync: %08x %s after %d forced shot(s)", b, hp > 0.0f ? "STILL ALIVE (gave up)" : "killed", pend[k].tries);
             pend[k] = pend[--npend]; k--;
@@ -7950,6 +9184,21 @@ static bool coop_puppet_immune(uint32_t v, int which, uint32_t args = 0)
 {
     if (g_cfg.coop_role != 2 || v < 0x80000000 || v >= 0x84000000 || v == g_p10_gdst) return false;
     if (*(volatile uint32_t *)(uintptr_t)v != 0x0028C1E8) return false;           // pawns only
+    // play 20261116 #27 (joiner AV 0x1da294, write 0xd8, ecx 0): a kill shot's damage reached a puppet whose
+    // death chain was ALREADY mid-flight (the death-pose swap had zeroed the body's link) and FUN_001da240
+    // wrote the death-voice index into the null link. #28: the kill shot's damage lands ONE FRAME LATE (the
+    // pellet impact processes on the next step) - a killing-flag block that ignored the attacker refused the
+    // kill's own deferred damage and the kills never landed ("STILL ALIVE" loops). The rules now:
+    // - a DYING body (life +0x384 != 0): NO local damage at all (the second death branch is the crash);
+    // - a KILLING body (the kill sync's hp 0.01, life 0): OUR weapons' damage passes (the kill's own shot,
+    //   deferred), the relayed enemy pellets do not.
+    uint32_t life27 = 0;
+    if (coop_safe_copy(&life27, v + 0x384, 4) && life27 != 0) return true;
+    if (coop_enid_is_killing(v)) {
+        uint32_t att = 0;
+        if (args >= 0x10000) coop_safe_copy(&att, (uintptr_t)args + 0x18, 4);
+        if (!(att == g_p10_gdst || coop_is_self(att))) return true;
+    }
     if (*(volatile uint8_t *)(uintptr_t)(v + 0x3B0) != 1) return false;           // our immune marker
     if (g_pi_hits[which & 3]++ < 8) {
         static const char *nm[4] = {"bullet +0x20", "debris +0x24", "explosion +0x2C", "directional +0x48"};
@@ -9136,6 +10385,12 @@ static void install_lookup_guard(void)
     memcpy(code + 1, &rel, 4);
     logf("coop: lookup guard installed at FUN_0018bf30 (a missing level object -> false)");
 }
+
+// ACTION GUARD - REMOVED (owner 20261117: "each version undraws more elements from the game, remove the action guard
+// entirely"). Its hook on FUN_001B7440 SILENTLY skipped every level action whose target lay outside 0x80000000-
+// 0x84000000 - and the level's unit array is relocated into OUR heap (the clone slot, "new array 03xxxxxx"), so the
+// actions on those units (props / terrain shown, activated) never ran. The crashes it was for (#21 / #23 / #28: an action
+// on a body whose part data was recycled) are unguarded again. FUN_001B7440 runs as the game's own code.
 // play 20261112_183200 + id2 (joiner AV 0x1904ad, both right after a host-ordered kill): FUN_00190470
 // (a behaviour test, cdecl-style plain RET, bool in AL; arg = node) reads
 // [[[node+4]+0x14]+0x20] = the enemy BODY and then body+0x324 with no null check; the body pointer
@@ -10381,6 +11636,32 @@ static void coop_downed_test_fire(uint32_t pobj)
 // joiner: replay each relayed explosion / melee hit through OUR player's own damage slot
 // (+0x2C FUN_001ed2b0 / +0x48 FUN_001ed5d0): HUD, hit direction, health and - on a
 // killing blow - the death dispatch, which the downed backstop turns into DOWNED.
+// a body in the pawn manager's slot array (mgr+0x79BC) or one of ours (the clone / the self model / our player)
+static bool coop_is_live_pawn(uint32_t b, uint32_t pobj)
+{
+    if (b == g_p10_gdst || b == pobj || coop_is_self(b)) return true;
+    if (b < 0x80000000 || b >= 0x84000000) return false;
+    if (*(volatile uint32_t *)(uintptr_t)b != 0x0028C1E8) return false;   // pawn vtable
+    uint32_t mgr = *(volatile uint32_t *)(uintptr_t)0x2D1980;
+    uint32_t arr = (mgr >= 0x80000000 && mgr < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(mgr + 0x79BC) : 0;
+    for (int i = 0; arr >= 0x80000000 && arr < 0x84000000 && i < 16; i++)
+        if (*(volatile uint32_t *)(uintptr_t)(arr + 4 * i) == b) return true;
+    return false;
+}
+// the xd relay's SEH reporter: logs the exception code, the faulting address, the accessed address and the
+// key registers, then executes the handler (the hit is skipped; see coop_xd_apply).
+static int coop_xd_seh_report(void *ep, uint32_t slot)
+{
+    EXCEPTION_POINTERS *p = (EXCEPTION_POINTERS *)ep;
+    if (p && p->ExceptionRecord && p->ContextRecord) {
+        CONTEXT *c = p->ContextRecord;
+        logf("coop: xd relay: FAULT slot +0x%X code %08x at %08x access %08x | eax %08x ebx %08x ecx %08x edx %08x esi %08x edi %08x",
+             slot, (uint32_t)p->ExceptionRecord->ExceptionCode, (uint32_t)(uintptr_t)p->ExceptionRecord->ExceptionAddress,
+             (uint32_t)p->ExceptionRecord->ExceptionInformation[1],
+             (uint32_t)c->Eax, (uint32_t)c->Ebx, (uint32_t)c->Ecx, (uint32_t)c->Edx, (uint32_t)c->Esi, (uint32_t)c->Edi);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 static void coop_xd_apply(uint32_t pobj)
 {
     if (g_cfg.coop_role != 2 || pobj < 0x80000000 || pobj >= 0x84000000) { g_xd_in_n = 0; return; }
@@ -10388,7 +11669,11 @@ static void coop_xd_apply(uint32_t pobj)
         const XdMsg &m = g_xd_in[i];
         if (g_coop_downed) continue;                       // a downed player takes no more damage
         if ((m.slot != 0x2C && m.slot != 0x48) || m.nargs > 7) continue;
-        static float data[7][8];
+        // the vector buffers MUST be 16-byte aligned: the melee path reads the dir with MOVAPS
+        // (mov edx,[ebp+0xC]; movaps xmm1,[edx] at 0x001ed620) and a misaligned copy faults
+        // (play 20261115 #13: joiner crash 0x1ed620 read ffffffff; the xd-test melee relay faulted
+        // every time while the explosion slot applied fine). The pitfalls rule was already on the books.
+        __declspec(align(16)) static float data[7][8];
         uint32_t args[7] = {0};
         for (uint32_t k = 0; k < m.nargs; k++) {
             uint32_t v = m.raw[k];
@@ -10413,14 +11698,31 @@ static void coop_xd_apply(uint32_t pobj)
                 args[k] = (uint32_t)(uintptr_t)data[k];
             }
         // melee: FUN_001dfa90 reads the attacker (arg 4) +0x39c on a kill - never null
-        if (m.slot == 0x48 && !coop_is_game_object(args[3])) args[3] = g_p10_gdst;
+        // play 20261115 #13 (joiner crash 0x1ed620, read ffffffff, FUN_001ed5d0+0x50): the relayed melee's
+        // ATTACKER is the host's enemy; when the g_hmap pair is missing or stale the raw / dead value went
+        // in and the damage path chased garbage. The attacker must be a LIVE local pawn (the pawn manager's
+        // slots) or one of ours; anything else = our clone (always valid).
+        if (m.slot == 0x48 && !coop_is_live_pawn(args[3], pobj)) {
+            static int ba; if (ba++ < 30) logf("coop: xd relay: melee attacker %08x is not a live local pawn - our clone stands in", args[3]);
+            args[3] = g_p10_gdst;
+        }
         uint32_t vt = *(volatile uint32_t *)(uintptr_t)pobj;
         float before = *(volatile float *)(uintptr_t)(pobj + 0x2F0), dmg;
         memcpy(&dmg, &args[2], 4);
         g_c7_fn = *(volatile uint32_t *)(uintptr_t)(vt + m.slot);
         g_c7_this = pobj;
         for (int k = 0; k < 7; k++) g_c7_a[k] = args[k];
-        coop_thunk_call7();
+        // the relayed call itself runs under SEH on the joiner (the anim event guard's rule): a fault skips
+        // THIS hit - a downed player is acceptable - instead of taking the whole session down. The exception
+        // details are logged (the melee slot has faulted since the day-7 build - xd13: even the clean
+        // --xd-test melee faulted while the explosion slot applies fine; play #13's joiner crash 0x1ed620
+        // was the same fault unhandled).
+        if (g_cfg.coop_role == 2) {
+            __try { coop_thunk_call7(); }
+            __except (coop_xd_seh_report(GetExceptionInformation(), m.slot)) {
+                static int xf; if (xf++ < 30) logf("coop: xd relay: the applied %s hit FAULTED - skipped (the session lives)", m.slot == 0x2C ? "explosion" : "melee");
+            }
+        } else coop_thunk_call7();
         g_xd_stats[2]++;
         static int ln;
         if (ln++ < 30)
@@ -11460,6 +12762,7 @@ bool coop_in_mission()
 }
 void coop_on_exit()
 {
+    coop_tl_dump("window closes");
     if (g_cfg.coop_role && !g_session_over) { logf("coop: session: this window closes - telling the partner (CLQT)"); coop_send_quit(); }
 }
 static void coop_quit_recv()
@@ -11493,9 +12796,18 @@ void coop_session_end(int reason)
 static void coop_quit_step()
 {
     if (!g_cfg.coop_role || g_session_over) return;
+    uint64_t nowq = GetTickCount64();
+    coop_heartbeat_send();
+    // two-PC play 20261117 (-26, mission 6 again): the heartbeat went out, but the receive loop runs only in PLAY - during
+    // the cutscene nobody read the socket (the last "recv #" 1 s before it), the heartbeats piled up unread and the 20-s
+    // quit fired anyway. A packet WAITING in the socket = the partner is alive (peeked, not taken: the play loop reads it).
+    if (g_coop_listens != INVALID_SOCKET) {
+        char pk[8]; sockaddr_in pf{}; int pfl = sizeof pf;
+        if (recvfrom(g_coop_listens, pk, sizeof pk, MSG_PEEK, (sockaddr *)&pf, &pfl) >= 4 || WSAGetLastError() == WSAEMSGSIZE) g_peer_alive_ms = nowq;
+    }
     int reason = 0;
     if (g_quit_in) reason = 1;
-    else if (g_coop_host_ms && GetTickCount64() - g_coop_host_ms > 20000) reason = 2;
+    else if (g_coop_host_ms && nowq - g_coop_host_ms > 20000 && (!g_peer_alive_ms || nowq - g_peer_alive_ms > 20000)) reason = 2;
     if (!reason) return;
     logf("coop: session: %s while in a level - quitting it (QuitLevel)", reason == 1 ? "the partner left" : "no partner state for 20 s");
     g_coop_teardown = 1;   // quit crashes 0x1A7F5E (#6, cpprobe): no AI update / weapon re-arm while the level is torn down
@@ -11727,14 +13039,27 @@ static uint32_t __stdcall coop_load_gate(uint32_t world)
 // sk1: the co-op receive loop runs in the play tick - nothing of play runs during a briefing video, so a CLSK sent then
 // was never read (both players waited for ever). The skip logic drains the socket itself while a video is up: CLSK
 // is taken, anything else dropped (no play state to feed).
+static void coop_heartbeat_send(void)
+{
+    static uint64_t hb;
+    uint64_t now = GetTickCount64();
+    if (!g_cfg.coop_role || g_coop_sock == INVALID_SOCKET || now - hb < 1000) return;
+    hb = now;
+    uint32_t m = 0x42484C43;   // "CLHB"
+    sendto(g_coop_sock, (const char *)&m, 4, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
+}
 void coop_poll_control()
 {
+    // two-PC play 20261117 (-27, mission 6): the joiner's PLAY tick stopped for 31 s during the cutscene (a video part -
+    // only this poll runs then) -> no heartbeat from it, the host quit after 20 s. The heartbeat goes out from here too.
+    coop_heartbeat_send();
     if (g_coop_listens == INVALID_SOCKET) return;
     char buf[2048];
     sockaddr_in from{};
     int fl = sizeof from, r;
     while ((r = recvfrom(g_coop_listens, buf, sizeof buf, 0, (sockaddr *)&from, &fl)) >= 4) {
         fl = sizeof from;
+        g_peer_alive_ms = GetTickCount64();
         if (*(const uint32_t *)buf == 0x524C4C43 && r >= 8) coop_load_recv(*(const uint32_t *)(buf + 4));
         if (*(const uint32_t *)buf == 0x54514C43) coop_quit_recv();
         if (*(const uint32_t *)buf == 0x4B534C43) {
@@ -11749,6 +13074,7 @@ void coop_poll_control()
 void coop_activate(int role, uint32_t peer_ip)
 {
     g_coop_host_ms = 0;   // a new session: no partner packet yet (the 20-s silence check starts at the first one)
+    g_peer_alive_ms = 0;
     if (g_cfg.coop_role && g_coop_sock != INVALID_SOCKET) { logf("coop: activate: already active (role %d)", g_cfg.coop_role); return; }
     g_session_over = false; g_quit_in = 0; g_coop_end_msg[0] = 0;
     in_addr ia; ia.s_addr = peer_ip;
