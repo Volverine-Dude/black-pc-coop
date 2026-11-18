@@ -7,3 +7,4 @@
 void movies_poll(uint16_t buttons, const uint8_t analog[8], bool enter);
 bool movie_playing(); // a movie that does not loop is playing (the menus' backgrounds loop)
 bool movies_playing(); // a movie plays (briefings, cinematics)
+const char *movies_name(); // the playing movie's file name ("" when none)

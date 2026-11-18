@@ -8,7 +8,7 @@ This is a fork of [black-pc](https://github.com/Spark198rus/black-pc) by **Spark
 
 ## Status
 
-- **Missions 1 to 6 have been played through in two-PC co-op**, start to finish.
+- **All 8 missions can be finished in two-PC co-op**: every mission has been played through start to finish.
 - Latest release: [**BLACK co-op releases**](../../releases/latest) (the zip holds `port\black.exe`, `port\blackrt.dll`, README-COOP.txt and the license).
 - Both players must run the same release.
 

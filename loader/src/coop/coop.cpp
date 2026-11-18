@@ -271,7 +271,8 @@ static void coop_part_step();
 static uint64_t g_peer_alive_ms;
 static void coop_heartbeat_send(void);   // "CLHB" once a second - from the play tick AND the video poll
 static void coop_tl_teleport(const float *from, const float *to, const char *why);
-static void coop_tl_dump(const char *why);               // a level part the partner has and we do not (playtest #4)
+static void coop_tl_dump(const char *why);
+static void coop_hr_log(const char *why);               // a level part the partner has and we do not (playtest #4)
 static void coop_hm_hit(uint32_t enemy, int who);   // HIT MARKER (owner 20261115): who 1 = the host player, 2 = the joiner
 static volatile int g_coop_teardown;        // the session ended inside a level: the level is being quit (until the next load)
 static uint32_t g_jhit_n; static float g_jhit_dmg;   // host: the JOINER clone's hits on enemies / their damage (playtest #6)
@@ -1856,6 +1857,40 @@ static void coop_on_trigger_fire_inner(void)
         if (sl++ < 5000) logf("coop: trigger sync: JOINER activation of trigger #%d %08x (type %u) -> request to the host (host count %u, ours %u)", id, o, ty, g_trig_host_cnt[id], g_trig_cnt[id]);
     }
 }
+// TRIGGER TARGETS (owner 20261118: "find the door trigger event" - mission 8's last part: a door locks the lagging
+// player out; the logs place it at one-shot 81af43a0 / 81aec820 / 81aedb80, fired at 580.9-581.5 s as the leader
+// crossed x ~ 440). Log only: every ONE-SHOT that fires (classes A / E and the 0x28EE28 relays) lists what it acts on -
+// FUN_001b48a0 walks [obj + 0x10] (count byte obj + 0x14) and calls each target's vtable +8 - with each target's
+// vtable, its action function (vtable +8: the same code for every door of the game), kind +0xC4 and position, plus both
+// players' positions. 300 lines. COOP_TRIG_TARGETS=0 = off.
+static void coop_trig_targets_log(uint32_t o, bool fired)
+{
+    static int on = -1, n;
+    if (on < 0) { char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_TRIG_TARGETS", e, sizeof e) && e[0] == '0'); }
+    if (!on || !g_cfg.coop_role || !fired || n >= 300) return;
+    uint32_t vt = 0, ty = 1; uint8_t cnt = 0; uint32_t arr = 0;
+    if (!coop_safe_copy(&vt, o, 4) || (vt != 0x0028EF88 && vt != 0x0028ED40 && vt != 0x0028EE28)) return;
+    coop_safe_copy(&ty, o + 0x120, 4);
+    if (ty != 0) return;
+    coop_safe_copy(&cnt, o + 0x14, 1); coop_safe_copy(&arr, o + 0x10, 4);
+    n++;
+    char buf[700]; int bo = 0;
+    for (int i = 0; i < cnt && i < 8 && bo < 640; i++) {
+        uint32_t t = 0, tvt = 0, act = 0, kind = 0; float q[3] = {0, 0, 0};
+        if (!coop_safe_copy(&t, arr + 4 * i, 4) || !t) continue;
+        coop_safe_copy(&tvt, t, 4); if (tvt) coop_safe_copy(&act, tvt + 8, 4);
+        coop_safe_copy(&kind, t + 0xC4, 4); coop_safe_copy(q, t + 0xA0, 12);
+        bo += snprintf(buf + bo, sizeof buf - bo, " [%08x vt %08x act %06x kind %u at %.1f %.1f %.1f]", t, tvt, act, kind, q[0], q[1], q[2]);
+    }
+    buf[bo] = 0;
+    uint32_t po = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+    float me[3] = {0, 0, 0}, pa[3] = {0, 0, 0};
+    if (po) coop_safe_copy(me, po + 0xA0, 12);
+    if (g_p10_gdst) coop_safe_copy(pa, g_p10_gdst + 0xA0, 12);
+    logf("coop: trigger targets: %08x (class %s, %s, part %d) us %.1f %.1f %.1f partner %.1f %.1f %.1f | %u target(s):%s",
+         o, vt == 0x0028EF88 ? "A" : vt == 0x0028ED40 ? "E" : "relay", o == g_trig_replay_this ? "replay of the partner's" : "fired here",
+         coop_world_part(), me[0], me[1], me[2], pa[0], pa[1], pa[2], cnt, buf);
+}
 extern "C" void coop_on_trigger_fire(void)
 {
     {   // RELAY SOURCE (log only): class vt 0x0028EE28 one-shots fire on the host only (trig_compare, -19 .. -21) - they are
@@ -1875,6 +1910,7 @@ extern "C" void coop_on_trigger_fire(void)
         }
     }
     coop_on_trigger_fire_inner();
+    coop_trig_targets_log(g_tf_this, g_tf_skip == 0);   // what a one-shot acts on (the door hunt)
     coop_tl_record(g_tf_this, g_tf_skip == 0);   // the ledger: what really fired here
 }
 __declspec(naked) void coop_thunk_trigger_fire()     // FUN_001bf670 entry: 83 B9 20 01 00 00 02 (cmp [ecx+0x120], 2) re-executed
@@ -5696,7 +5732,10 @@ static void coop_part_step()
                             is_near0 = dd2 < 40.0f * 40.0f;
                             adjacent0 = dd2 < 9.0f;   // #16: the switch decides, not the distance - only an
                         }                              // already-ADJACENT player is not pulled (the void rule)
-                        if (!adjacent0 && coop_same_part(po, cur0 + 1, "entering")) { adjacent0 = true; is_near0 = true; }   // standing in the next part already
+                        // two-PC play 20261118 (mission 8): the host was pulled twice per part - "SAME PART, no teleport" at 284.8, then this
+                        // rule teleported it at 286.9 because it compared the ground with cur0 + 1 while the partner's world was
+                        // on cur0 (the partner had only started that part's SECTION). The partner's real part when CLPA told us.
+                        if (!adjacent0 && coop_same_part(po, g_cp_peer_part >= 0 ? g_cp_peer_part : cur0 + 1, "entering")) { adjacent0 = true; is_near0 = true; }   // standing in the next part already
                         bool moved0 = now - g_cp_moved_ms < 8000;
                         // two-PC play 20261117 (-25, owner: "the joiner kept getting teleported back to the host even though
                         // the joiner was the one triggering part switches and checkpoints"): this block also runs on the
@@ -5804,7 +5843,7 @@ static void coop_part_step()
         }                            // player is not pulled (the void rule)
         uint32_t W1 = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
         int32_t cur1 = (W1 >= 0x80000000 && W1 < 0x84000000) ? *(volatile int32_t *)(uintptr_t)(W1 + 0x5AF0) : -1;
-        if (!adjacent && po >= 0x80000000 && po < 0x84000000 && cur1 >= 0 && coop_same_part(po, cur1 + 1, "section rule")) { adjacent = true; is_near = true; }
+        if (!adjacent && po >= 0x80000000 && po < 0x84000000 && cur1 >= 0 && coop_same_part(po, g_cp_peer_part >= 0 ? g_cp_peer_part : cur1 + 1, "section rule")) { adjacent = true; is_near = true; }
     }
     bool moved_recently = now - g_cp_moved_ms < 8000;
     static uint64_t t_req, t_log; static uint32_t req_for;
@@ -6078,7 +6117,11 @@ extern "C" void coop_level_prepare(uint32_t obj)
     // with NO level load since the last one = a section: the clone, the self model, the spawn counter and the enemy
     // ids stay (only a real load / a restart resets them).
     bool section = loads > 1 && g_load_seq == g_prep_load_seq && g_p10_gdst >= 0x80000000 && g_p10_gdst < 0x84000000 &&
-                   *(volatile uint32_t *)(uintptr_t)g_p10_gdst == 0x0028C1E8 && *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) == 0;
+                   *(volatile uint32_t *)(uintptr_t)g_p10_gdst == 0x0028C1E8 && *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) <= 1;
+    // two-PC play 20261118 (mission 8, owner: "a lot went wrong while the joiner was downed"): the clone of a DOWNED
+    // partner carries life state 1 - OUR marking ("enemies drop it, no damage"; the clone guard keeps the game from
+    // ever killing it). The test required 0, so a section start while the joiner was down ran as a LEVEL LOAD
+    // ("level load #7" at 915.3): a second clone pair, the enemy ids and the sync tables reset mid-level. 0 or 1 = alive.
     g_prep_load_seq = g_load_seq;
     if (section) {
         coop_checkpoint_section();
@@ -7332,6 +7375,62 @@ __declspec(naked) void coop_thunk_pellet()
         ret 4
     }
 }
+// HIT-RATE COUNTER (owner 20261118: "the joiner's enemies fire at the player but sometimes miss more than the host";
+// log only, host). Every enemy pellet (the pellet hook) is counted against the shooter's current target (brain +0x2A8
+// = registry index, compared with the host player's / the clone's +0x378); every enemy bullet that damages the host
+// player (coop_on_player_damage) or the clone (coop_on_pawn_damage) is a hit. Split by the target MOVING (> 1 m/s)
+// or STILL at that moment. "coop: hit rate: ..." every 30 s and at the window close. COOP_HITRATE=0 = off.
+struct HrTarget { float pos[3]; uint64_t ms; float speed; };
+static HrTarget g_hr_t[2];                         // 0 = the host player, 1 = the joiner (the clone)
+static uint32_t g_hr_shots[2][2], g_hr_hits[2][2]; // [target][moving]
+static uint32_t g_hr_other; static uint64_t g_hr_log_ms; static int g_hr_on = -1;
+static bool coop_hr_enabled(void)
+{
+    if (g_hr_on < 0) { char e[8] = {0}; g_hr_on = !(GetEnvironmentVariableA("COOP_HITRATE", e, sizeof e) && e[0] == '0'); }
+    return g_hr_on == 1 && g_cfg.coop_role == 1;
+}
+static int coop_hr_moving(int k, uint32_t body)
+{
+    if (body < 0x80000000 || body >= 0x84000000) return 0;
+    HrTarget &t = g_hr_t[k];
+    const volatile float *f = (const volatile float *)(uintptr_t)(body + 0xA0);
+    uint64_t now = GetTickCount64();
+    if (!t.ms) { t.pos[0] = f[0]; t.pos[1] = f[1]; t.pos[2] = f[2]; t.ms = now; return 0; }
+    if (now - t.ms >= 200) {
+        float dx = f[0] - t.pos[0], dz = f[2] - t.pos[2];
+        float sp = sqrtf(dx * dx + dz * dz) * 1000.0f / (float)(now - t.ms);
+        t.speed = sp < 30.0f ? sp : t.speed;   // a teleport is not a speed
+        t.pos[0] = f[0]; t.pos[1] = f[1]; t.pos[2] = f[2]; t.ms = now;
+    }
+    return t.speed > 1.0f ? 1 : 0;
+}
+static void coop_hr_log(const char *why)
+{
+    if (!coop_hr_enabled()) return;
+    auto pc = [](uint32_t h, uint32_t s) { return s ? 100.0f * (float)h / (float)s : 0.0f; };
+    logf("coop: hit rate (%s): HOST still %u shots %u hits (%.0f%%), moving %u / %u (%.0f%%) | JOINER still %u / %u (%.0f%%), moving %u / %u (%.0f%%) | shots at others %u",
+         why, g_hr_shots[0][0], g_hr_hits[0][0], pc(g_hr_hits[0][0], g_hr_shots[0][0]), g_hr_shots[0][1], g_hr_hits[0][1], pc(g_hr_hits[0][1], g_hr_shots[0][1]),
+         g_hr_shots[1][0], g_hr_hits[1][0], pc(g_hr_hits[1][0], g_hr_shots[1][0]), g_hr_shots[1][1], g_hr_hits[1][1], pc(g_hr_hits[1][1], g_hr_shots[1][1]), g_hr_other);
+    g_hr_log_ms = GetTickCount64();
+}
+static void coop_hr_shot(uint32_t shooter, uint32_t pobj)
+{
+    if (!coop_hr_enabled()) return;
+    uint32_t br = 0, ti = 0xFFFFFFFF, hi = 0xFFFFFFFE, ci = 0xFFFFFFFD;
+    coop_safe_copy(&br, shooter + 0x324, 4);
+    if (br >= 0x80000000 && br < 0x84000000) coop_safe_copy(&ti, br + 0x2A8, 4);
+    if (pobj >= 0x80000000 && pobj < 0x84000000) coop_safe_copy(&hi, pobj + 0x378, 4);
+    if (g_p10_gdst >= 0x80000000 && g_p10_gdst < 0x84000000) coop_safe_copy(&ci, g_p10_gdst + 0x378, 4);
+    if (ti == hi) g_hr_shots[0][coop_hr_moving(0, pobj)]++;
+    else if (ti == ci) g_hr_shots[1][coop_hr_moving(1, g_p10_gdst)]++;
+    else g_hr_other++;
+    if (GetTickCount64() - g_hr_log_ms > 30000) coop_hr_log("30 s");
+}
+static void coop_hr_hit(int k, uint32_t attacker, uint32_t pobj)
+{
+    if (!coop_hr_enabled() || attacker < 0x80000000 || attacker >= 0x84000000 || !is_enemy(attacker, pobj)) return;
+    g_hr_hits[k][coop_hr_moving(k, k == 0 ? pobj : g_p10_gdst)]++;
+}
 extern "C" void coop_on_pellet(void)
 {
     uint32_t ctx = g_pel_ctx;
@@ -7348,6 +7447,7 @@ extern "C" void coop_on_pellet(void)
     // puppet's pellet takes the next host ray for that body (fresh < 400 ms), so a host
     // bullet that would hit the joiner's clone hits the joiner's real player here.
     if ((g_cfg.coop_role || g_cfg.enemy_test_clone) && owner && is_enemy(owner, pobj)) {
+        coop_hr_shot(owner, pobj);
         if (g_cfg.coop_role == 0 && g_cfg.enemy_test_clone) {
             // solo variant: aim at the LOCAL player's chest - do enemy bullets damage a player at all?
             const volatile float *pf = (const volatile float *)(uintptr_t)(pobj + 0xA0);
@@ -9296,6 +9396,10 @@ extern "C" void coop_on_pawn_damage(void)
     bool may = al >= 0x80000000 && al < 0x84000000 && *(volatile uint8_t *)(uintptr_t)(al + 0x4D) != 0;
     static uint32_t ln;
     if (ln++ < 30) logf("coop: hit relay: clone hit by %08x dmg %.1f part %08x p5 %u p6 %u (may hurt %d)", att, dmg, part, p5, p6, (int)may);
+    {   // hit-rate counter: an enemy bullet on the joiner's clone
+        uint32_t po0 = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+        coop_hr_hit(1, att, po0);
+    }
     {   // play 20261113_190252: a SQUADMATE (team 0, the clone's own team) shot the clone and the joiner took
         // the hit (11 of 30 relayed hits came from 801e39a0). Allies never hurt the player in the game:
         // a hit from the clone's own team is never relayed.
@@ -11861,6 +11965,10 @@ volatile uint32_t g_pdh_victim, g_pdh_args;
 volatile void *g_pdh_resume;
 extern "C" void coop_on_player_damage(void)
 {
+    {   // hit-rate counter: an enemy bullet on the host's own player
+        uint32_t po0 = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+        if (po0 && g_pdh_victim == po0 && g_pdh_args >= 0x10000) coop_hr_hit(0, ((const volatile uint32_t *)(uintptr_t)g_pdh_args)[6], po0);
+    }
     if (!g_cfg.coop_downed) return;
     uint32_t victim = g_pdh_victim;
     if (victim < 0x80000000 || victim >= 0x84000000) return;
@@ -12839,6 +12947,7 @@ bool coop_in_mission()
 void coop_on_exit()
 {
     coop_tl_dump("window closes");
+    coop_hr_log("window closes");
     if (g_cfg.coop_role && !g_session_over) { logf("coop: session: this window closes - telling the partner (CLQT)"); coop_send_quit(); }
 }
 static void coop_quit_recv()

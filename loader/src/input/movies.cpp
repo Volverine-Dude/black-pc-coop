@@ -46,6 +46,15 @@ bool movies_playing()   // co-op code (fe/coop_menu.cpp): the same test as movie
     return movie_playing();
 }
 
+const char *movies_name()   // co-op code: the file name of the movie that plays (player + 0x84)
+{
+    static char name[64];
+    const uint8_t *p = g_cfg.supported_build ? player() : nullptr;
+    name[0] = 0;
+    if (p && playing_once(p)) { memcpy(name, p + kName, sizeof name - 1); name[sizeof name - 1] = 0; }
+    return name;
+}
+
 void movies_poll(uint16_t buttons, const uint8_t analog[8], bool enter)
 {
     bool down = analog[0] > 30 || (buttons & 0x10) || enter; // A, START or Enter
