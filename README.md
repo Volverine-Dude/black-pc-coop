@@ -1,3 +1,55 @@
+# BLACK co-op - 2-player LAN co-op for the black-pc port
+
+Play **BLACK** (Criterion Games, 2006) with a friend: two PCs on the same local network, each running its own copy of the game, fighting through the missions together.
+
+This is a fork of [black-pc](https://github.com/Spark198rus/black-pc) by **Spark198rus**, the native Windows port this co-op mode is built on. Everything below the line further down is Spark198rus's original README for the port.
+
+**You need your own copy of the game on each PC.** This repository and the release downloads contain no game code or data.
+
+## Status
+
+- **Missions 1 to 6 have been played through in two-PC co-op**, start to finish.
+- Latest release: [**BLACK co-op releases**](../../releases/latest) (the zip holds `port\black.exe`, `port\blackrt.dll`, README-COOP.txt and the license).
+- Both players must run the same release.
+
+What co-op does:
+
+- Shared world: enemies, triggers, objectives, pickups, props and explosions are kept in sync, with the host deciding.
+- The level streams its parts for both players; whoever falls behind is pulled to the partner, the one in front is never pulled back.
+- Downed instead of dead: the partner revives you, or you come back when a main objective is completed; both downed = mission failed, and the host's restart restarts both.
+- Shared level exit with a 20-second countdown, then results and back to the lobby together.
+- Co-op sprint, a hit marker, and shared cinematic skips.
+
+## Setup and playing
+
+1. Set up the game on **each** PC exactly as in the [Windows setup](#windows-setup) below (dump and extract the NTSC-U or PAL Europe disc, check the SHA-256, put the `port` folder next to `game`). Use the zip from the co-op [releases](../../releases/latest).
+2. Allow `black.exe` on **private** networks when Windows Firewall asks (UDP ports 44100, 44000 and 44001).
+3. **Host:** title menu > CO-OP > HOST GAME > LAN. The lobby shows a 6-character code.
+4. **Joiner:** title menu > CO-OP > JOIN GAME > LAN, type the code, CONNECT, set READY to YES.
+5. **Host:** START MISSION, then pick the mission and difficulty. The joiner follows automatically.
+
+README-COOP.txt in the zip has the details (revives, the level exit, sprint, the hit marker).
+
+## Known limits
+
+- LAN only for now (no internet play).
+- The game allows at most 16 live characters, and co-op uses 2 of them for the partner. If you run past enemies instead of fighting them, the remaining enemies keep their places and later enemies may not spawn.
+- The partner's grenade-launcher rounds hit for both players, but the flying round itself is only drawn on the shooter's screen.
+- The joiner's pause menu has been seen to freeze once; if it happens, please report it with a screenshot.
+- Report problems with `port\black.log` from **both** PCs.
+
+## Credits
+
+- **Spark198rus** - [black-pc](https://github.com/Spark198rus/black-pc), the PC port this co-op mode is built on (GPL-2.0).
+- **cranebeaker** - [coop-anything](https://github.com/cranebeaker/coop-anything), whose playbook for adding co-op to single-player games contributed to this project.
+- Co-op mode by **Volverine-Dude**.
+
+This project is not affiliated with Criterion Games or Electronic Arts. BLACK is a trademark of Electronic Arts Inc.; Xbox is a trademark of Microsoft Corporation.
+
+---
+
+## Original black-pc README (Spark198rus)
+
 [🇺🇸 English](#english) | [🇧🇷 Português](#português)
 
 ---
