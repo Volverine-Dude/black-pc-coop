@@ -767,7 +767,7 @@ static void vel_update(VelTrack &v, float x, float z)
 // jittering"). The clone stood on the partner's LATEST packet each frame: at 60 fps some frames brought no packet (the
 // clone stopped) and some brought two (it jumped), and the walk animation follows the body's own per-frame movement
 // (FUN_001DFD90: (+0xA0 - +0x190) / dt), so it stuttered too. Now each packet carries the sender's clock (tms, QPC ms);
-// the receiver keeps the last 32 snapshots and shows the partner COOP_INTERP_MS (80) in the past, blended between the
+// the receiver keeps the last 32 snapshots and shows the partner COOP_INTERP_MS (80; 50 since 20261118) in the past, blended between the
 // two snapshots around that moment (position, yaw on the short arc, pitch); a late packet is extrapolated at most 100 ms;
 // a jump over 4 m (respawn, checkpoint move) snaps. Clock offset = the smallest (local - sender) of the buffer.
 static double coop_qpc_ms()
@@ -833,9 +833,31 @@ static void coop_snap_sample(double rt, float out[5])
 // history (use the raw packet). strf1 (owner: "strafing left no longer turns the legs to the movement"): the velocity of
 // the single snapshot pair alternated 0.6 / 3.2 m/s (the sender's state moves at 30 Hz, its packets come at 60) and
 // dipped under the legs' 0.15 m/s idle threshold -> the legs swung back to the aim. Over 100 ms it is steady.
+// SMALLER DELAY (owner 20261118: "the joiner lags a bit on the host side"): the partner was shown 80 ms in the past,
+// on top of the network and the sender's 30-Hz game tick - about 0.4 m behind a running player, 0.6 m sprinting. The
+// sender's state changes every 33 ms (snapshots every ~33 ms), so 50 ms keeps one snapshot of margin; a late one is
+// extrapolated (up to 100 ms) as before. "coop: interp health" every 30 s: the share of frames that had to extrapolate
+// and the headroom (newest snapshot - shown moment) percentiles, to tune COOP_INTERP_MS.
+static void coop_interp_health(double head, float delay, bool moving)
+{
+    static uint32_t frames, extra, bins[41]; static double worst = 0; static uint64_t last;
+    if (!moving) return;   // -42: a standing partner sends one snapshot per 100 ms (coop_snap_push) - not a late packet
+    frames++;
+    if (head < 0) { extra++; if (head < worst) worst = head; }
+    int bi = head < 0 ? 0 : (int)(head / 5.0) + 1; if (bi > 40) bi = 40; bins[bi]++;
+    uint64_t now = GetTickCount64();
+    if (!last) last = now;
+    if (now - last < 30000 || frames < 100) return;
+    auto pct = [&](double q) { uint32_t need = (uint32_t)(frames * q), acc = 0; for (int i = 0; i <= 40; i++) { acc += bins[i]; if (acc > need) return i == 0 ? -1 : (i - 1) * 5; } return 200; };
+    static int lines;
+    if (lines++ < 120)
+        logf("coop: interp health (%s, partner moving): delay %.0f ms, %u frames, %.1f%% extrapolated (worst %.0f ms past the newest snapshot), headroom p5 %d / p50 %d ms",
+             g_cfg.coop_role == 1 ? "HOST" : "JOINER", delay, frames, 100.0 * extra / frames, -worst, pct(0.05), pct(0.5));
+    frames = extra = 0; worst = 0; memset(bins, 0, sizeof bins); last = now;
+}
 static bool coop_interp_remote(float out[5], float vel[2])
 {
-    static int mode = -1; static float delay = 80.0f;
+    static int mode = -1; static float delay = 25.0f;   // -43: at 50 ms the headroom was p5 40-45 ms, 0 % extrapolated
     if (mode < 0) {
         char e[16] = {0};
         mode = !(GetEnvironmentVariableA("COOP_INTERP", e, sizeof e) && e[0] == '0');
@@ -847,6 +869,11 @@ static bool coop_interp_remote(float out[5], float vel[2])
     double off = 1e300;
     for (uint32_t i = 0; i < n; i++) { const Snap &q = g_snap[(g_snap_w - 1 - i) & 31]; if (q.lt - q.st < off) off = q.lt - q.st; }
     double rt = coop_qpc_ms() - off - delay;   // the moment to show, on the sender's clock
+    {
+        const Snap &q1 = g_snap[(g_snap_w - 1) & 31], &q0 = g_snap[(g_snap_w - 2) & 31];
+        float mx = q1.x - q0.x, mz = q1.z - q0.z;
+        coop_interp_health(q1.st - rt, delay, mx * mx + mz * mz > 0.0004f && q1.st - q0.st < 90.0);
+    }
     coop_snap_sample(rt, out);
     float back[5];
     coop_snap_sample(rt - 100.0, back);
@@ -5496,23 +5523,29 @@ static uint64_t g_cp_moved_ms;              // when the checkpoint rule last mov
 // countdown. When one of them fires here (our own or the partner's replay), a player who is up and more than 8 m
 // from the partner is moved ~1 m in front of the partner (along the partner's facing), once per load. Matched by the
 // trigger's raw +0xA0 position (as the ledger logs it), 1.5 m tolerance. COOP_DOOR_PULL=0 = off.
+// Mission 4 (Naszran Foundry) last part (owner 20261118, -43 play: "another door event in the mission I played"): going
+// down the stairs at (-382 -3.6 -12) the leader fires 81d80080 then 81d7fee0 (class A); both act on a door-type object
+// (vt 0x28E99C, action FUN_001b9590, +0xA0 = (0 0 -1) / (0 0 +1)); the player behind (12 m back, up at -379 7 -8) stayed
+// out until the end. The pull rides the later one, 81d7fee0 (raw +0xA0 -0.6 2.6 -383.0, a rotated row - stable).
 static void coop_door_pull(uint32_t o)
 {
-    static int on = -1; static uint32_t done_seq = 0xFFFFFFFF;
+    static int on = -1; static uint32_t done_seq[2] = {0xFFFFFFFF, 0xFFFFFFFF};
     if (on < 0) { char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_DOOR_PULL", e, sizeof e) && e[0] == '0'); }
-    if (!on || !g_cfg.coop_role || done_seq == g_load_seq) return;
+    if (!on || !g_cfg.coop_role) return;
     uint32_t vt = 0;
     if (!coop_safe_copy(&vt, o, 4) || (vt != 0x0028EF88 && vt != 0x0028ED40)) return;
     float q[3] = {0, 0, 0};
     if (!coop_safe_copy(q, o + 0xA0, 12)) return;
-    static const float door[3][3] = {{-442.3f, 69.3f, 124.3f}, {-123.5f, -69.3f, 438.8f}, {-124.2f, -69.3f, 443.5f}};
+    static const float door[4][3] = {{-442.3f, 69.3f, 124.3f}, {-123.5f, -69.3f, 438.8f}, {-124.2f, -69.3f, 443.5f},   // mission 8
+                                     {-0.6f, 2.6f, -383.0f}};                                                            // mission 4
+    static const int group[4] = {0, 0, 0, 1};
     int k = -1;
-    for (int i = 0; i < 3 && k < 0; i++) {
+    for (int i = 0; i < 4 && k < 0; i++) {
         float dx = q[0] - door[i][0], dy = q[1] - door[i][1], dz = q[2] - door[i][2];
         if (dx * dx + dy * dy + dz * dz < 1.5f * 1.5f) k = i;
     }
-    if (k < 0) return;
-    done_seq = g_load_seq;   // one door trigger per load decides; the other two are the same threshold
+    if (k < 0 || done_seq[group[k]] == g_load_seq) return;
+    done_seq[group[k]] = g_load_seq;   // one trigger per door and load decides (mission 8's three are one threshold)
     uint32_t po = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
     if (po < 0x80000000 || po >= 0x84000000) { logf("coop: door pull: trigger %08x fired - no player object", o); return; }
     if (!g_coop_host_pawn_ok) { logf("coop: door pull: trigger %08x fired - no partner position", o); return; }
@@ -10494,14 +10527,14 @@ static void install_null_guard(void)
 // DEAD-TARGET GUARD (two-PC play 20261118, -39, Level_04: JOINER AV at 0x189EFA, read of 0). FUN_00189e40 (called from
 // FUN_001a2f30, ESI = an AI object, ESI+0x48 = its link) looks up its link's target in the target registry (link
 // +0x2A8 -> R+0xFB0 + idx*0xC); for a soldier-state target (+0xCA8 = 0x1D..0x1F) it reads [target body +0x29C] and
-// then a byte through it. Here an ALLY's AI (per-copy on the joiner) still targeted puppet 801e4c60, killed by the
+// then a byte through it (+0x29C = the body's WEAPON; -42: a puppet that lost its weapon). Here an ALLY's AI (per-copy on the joiner) still targeted puppet 801e4c60, killed by the
 // kill sync 0.2 s earlier, whose +0x29C was already 0. The guard: a null target body or a null +0x29C takes the
 // function's own "nothing to do" exit (0x189F14: pop edi; ret - only the +0x6C write is skipped).
 // Displaced: 8B 91 9C 02 00 00 (mov edx, [ecx+0x29c]) at 0x189EF4, re-executed.
 volatile uint32_t g_tg_resume, g_tg_exit, g_tg_hits;
 extern "C" void coop_target_guard_log(void)
 {
-    if (g_tg_hits++ < 10) logf("coop: dead-target guard: an AI's target body has no +0x29C (a body killed under it) - skipped");
+    if (g_tg_hits++ < 10) logf("coop: dead-target guard: an AI's target body has no weapon (+0x29C = 0) - skipped");
 }
 __declspec(naked) void coop_thunk_target_guard()
 {
@@ -10532,6 +10565,43 @@ static void install_target_guard(void)
     memcpy(code + 1, &rel, 4);
     code[5] = 0x90;
     logf("coop: dead-target guard installed at 0x189EF4 (FUN_00189e40)");
+}
+// DYING-WEAPON GUARD (two-PC play 20261118, -42, Level_04: JOINER AV at 0x1DA294, write of 0xD8). FUN_001da240 = the
+// body's "start dying" (life +0x384 = 1; from FUN_00205640 in the death path) clears [its weapon (+0x29C) +0xD8]
+// without a null test. Puppet 801e48a0 had lost its weapon on the joiner's copy (its own drop removed by the drop sync
+// 50 ms before; the dead-target guard caught 3 AI reads of the same null +0x29C), then the host's kill arrived ->
+// crash. The guard: a null weapon skips that one store. Displaced: 89 99 D8 00 00 00 (mov [ecx+0xd8], ebx), re-executed.
+volatile uint32_t g_dwg_resume, g_dwg_hits;
+extern "C" void coop_dying_guard_log(void)
+{
+    if (g_dwg_hits++ < 10) logf("coop: dying-weapon guard: a body started dying without a weapon (+0x29C = 0) - the weapon store skipped");
+}
+__declspec(naked) void coop_thunk_dying_guard()
+{
+    __asm {
+        test ecx, ecx
+        jz noweap
+        mov dword ptr [ecx + 0xD8], ebx
+        jmp dword ptr [g_dwg_resume]
+    noweap:
+        pushad
+        call coop_dying_guard_log
+        popad
+        jmp dword ptr [g_dwg_resume]
+    }
+}
+static void install_dying_guard(void)
+{
+    uint32_t site = xbe_va(0x001DA294);
+    auto *code = (uint8_t *)(uintptr_t)site;
+    static const uint8_t kExpect[6] = {0x89, 0x99, 0xD8, 0x00, 0x00, 0x00};
+    if (memcmp(code, kExpect, 6) != 0) { logf("coop: dying-weapon guard: 001da294 bytes mismatch - not installed"); return; }
+    g_dwg_resume = site + 6;
+    code[0] = 0xE9;
+    int32_t rel = (int32_t)((uintptr_t)coop_thunk_dying_guard - (site + 5));
+    memcpy(code + 1, &rel, 4);
+    code[5] = 0x90;
+    logf("coop: dying-weapon guard installed at 0x1DA294 (FUN_001da240)");
 }
 // PUPPET BRAIN OFF (joiner; vb1/vb2 + every earlier joiner AI crash: 0x1af1a3, 0x1a7f58, 0x194bfb,
 // 0x19d700/0x19d747, 0x5bb17 all sit under FUN_001e5ef0 = the per-enemy AI update, EAX = the brain
@@ -12948,7 +13018,7 @@ static void install_coop_features()
     if (g_cfg.skin_hook) install_skin_hook();   // --skin-hook: arm-aim skeleton work
     if (g_cfg.coop_clone) install_pellet_hook();   // hit sync: per-pellet ray hook
     if (g_cfg.coop_clone) install_damage_hook();   // clone shield + relay: bullets on the clone are skipped (and relayed on the host)
-    if (g_cfg.coop_clone) { install_weapon_guard(); install_null_guard(); install_target_guard(); install_body_guard(); install_puppet_brain(); install_lookup_guard(); install_trigger_sync(); install_spawn_gate(); install_retire_guard(); install_death_guard(); install_pick_guard(); coop_jp_install(); install_anim_sync(); install_projectile_sync(); install_ammo_guard(); install_agent_list_guard(); install_reg_once(); install_throw_trace(); install_objective_sync(); install_prop_sync(); install_piece_sync(); install_pickup_sync(); install_drop_sync(); if (g_cfg.coop_role) { install_no_pause(); install_restart_rule(); } install_clone_shield(); install_explosion_log(); }  // null-weapon guard; clone shield: explosions/stealth damage on the clone is skipped
+    if (g_cfg.coop_clone) { install_weapon_guard(); install_null_guard(); install_target_guard(); install_dying_guard(); install_body_guard(); install_puppet_brain(); install_lookup_guard(); install_trigger_sync(); install_spawn_gate(); install_retire_guard(); install_death_guard(); install_pick_guard(); coop_jp_install(); install_anim_sync(); install_projectile_sync(); install_ammo_guard(); install_agent_list_guard(); install_reg_once(); install_throw_trace(); install_objective_sync(); install_prop_sync(); install_piece_sync(); install_pickup_sync(); install_drop_sync(); if (g_cfg.coop_role) { install_no_pause(); install_restart_rule(); } install_clone_shield(); install_explosion_log(); }  // null-weapon guard; clone shield: explosions/stealth damage on the clone is skipped
     install_sight_trace();   // COOP_SIGHT_TRACE=1: every awareness record + its caller chain
     if (g_cfg.as_log) install_as_log();   // HUD clip discovery
     if (g_cfg.coop_downed || g_cfg.hide_test || g_cfg.msg_test) install_render_gates();   // hide HUD/viewmodel while downed
