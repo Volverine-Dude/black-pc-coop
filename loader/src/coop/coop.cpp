@@ -10491,6 +10491,48 @@ static void install_null_guard(void)
     memcpy(code + 1, &rel, 4);
     logf("coop: null guard installed at FUN_0005bb10 (null object -> return 0)");
 }
+// DEAD-TARGET GUARD (two-PC play 20261118, -39, Level_04: JOINER AV at 0x189EFA, read of 0). FUN_00189e40 (called from
+// FUN_001a2f30, ESI = an AI object, ESI+0x48 = its link) looks up its link's target in the target registry (link
+// +0x2A8 -> R+0xFB0 + idx*0xC); for a soldier-state target (+0xCA8 = 0x1D..0x1F) it reads [target body +0x29C] and
+// then a byte through it. Here an ALLY's AI (per-copy on the joiner) still targeted puppet 801e4c60, killed by the
+// kill sync 0.2 s earlier, whose +0x29C was already 0. The guard: a null target body or a null +0x29C takes the
+// function's own "nothing to do" exit (0x189F14: pop edi; ret - only the +0x6C write is skipped).
+// Displaced: 8B 91 9C 02 00 00 (mov edx, [ecx+0x29c]) at 0x189EF4, re-executed.
+volatile uint32_t g_tg_resume, g_tg_exit, g_tg_hits;
+extern "C" void coop_target_guard_log(void)
+{
+    if (g_tg_hits++ < 10) logf("coop: dead-target guard: an AI's target body has no +0x29C (a body killed under it) - skipped");
+}
+__declspec(naked) void coop_thunk_target_guard()
+{
+    __asm {
+        test ecx, ecx
+        jz dead
+        mov edx, dword ptr [ecx + 0x29C]
+        test edx, edx
+        jz dead
+        jmp dword ptr [g_tg_resume]
+    dead:
+        pushad
+        call coop_target_guard_log
+        popad
+        jmp dword ptr [g_tg_exit]
+    }
+}
+static void install_target_guard(void)
+{
+    uint32_t site = xbe_va(0x00189EF4);
+    auto *code = (uint8_t *)(uintptr_t)site;
+    static const uint8_t kExpect[8] = {0x8B, 0x91, 0x9C, 0x02, 0x00, 0x00, 0x8A, 0x02};
+    if (memcmp(code, kExpect, 8) != 0) { logf("coop: dead-target guard: 00189ef4 bytes mismatch - not installed"); return; }
+    g_tg_resume = site + 6;
+    g_tg_exit = xbe_va(0x00189F14);
+    code[0] = 0xE9;
+    int32_t rel = (int32_t)((uintptr_t)coop_thunk_target_guard - (site + 5));
+    memcpy(code + 1, &rel, 4);
+    code[5] = 0x90;
+    logf("coop: dead-target guard installed at 0x189EF4 (FUN_00189e40)");
+}
 // PUPPET BRAIN OFF (joiner; vb1/vb2 + every earlier joiner AI crash: 0x1af1a3, 0x1a7f58, 0x194bfb,
 // 0x19d700/0x19d747, 0x5bb17 all sit under FUN_001e5ef0 = the per-enemy AI update, EAX = the brain
 // (class object), body = [EAX+0x8C]). A puppet's body reads OUR private link ([body+0x324], native
@@ -12906,7 +12948,7 @@ static void install_coop_features()
     if (g_cfg.skin_hook) install_skin_hook();   // --skin-hook: arm-aim skeleton work
     if (g_cfg.coop_clone) install_pellet_hook();   // hit sync: per-pellet ray hook
     if (g_cfg.coop_clone) install_damage_hook();   // clone shield + relay: bullets on the clone are skipped (and relayed on the host)
-    if (g_cfg.coop_clone) { install_weapon_guard(); install_null_guard(); install_body_guard(); install_puppet_brain(); install_lookup_guard(); install_trigger_sync(); install_spawn_gate(); install_retire_guard(); install_death_guard(); install_pick_guard(); coop_jp_install(); install_anim_sync(); install_projectile_sync(); install_ammo_guard(); install_agent_list_guard(); install_reg_once(); install_throw_trace(); install_objective_sync(); install_prop_sync(); install_piece_sync(); install_pickup_sync(); install_drop_sync(); if (g_cfg.coop_role) { install_no_pause(); install_restart_rule(); } install_clone_shield(); install_explosion_log(); }  // null-weapon guard; clone shield: explosions/stealth damage on the clone is skipped
+    if (g_cfg.coop_clone) { install_weapon_guard(); install_null_guard(); install_target_guard(); install_body_guard(); install_puppet_brain(); install_lookup_guard(); install_trigger_sync(); install_spawn_gate(); install_retire_guard(); install_death_guard(); install_pick_guard(); coop_jp_install(); install_anim_sync(); install_projectile_sync(); install_ammo_guard(); install_agent_list_guard(); install_reg_once(); install_throw_trace(); install_objective_sync(); install_prop_sync(); install_piece_sync(); install_pickup_sync(); install_drop_sync(); if (g_cfg.coop_role) { install_no_pause(); install_restart_rule(); } install_clone_shield(); install_explosion_log(); }  // null-weapon guard; clone shield: explosions/stealth damage on the clone is skipped
     install_sight_trace();   // COOP_SIGHT_TRACE=1: every awareness record + its caller chain
     if (g_cfg.as_log) install_as_log();   // HUD clip discovery
     if (g_cfg.coop_downed || g_cfg.hide_test || g_cfg.msg_test) install_render_gates();   // hide HUD/viewmodel while downed
