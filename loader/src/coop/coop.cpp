@@ -1464,7 +1464,7 @@ static void coop_track_max_hp(uint32_t po)
 // respawn our downed player at the survivor's feet (their "CLRS" packet), full
 // health, oriented like them. The clone drive's 1 m min separation re-parks the
 // survivor's model beside us on our screen after the teleport.
-static void coop_respawn_at(const float *feet, float yaw, bool refill = true)
+static void coop_respawn_at(const float *feet, float yaw, bool refill = true, float back = 0.8f)
 {
     uint32_t ctrl = g_coop_last_ctrl;
     if (ctrl < 0x80000000 || ctrl >= 0x84000000) return;
@@ -1476,7 +1476,7 @@ static void coop_respawn_at(const float *feet, float yaw, bool refill = true)
     // exactly these feet here - two bodies on one point is the m2c crash (degenerate collision test). Land
     // 0.8 m behind the survivor (along their yaw) instead; the clone drive's 1 m separation does the rest.
     float yr = yaw * 0.0174532925f;
-    float tgt[3] = {feet[0] - 0.8f * sinf(yr), feet[1], feet[2] - 0.8f * cosf(yr)};
+    float tgt[3] = {feet[0] - back * sinf(yr), feet[1], feet[2] - back * cosf(yr)};
     feet = tgt;
     { float fr[3] = {f[0], f[1], f[2]}; coop_tl_teleport(fr, tgt, refill ? "respawn / move" : "move"); }
     float dx = feet[0] - f[0], dy = feet[1] - f[1], dz = feet[2] - f[2];
@@ -3659,6 +3659,102 @@ static void coop_route_step(uint32_t ctrl, uint32_t obj)
     if ((pl++ % 180) == 0) logf("coop: route: %.0f / %.0f m, at %.1f %.1f %.1f yaw %.0f", dist, total, want[0], want[1], want[2], yaw);
 }
 
+// REVIVE (owner 20261119): a downed player has 15 s to be revived (COOP_BLEED_MS); after that they are OUT until the
+// next respawn (a main objective, coop_main_obj_poll). The partner revives by standing close (COOP_REVIVE_RADIUS, 2.5 m)
+// - the countdown stops and a progress bar fills in 5 s (COOP_REVIVE_MS); walking away resets it. A revive costs the
+// reviver 25 % of their full health; at 25 % or less they cannot revive (a popup says so). The DOWNED side owns the
+// countdown (paused while the partner's packet carries a revive in progress); the STANDING side runs the revive and
+// sends "CLRS" kind 1 (respawn at the downed spot, no 0.8 m offset). Packet: downed 1 = down, 2 = out; bleed = the
+// countdown left (ms); revive = the sender's revive progress 0..1000.
+volatile uint32_t g_coop_bled;                 // our downed player bled out (OUT): no revive, back at a main objective
+volatile int g_coop_bleed_left_ms = 15000;     // our countdown while downed
+volatile int g_coop_revive_prog;               // 0..1000: OUR revive of the downed partner
+volatile uint32_t g_coop_peer_bleed_ms;        // the partner's countdown (their packet)
+volatile uint32_t g_coop_peer_revive;          // the partner's revive progress of US (their packet)
+static void coop_revive_step(uint32_t ctrl)
+{
+    static int cfg; static float radius = 2.5f; static int bleed_ms = 15000, revive_ms = 5000;
+    if (!cfg) {
+        cfg = 1; char e[16] = {0};
+        if (GetEnvironmentVariableA("COOP_REVIVE_RADIUS", e, sizeof e)) radius = (float)atof(e);
+        if (GetEnvironmentVariableA("COOP_BLEED_MS", e, sizeof e)) bleed_ms = atoi(e);
+        if (GetEnvironmentVariableA("COOP_REVIVE_MS", e, sizeof e)) revive_ms = atoi(e);
+        if (revive_ms < 100) revive_ms = 100;
+    }
+    uint64_t now = GetTickCount64();
+    static uint64_t last;
+    int dt = last ? (int)(now - last > 200 ? 200 : now - last) : 0;
+    last = now;
+    bool peer_fresh = g_coop_host_ms && now - g_coop_host_ms <= 400;
+    // the downed side: the countdown
+    static int was_down;
+    if (!g_coop_downed) {
+        if (was_down) logf("coop: revive: we are up again");
+        was_down = 0; g_coop_bled = 0; g_coop_bleed_left_ms = bleed_ms;
+    } else {
+        if (!was_down) {
+            was_down = 1; g_coop_bled = 0; g_coop_bleed_left_ms = bleed_ms;
+            logf("coop: revive: we are down - %d s for the partner to revive us", bleed_ms / 1000);
+        }
+        bool being = peer_fresh && g_coop_peer_revive > 0;
+        static int bl;
+        if (being != (bl != 0)) { bl = being; logf("coop: revive: the partner %s reviving us (%d ms left)", being ? "started" : "stopped", g_coop_bleed_left_ms); }
+        if (!g_coop_bled && !being) {
+            g_coop_bleed_left_ms -= dt;
+            if (g_coop_bleed_left_ms <= 0) {
+                g_coop_bleed_left_ms = 0; g_coop_bled = 1;
+                logf("coop: revive: we BLED OUT - back when a main objective is completed");
+            }
+        }
+    }
+    // the standing side: the revive
+    static int prog; static uint64_t cool, no_hp_log;
+    uint32_t po = (ctrl >= 0x80000000 && ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(ctrl + 0x8C) : 0;
+    bool can = !g_coop_downed && peer_fresh && g_coop_peer_downed == 1 && now >= cool && g_coop_sock != INVALID_SOCKET &&
+               po >= 0x80000000 && po < 0x84000000;
+    float hd = 99.0f, dy = 99.0f, f[3] = {0, 0, 0}, pf[3] = {g_coop_host_pawnmat[12], g_coop_host_pawnmat[13], g_coop_host_pawnmat[14]};
+    if (can) {
+        for (int k = 0; k < 3; k++) f[k] = *(volatile float *)(uintptr_t)(po + 0xA0 + 4 * k);
+        float dx = f[0] - pf[0], dz = f[2] - pf[2];
+        hd = sqrtf(dx * dx + dz * dz); dy = fabsf(f[1] - pf[1]);
+    }
+    if (!can || hd > radius || dy > 2.0f) {
+        if (prog) logf("coop: revive: interrupted at %d ms (%.1f m from the partner%s)", prog, hd, can ? "" : ", not possible now");
+        prog = 0; g_coop_revive_prog = 0;
+        return;
+    }
+    float hp = *(volatile float *)(uintptr_t)(po + 0x2F0);
+    float mx = (po == g_player_max_obj && g_player_max_hp > 1.0f) ? g_player_max_hp : 1200.0f;
+    float cost = 0.25f * mx;
+    if (hp <= cost + 0.5f) {
+        if (prog) logf("coop: revive: stopped - our health %.0f is 25 %% or less", hp);
+        prog = 0; g_coop_revive_prog = 0;
+        strncpy(g_coop_warn_msg, "NOT ENOUGH HEALTH TO REVIVE - YOU NEED MORE THAN 25%", sizeof g_coop_warn_msg - 1);
+        g_coop_warn_msg_until = now + 700;
+        if (now - no_hp_log > 3000) { no_hp_log = now; logf("coop: revive: next to the partner but our health %.0f / %.0f is 25 %% or less - no revive", hp, mx); }
+        return;
+    }
+    if (!prog) logf("coop: revive: started (%.1f m from the partner, our health %.0f / %.0f)", hd, hp, mx);
+    prog += dt ? dt : 1;
+    g_coop_revive_prog = prog >= revive_ms ? 1000 : (prog * 1000 / revive_ms > 0 ? prog * 1000 / revive_ms : 1);
+    if (prog < revive_ms) return;
+    // done: pay 25 % and stand the partner up at their downed spot, facing us (pushed off our feet when we stand on it)
+    *(volatile float *)(uintptr_t)(po + 0x2F0) = hp - cost;
+    struct { uint32_t magic, seq; float feet[3]; float yaw; uint32_t kind; } rp;
+    rp.magic = 0x53524C43; rp.seq = ++g_coop_calls; rp.kind = 1;
+    float ax = pf[0] - f[0], az = pf[2] - f[2], al = sqrtf(ax * ax + az * az);
+    if (al < 0.01f) { float yr = cpu_of(ctrl + 0x18) * 0.0174532925f; ax = sinf(yr); az = cosf(yr); al = 1.0f; }
+    ax /= al; az /= al;                               // from us to the downed spot
+    float push = hd < 1.0f ? 1.0f - hd : 0.0f;        // keep 1 m between the two bodies
+    rp.feet[0] = pf[0] + ax * push; rp.feet[1] = pf[1]; rp.feet[2] = pf[2] + az * push;
+    rp.yaw = 57.2957795f * atan2f(-ax, -az);          // the revived player faces us
+    for (int r = 0; r < 3; r++) sendto(g_coop_sock, (const char *)&rp, (int)sizeof rp, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
+    logf("coop: revive: DONE - the partner stands up at %.1f %.1f %.1f; our health %.0f -> %.0f (-25 %%)", rp.feet[0], rp.feet[1], rp.feet[2], hp, hp - cost);
+    strncpy(g_coop_info_msg, "PARTNER REVIVED - 25% OF YOUR HEALTH USED", sizeof g_coop_info_msg - 1);
+    g_coop_info_msg_until = now + 3000;
+    g_coop_peer_downed = 0; cool = now + 2500; prog = 0; g_coop_revive_prog = 0;
+}
+
 // called from read_pad (input/xinput.cpp) every poll with the FULLY merged input (pad,
 // scripted presses, keyboard/mouse bindings). While the peer is downed and we are up,
 // X is the revive key: its press edge sends "CLRS", and X is eaten so it does not also
@@ -3864,7 +3960,7 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
     // side's puppet stands at the remote player's ACTUAL maintained pawn spot with
     // the remote's body orientation - no invented floor offsets.
     if (g_coop_listens != INVALID_SOCKET) {
-        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; uint32_t anim; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation; anim: 1 sprint, 2 reload
+        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; uint32_t anim, bleed, revive; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation; anim: 1 sprint, 2 reload
         static uint32_t pkts;
         for (;;) {
             sockaddr_in from{};
@@ -4023,7 +4119,18 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
                 const float *rf = (const float *)(buf.raw + 8);
                 float ryaw = *(const float *)(buf.raw + 20);
                 g_coop_peer_downed = 0;
-                if (g_coop_downed) coop_respawn_at(rf, ryaw);
+                bool rv = r >= 28 && *(const uint32_t *)(buf.raw + 24) == 1;   // kind 1: the partner revived us at our downed spot
+                if (g_coop_downed && rv) logf("coop: revive: the partner revived us");
+                if (g_coop_downed) {
+                    coop_respawn_at(rf, ryaw, true, rv ? 0.0f : 0.8f);
+                    // owner 20261119: "a revived player should have 75% of his overall health" (an objective respawn stays full)
+                    uint32_t rc = g_coop_last_ctrl, rpo = (rc >= 0x80000000 && rc < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(rc + 0x8C) : 0;
+                    if (rv && rpo >= 0x80000000 && rpo < 0x84000000) {
+                        float full = (rpo == g_player_max_obj && g_player_max_hp > 1.0f) ? g_player_max_hp : 1200.0f;
+                        *(volatile float *)(uintptr_t)(rpo + 0x2F0) = 0.75f * full;
+                        logf("coop: revive: revived with 75 %% health (%.0f / %.0f)", 0.75f * full, full);
+                    }
+                }
                 continue;
             }
             if (r < (int)sizeof pkt) continue;
@@ -4038,7 +4145,8 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             if (pkt.pawnmat[3] == 1.0f) coop_snap_push(pkt.tms, &pkt.pawnmat[12], pkt.yaw, pkt.pitch);
             g_coop_host_seq = ++pkts;
             g_coop_host_ms = GetTickCount64();
-            g_coop_peer_downed = pkt.downed;   // the peer's downed flag (we can respawn them with X)
+            g_coop_peer_downed = pkt.downed;   // the peer's downed flag (1 down, 2 out - bled out)
+            g_coop_peer_bleed_ms = pkt.bleed; g_coop_peer_revive = pkt.revive;   // the revive: their countdown, their revive of us
             g_coop_peer_anim = pkt.anim; g_coop_peer_anim_ms = GetTickCount64();   // sprint / reload bits (the partner-model clips)
             if (g_cfg.coop_log && (g_coop_host_seq <= 3 || g_coop_host_seq % 180 == 0))
                 logf("coop: recv #%u host pos %.2f %.2f %.2f pawn %.2f %.2f %.2f (seq track ok)",
@@ -4053,6 +4161,7 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
     // facing their way and pitched down at their chest, so their model fills the
     // centre of the view. Live input is muted. Our stream keeps the spot where we went
     // DOWN (g_downed_pos), so the survivor sees our body there, not under the camera.
+    coop_revive_step(ctrl);   // the revive: the bleed-out countdown / the proximity revive
     if (!g_coop_downed) g_downed_pos_ok = 0;
     else if (!g_downed_pos_ok) {
         uint32_t mo0 = *(volatile uint32_t *)(uintptr_t)(ctrl + 0x8C);
@@ -4781,10 +4890,12 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
         // (pobj+0xF0), [3] = 1.0 valid marker, [12..14] = this player's FEET
         // (pobj+0xA0, game-maintained, on the floor plane). v3 read *(mgr+0x79BC) =
         // the slot-ARRAY pointer (not a body) - never the player.
-        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; uint32_t anim; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation; anim: 1 sprint, 2 reload
+        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; uint32_t anim, bleed, revive; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation; anim: 1 sprint, 2 reload
         memset(&pkt, 0, sizeof pkt);
-        pkt = { 0x434C4152, n, ctrl, obj, yaw, pitch, {m[12], m[13], m[14]}, {}, g_coop_downed };
+        pkt = { 0x434C4152, n, ctrl, obj, yaw, pitch, {m[12], m[13], m[14]}, {}, g_coop_downed ? (g_coop_bled ? 2u : 1u) : 0u };
         pkt.tms = coop_qpc_ms();
+        pkt.bleed = g_coop_downed ? (uint32_t)(g_coop_bleed_left_ms > 0 ? g_coop_bleed_left_ms : 0) : 0;   // the revive
+        pkt.revive = (uint32_t)g_coop_revive_prog;
         {   // the partner-model clips: our sprint and our reload (the weapon state machine's 4)
             uint32_t Wa = (obj >= 0x80000000 && obj < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(obj + 0x278 + 0x28) : 0;
             int wst = (Wa >= 0x80000000 && Wa < 0x84000000) ? *(volatile int *)(uintptr_t)(Wa + 0xD8) : 0;
@@ -11905,7 +12016,7 @@ static void install_restart_rule(void)
 // the reload -> both still "downed" -> the failed screen came straight back)
 static void coop_restart_reset(void)
 {
-    g_coop_downed = 0; g_coop_peer_downed = 0;
+    g_coop_downed = 0; g_coop_peer_downed = 0; g_coop_bled = 0; g_coop_revive_prog = 0; g_coop_peer_revive = 0;
     extern volatile uint32_t g_coop_mission_failed; g_coop_mission_failed = 0;
     uint32_t S = *(volatile uint32_t *)(uintptr_t)0x002D45F0, cur = 0;
     if (S >= 0x80000000 && S < 0x84000000 && coop_safe_copy(&cur, S + 0x21070, 4) && cur >= 0x80000000 && cur < 0x84000000)

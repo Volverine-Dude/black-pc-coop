@@ -1542,11 +1542,54 @@ static void coop_font_draw(const std::vector<CoopFontV> &band, const CoopFont *f
 // icon), centred in the upper part of the picture over a translucent band, drop-shadowed.
 // Returns false when the fonts are not available (the caller falls back to the 5x7 font).
 static bool coop_banner(const RECT &pic, const char *title, const char *sub, uint32_t title_rgb, uint32_t frameno);
+// the revive (owner 20261119): DOWNED with the bleed-out countdown (the partner can revive), OUT after it (back at a
+// main objective); the partner's side the same from their packet
 static bool coop_downed_banner(const RECT &pic, bool self_downed, uint32_t frameno)
 {
-    return coop_banner(pic, self_downed ? "DOWNED" : "PARTNER DOWN",
-                       self_downed ? "BACK WHEN A MAIN OBJECTIVE IS COMPLETED" : "COMPLETE A MAIN OBJECTIVE TO BRING THEM BACK", // respawn rule (owner)
-                       self_downed ? 0xFF4A3A : 0x40E0FF, frameno);
+    bool fresh = g_coop_host_ms && GetTickCount64() - g_coop_host_ms <= 400;
+    char sub[96];
+    if (self_downed) {
+        if (g_coop_bled)
+            return coop_banner(pic, "OUT", "BACK WHEN A MAIN OBJECTIVE IS COMPLETED", 0xFF4A3A, frameno);
+        if (fresh && g_coop_peer_revive)
+            return coop_banner(pic, "DOWNED", "YOUR PARTNER IS REVIVING YOU", 0xFF4A3A, frameno);
+        snprintf(sub, sizeof sub, "BLEEDING OUT IN %d S - YOUR PARTNER CAN REVIVE YOU", (g_coop_bleed_left_ms + 999) / 1000);
+        return coop_banner(pic, "DOWNED", sub, 0xFF4A3A, frameno);
+    }
+    if (g_coop_peer_downed == 2)
+        return coop_banner(pic, "PARTNER OUT", "COMPLETE A MAIN OBJECTIVE TO BRING THEM BACK", 0x40E0FF, frameno);
+    if (g_coop_revive_prog)
+        return coop_banner(pic, "PARTNER DOWN", "REVIVING - STAY CLOSE", 0x40E0FF, frameno);
+    snprintf(sub, sizeof sub, "STAND NEXT TO THEM TO REVIVE - %d S LEFT", ((int)g_coop_peer_bleed_ms + 999) / 1000);
+    return coop_banner(pic, "PARTNER DOWN", sub, 0x40E0FF, frameno);
+}
+// the revive progress bar (owner: "a revive progress bar appears on top that take 5 seconds to fill"): a label and a
+// green bar near the top of the picture, on both screens (the reviver: its own progress; the downed: the partner's)
+static void coop_revive_bar(const RECT &pic, float frac, const char *label)
+{
+    if (!coop_font_load(g_font_small, L"Small.bin")) return;
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    float s = ph / 480.0f;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    float w = pw * 0.32f, h = 7.0f * s, x0 = pic.left + (pw - w) / 2, y0 = pic.top + ph * 0.085f;
+    float cap = 11.0f * s, ly = y0 - cap - 6.0f * s;
+    std::vector<CoopFontV> tri;
+    auto rect = [&](float a, float b, float c, float d, D3DCOLOR col) {
+        CoopFontV q[6] = {{a, b, 0, 1, col, 0, 0}, {c, b, 0, 1, col, 0, 0}, {a, d, 0, 1, col, 0, 0},
+                          {c, b, 0, 1, col, 0, 0}, {c, d, 0, 1, col, 0, 0}, {a, d, 0, 1, col, 0, 0}};
+        tri.insert(tri.end(), q, q + 6);
+    };
+    rect(x0 - 6.0f * s, ly - 5.0f * s, x0 + w + 6.0f * s, y0 + h + 5.0f * s, 0xA0000000);   // the plate
+    rect(x0, y0, x0 + w, y0 + h, 0xFF383838);                                                   // the empty bar
+    rect(x0, y0, x0 + w * frac, y0 + h, 0xFF40E060);                                            // the fill
+    std::vector<CoopFontV> sml;
+    float tx = pic.left + (pw - coop_font_width(g_font_small, label, s)) / 2;
+    coop_font_quads(sml, g_font_small, label, tx + 1.5f * s, ly + 1.5f * s, s, 0xC0000000);
+    coop_font_quads(sml, g_font_small, label, tx, ly, s, 0xFFE8E8E8);
+    const CoopFont *fonts[1] = {&g_font_small};
+    const std::vector<CoopFontV> *lists[1] = {&sml};
+    coop_font_draw(tri, fonts, lists, 1);
 }
 // owner (day 15): "put the banner at the bottom where the black bars are, to not interfere with the cinematic" - one
 // pulsing line of the small font on a dark band in the bottom letterbox bar (the briefing video leaves ~13 % black)
@@ -1726,12 +1769,13 @@ void D3DDevice_Swap_after_compose()
     if (banner_test) downed_hud = true;
     {   // owner (20261115): "make the DOWNED and PARTNER DOWN banners disappear after 5 s" - each shows 5 s from the moment
         // that state began (a new state - we go down, the partner goes down - shows its banner again)
-        int state = g_coop_downed ? 1 : g_coop_peer_downed ? 2 : 0;
+        int state = g_coop_downed ? (g_coop_bled ? 5 : 1) : g_coop_peer_downed ? (g_coop_peer_downed == 2 ? 6 : 2) : 0;
         if (banner_test) state = 2 + banner_test;
         static int last_state; static ULONGLONG since;
         ULONGLONG now = GetTickCount64();
         if (state != last_state) { last_state = state; since = now; }
-        if (state && now - since > 5000) downed_hud = false;
+        bool timed = state != 1 && state != 2;   // the revive: the countdown banners stay up while it runs
+        if (state && timed && now - since > 5000) downed_hud = false;
     }
     { static int nb = -1; if (nb < 0) { char e[8] = {0}; nb = GetEnvironmentVariableA("COOP_NO_BANNER", e, sizeof e) && e[0] == '1'; } if (nb) downed_hud = false; }   // test shots: no DOWNED banner
     bool hm_on = g_cfg.coop_hitmarker && g_coop_hm_ms && GetTickCount64() - g_coop_hm_ms < 600;   // a hit marker is showing
@@ -1743,7 +1787,11 @@ void D3DDevice_Swap_after_compose()
     bool notes_on = (g_coop_end_msg[0] && nowm < g_coop_end_msg_until) || (g_coop_info_msg[0] && nowm < g_coop_info_msg_until) ||
                     (g_coop_warn_msg[0] && nowm < g_coop_warn_msg_until) || g_coop_skip_ui || g_coop_exit_ui || g_coop_load_ui ||
                     g_coop_lobby_banner[0][0] || g_coop_lobby_banner[1][0];
-    if (!marker_on && !clone_on && !downed_hud && !g_gunmark_on && !g_cfg.role_label && !hm_on && !notes_on) return;
+    // the revive bar: our revive of the partner, or the partner's revive of us
+    bool rv_fresh = g_coop_host_ms && nowm - g_coop_host_ms <= 400;
+    int rv_bar = g_coop_downed ? (rv_fresh && !g_coop_bled ? (int)g_coop_peer_revive : 0) : g_coop_revive_prog;
+    if (g_coop_mission_failed) rv_bar = 0;
+    if (!marker_on && !clone_on && !downed_hud && !g_gunmark_on && !g_cfg.role_label && !hm_on && !notes_on && !rv_bar) return;
     RECT frame, pic;
     host3d::frame_layout(&frame, &pic);
     int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
@@ -1751,6 +1799,7 @@ void D3DDevice_Swap_after_compose()
     if (g_cfg.role_label && host3d::dev()) coop_role_label(pic);
     if ((g_coop_lobby_banner[0][0] || g_coop_lobby_banner[1][0]) && host3d::dev()) coop_lobby_banners(pic);   // the co-op lobby
     if (hm_on && host3d::dev()) coop_hitmarker(pic);
+    if (rv_bar && host3d::dev()) coop_revive_bar(pic, rv_bar / 1000.0f, g_coop_downed ? "BEING REVIVED" : "REVIVING");
     // the shared cinematic skip (fe/coop_menu.cpp): drawn over the briefing video
     if (g_coop_info_msg[0] && GetTickCount64() < g_coop_info_msg_until && host3d::dev())   // co-op notice (checkpoint)
         coop_bottom_note(pic, g_coop_info_msg, 0x60FF60, g_frame_count.load());

@@ -196,6 +196,11 @@ extern char g_coop_end_msg[96];                 // coop/coop.cpp: why the co-op 
 extern volatile unsigned long long g_coop_end_msg_until;   // GetTickCount64 until which it shows   // coop/coop.cpp: seconds left of the shared level-exit countdown (0 = none)   // coop/coop.cpp: 1 = this copy finished loading the level and waits for the partner
 extern volatile int g_coop_skip_ui;   // fe/coop_menu.cpp: shared cinematic skip popup (1 we wait for the partner, 2 the partner wants to skip)
 extern volatile uint32_t g_coop_downed; // coop.cpp: this instance's player is DOWNED (input muted, spectator cam on the survivor)
+extern volatile uint32_t g_coop_bled;             // coop.cpp: the revive - our downed player bled out (OUT)
+extern volatile int g_coop_bleed_left_ms;          // coop.cpp: our bleed-out countdown while downed
+extern volatile int g_coop_revive_prog;            // coop.cpp: 0..1000 our revive of the downed partner
+extern volatile uint32_t g_coop_peer_bleed_ms;     // coop.cpp: the partner's countdown (their packet)
+extern volatile uint32_t g_coop_peer_revive;       // coop.cpp: the partner's revive of us, 0..1000 (their packet)
 extern volatile uint32_t g_coop_mission_failed; // coop.cpp: both players went down -> the mission failed screen is up (no downed banner)
 bool coop_game_paused(void); // coop.cpp: co-op no-pause - the in-level pause menu is open (the world keeps running; no mouse-look)
 void coop_notify_x_press(unsigned char analogButtons[8]); // coop.cpp, called from read_pad AFTER the key bindings: the SURVIVOR's X revives the downed peer (and is eaten)
