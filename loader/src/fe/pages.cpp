@@ -1560,10 +1560,13 @@ bool fe_build_pages(const std::wstring &game_dir, const std::wstring &out_root)
             choice_page(join, "JOIN GAME", {{RowSpec::Action, 21, "INTERNET (COMING LATER)", "", "PCCoop"},
                                             {RowSpec::Link, 22, "LAN", "", "CoopCode"}}, "CoopMenu", true, 211);
             add_movie(c, "coopjoin", join.build());
-            Movie lobby(sound);   // rows show &PC_V<row>: the code, the status, player 2
+            // owner 20261118 (the lobby redesign): STATUS and PLAYER 2 moved to two banners at the top of the screen
+            // (fe/coop_menu.cpp g_coop_lobby_banner, drawn by d3d/device.cpp); their rows became two host options:
+            // DIFFICULTY (VANILLA / CO-OP: players take more damage) and SPECIAL WEAPONS (the game's silver / gold weapons)
+            Movie lobby(sound);   // rows show &PC_V<row>: the code, the difficulty mode, special weapons, sprint
             choice_page(lobby, "LAN LOBBY", {{RowSpec::Choice, 403, "CODE", "&PC_V0", "PCCoopChange"},
-                                             {RowSpec::Choice, 404, "STATUS", "&PC_V1", "PCCoopChange"},
-                                             {RowSpec::Choice, 405, "PLAYER 2", "&PC_V2", "PCCoopChange"},
+                                             {RowSpec::Choice, 409, "DIFFICULTY", "&PC_V1", "PCCoopChange"},
+                                             {RowSpec::Choice, 410, "SPECIAL WEAPONS", "&PC_V2", "PCCoopChange"},
                                              {RowSpec::Choice, 408, "SPRINT", "&PC_V3", "PCCoopChange"},   // owner 20261115: host-only option
                                              {RowSpec::Action, 41, "START MISSION", "", "PCCoop"},
                                              {RowSpec::Action, 42, "LEAVE LOBBY", "", "PCCoop"}}, "CoopHost", true, 220);   // step 4: only with player 2 READY (fe/coop_menu.cpp opens mission select)

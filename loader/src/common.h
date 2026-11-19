@@ -150,6 +150,8 @@ struct Config {
     bool shot_test_npc = false; // --shot-test-npc: solo hit-sync test - the clone's pellets aim at the nearest live enemy
     bool hit_test_death = false; // --hit-test-death: (joiner test) pin our hp to the next relayed hit's damage so it kills (the death-path test)
     bool coop_sprint = false;    // co-op (HOST's lobby option, black.ini sprint): both players may sprint (pad L1 / Shift)
+    int coop_diffmode = 0;       // co-op (HOST's lobby option DIFFICULTY, black.ini coop_difficulty): 0 VANILLA, 1 CO-OP (players take more damage)
+    bool coop_special = true;    // co-op (HOST's lobby option SPECIAL WEAPONS, black.ini coop_special_weapons): the game's silver / gold weapons
     bool coop_hitmarker = false; // co-op: a local hit marker at the crosshair (white = hit, red = kill); CO-OP page, black.ini hitmarker
     bool coop_downed = false;  // --coop-downed: killing blows clamp to hp 1 (DOWNED, no death branch); spectator cam on the survivor; the survivor's X respawns them
     std::wstring skip_caller;     // --skip-caller "S:hex,S:hex,...": (test) from S seconds skip draws whose game caller chain contains hex, until the next stage
@@ -177,6 +179,9 @@ extern uint32_t g_pad_watch; // address DR3 watches for --watch-pad (input/xinpu
 extern volatile int g_coop_load_ui;
 extern volatile int g_coop_exit_ui;
 extern volatile int g_coop_sprint_allowed;   // coop/coop.cpp: sprint is on this session (the host's lobby option)
+extern volatile int g_coop_diffmode_on;      // fe/coop_menu.cpp: this session's DIFFICULTY (0 VANILLA, 1 CO-OP; the host's lobby option)
+extern volatile int g_coop_special_on;       // fe/coop_menu.cpp: this session's SPECIAL WEAPONS (1 = the game's silver / gold rule, 0 = off)
+extern char g_coop_lobby_banner[2][64];      // fe/coop_menu.cpp: the lobby's two top banners (d3d/device.cpp draws them; "" = none)
 extern volatile int g_coop_sprinting;        // input/xinput.cpp: our player sprints now
 extern volatile float g_coop_sprint_blend;   // 0..1, eased: the lowered gun (d3d/draw.cpp)
 extern volatile unsigned long long g_coop_hm_ms;  // coop/coop.cpp: when the last hit marker started (0 = none)

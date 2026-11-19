@@ -87,6 +87,8 @@ void settings_load()
         else if (k == "speakers") g_cfg.speakers = !strcmp(val, "5.1") ? 6 : !strcmp(val, "stereo") ? 2 : 0;
         else if (k == "hitmarker") g_cfg.coop_hitmarker = v != 0;
         else if (k == "coop_sprint") g_cfg.coop_sprint = v != 0;   // co-op sprint (the host's lobby option); "sprint" = the solo Sprint option
+        else if (k == "coop_difficulty") g_cfg.coop_diffmode = v != 0 ? 1 : 0;   // the host's lobby DIFFICULTY: 0 VANILLA, 1 CO-OP
+        else if (k == "coop_special_weapons") g_cfg.coop_special = v != 0;       // the host's lobby SPECIAL WEAPONS
         else bindings::load_ini(k.c_str(), val); // key_<action> = Key[,Key]
     }
     fclose(f);
@@ -127,6 +129,8 @@ void settings_save()
     fprintf(f, "effectsnative = %d\n", g_cfg.effects_native ? 1 : 0);
     fprintf(f, "hitmarker = %d\n", g_cfg.coop_hitmarker ? 1 : 0);
     fprintf(f, "coop_sprint = %d\n", g_cfg.coop_sprint ? 1 : 0);
+    fprintf(f, "coop_difficulty = %d\n", g_cfg.coop_diffmode);
+    fprintf(f, "coop_special_weapons = %d\n", g_cfg.coop_special ? 1 : 0);
     bindings::save_ini(f);
     fclose(f);
 }

@@ -1682,6 +1682,37 @@ static void coop_role_label(const RECT &pic)
     coop_font_draw(band, fonts, lists, 1);
 }
 
+// THE LOBBY BANNERS (owner 20261118: "change the status and player 2 status with 2 banners on top of the screen"): two
+// plates of the game's small font side by side in the top band of the picture (above the page title), each centred in
+// its half - left amber (the status / the difficulty), right cyan (player 2 / the special weapons).
+static void coop_lobby_banners(const RECT &pic)
+{
+    if (!coop_font_load(g_font_small, L"Small.bin")) return;
+    int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
+    std::vector<CoopFontV> band, txt;
+    for (int i = 0; i < 2; i++) {
+        const char *t = g_coop_lobby_banner[i];
+        if (!t[0]) continue;
+        float s = ph / 480.0f * 1.15f;
+        while (s > 0.4f && coop_font_width(g_font_small, t, s) > pw * 0.44f) s *= 0.92f;
+        float w = coop_font_width(g_font_small, t, s), cap = 11.0f * s;
+        float cx = pic.left + pw * (i == 0 ? 0.27f : 0.73f);
+        float x = cx - w / 2, y = pic.top + ph * 0.045f;
+        float l = x - 10.0f * s, r = x + w + 10.0f * s, tp = y - 5.0f * s, b = y + cap + 6.0f * s;
+        D3DCOLOR bc = 0xB0000000;
+        CoopFontV q[6] = {{l, tp, 0, 1, bc, 0, 0}, {r, tp, 0, 1, bc, 0, 0}, {l, b, 0, 1, bc, 0, 0},
+                          {r, tp, 0, 1, bc, 0, 0}, {r, b, 0, 1, bc, 0, 0}, {l, b, 0, 1, bc, 0, 0}};
+        band.insert(band.end(), q, q + 6);
+        D3DCOLOR col = i == 0 ? 0xFFFFC040 : 0xFF40E0FF;
+        coop_font_quads(txt, g_font_small, t, x + 1.5f * s, y + 1.5f * s, s, 0xC0000000);
+        coop_font_quads(txt, g_font_small, t, x, y, s, col);
+    }
+    if (band.empty()) return;
+    const CoopFont *fonts[1] = {&g_font_small};
+    const std::vector<CoopFontV> *lists[1] = {&txt};
+    coop_font_draw(band, fonts, lists, 1);
+}
+
 void D3DDevice_Swap_after_compose()
 {
     // Route B: draw the marker (the streamed host / guest role) and the pilot clone's
@@ -1710,13 +1741,15 @@ void D3DDevice_Swap_after_compose()
     // owner two-PC play 20261115: "the skip-cinematic banner and the level-exit banner didn't show" - they lived behind
     // this early return too and passed only while the HOST / JOINER label was on (removed from regular play)
     bool notes_on = (g_coop_end_msg[0] && nowm < g_coop_end_msg_until) || (g_coop_info_msg[0] && nowm < g_coop_info_msg_until) ||
-                    (g_coop_warn_msg[0] && nowm < g_coop_warn_msg_until) || g_coop_skip_ui || g_coop_exit_ui || g_coop_load_ui;
+                    (g_coop_warn_msg[0] && nowm < g_coop_warn_msg_until) || g_coop_skip_ui || g_coop_exit_ui || g_coop_load_ui ||
+                    g_coop_lobby_banner[0][0] || g_coop_lobby_banner[1][0];
     if (!marker_on && !clone_on && !downed_hud && !g_gunmark_on && !g_cfg.role_label && !hm_on && !notes_on) return;
     RECT frame, pic;
     host3d::frame_layout(&frame, &pic);
     int pw = pic.right - pic.left, ph = pic.bottom - pic.top;
     if (pw < 8 || ph < 8) return;
     if (g_cfg.role_label && host3d::dev()) coop_role_label(pic);
+    if ((g_coop_lobby_banner[0][0] || g_coop_lobby_banner[1][0]) && host3d::dev()) coop_lobby_banners(pic);   // the co-op lobby
     if (hm_on && host3d::dev()) coop_hitmarker(pic);
     // the shared cinematic skip (fe/coop_menu.cpp): drawn over the briefing video
     if (g_coop_info_msg[0] && GetTickCount64() < g_coop_info_msg_until && host3d::dev())   // co-op notice (checkpoint)

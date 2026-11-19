@@ -29,6 +29,9 @@
 
 volatile int g_coop_code_len = -1;
 volatile int g_coop_skip_ui;
+volatile int g_coop_diffmode_on;          // this session's DIFFICULTY (host: its option; joiner: the host's, from the heartbeat)
+volatile int g_coop_special_on = 1;       // this session's SPECIAL WEAPONS (same)
+char g_coop_lobby_banner[2][64];          // the lobby's top banners (status / player 2 on the host; the host's options on the joiner)
 
 namespace {
 
@@ -134,7 +137,7 @@ void send_to(const sockaddr_in &to, uint32_t magic, const char *code)
     Msg m{};
     m.magic = magic;
     memcpy(m.code, code, kCodeLen);
-    if (magic == kBeat) { m.code[6] = code[6]; m.code[7] = code[7]; }   // host: [6] = SPRINT on; joiner: [7] = READY (buffers are 8 long)
+    if (magic == kBeat) { m.code[6] = code[6]; m.code[7] = code[7]; }   // host: [6] = SPRINT on, [7] = 0x80 | options; joiner: [7] = READY (buffers are 8 long)
     sendto(g_sock, (const char *)&m, sizeof m, 0, (const sockaddr *)&to, sizeof to);
 }
 
@@ -247,6 +250,7 @@ void host_poll(ULONGLONG now)
     if (g_have_joiner && now - g_beat_ms >= kBeatMs) {
         g_beat_ms = now;
         char hb[8]; memcpy(hb, g_code, sizeof hb); hb[6] = g_cfg.coop_sprint ? 1 : 0;   // the host's SPRINT option rides the heartbeat
+        hb[7] = (char)(0x80 | (g_cfg.coop_diffmode ? 1 : 0) | (g_cfg.coop_special ? 2 : 0));   // and DIFFICULTY / SPECIAL WEAPONS (0x80 = present)
         send_to(g_joiner, kBeat, hb);
         if (g_started) send_to(g_joiner, kActivate, g_code);   // until the mission goes (a lost CLAC)
     }
@@ -257,11 +261,16 @@ void host_poll(ULONGLONG now)
         if (!g_go_sends) { logf("coop menu: HOST: the mission went to the joiner - lobby closed"); net_close(); g_page = None; return; }
     }
     show(0, g_sock == INVALID_SOCKET ? "-" : g_code);
-    show(1, g_sock == INVALID_SOCKET ? "PORT BUSY" : g_started ? "STARTING..." : g_start_refused ? "P2 NOT READY" :
-             !g_have_joiner ? "WAITING" : g_peer_ready ? "ALL READY" : "P2 JOINED");   // the value field shows ~14 characters
-    show(2, !g_have_joiner ? "-" : g_peer_ready ? "READY" : "NOT READY");
+    show(1, g_cfg.coop_diffmode ? "CO-OP" : "VANILLA");
+    show(2, g_cfg.coop_special ? "ON" : "OFF");
     show(3, g_cfg.coop_sprint ? "ON" : "OFF");
-    g_coop_sprint_allowed = g_cfg.coop_sprint ? 1 : 0;   // the host's own option
+    // the lobby redesign (owner 20261118): STATUS and PLAYER 2 are banners at the top of the screen
+    snprintf(g_coop_lobby_banner[0], sizeof g_coop_lobby_banner[0], "STATUS: %s", g_sock == INVALID_SOCKET ? "PORT BUSY" : g_started ? "STARTING..." :
+             g_start_refused ? "PLAYER 2 NOT READY" : !g_have_joiner ? "WAITING FOR PLAYER 2" : g_peer_ready ? "ALL READY" : "PLAYER 2 JOINED");
+    snprintf(g_coop_lobby_banner[1], sizeof g_coop_lobby_banner[1], "PLAYER 2: %s", !g_have_joiner ? "-" : g_peer_ready ? "READY" : "NOT READY");
+    g_coop_sprint_allowed = g_cfg.coop_sprint ? 1 : 0;   // the host's own options
+    g_coop_diffmode_on = g_cfg.coop_diffmode ? 1 : 0;
+    g_coop_special_on = g_cfg.coop_special ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------------------------------- join code
@@ -405,6 +414,11 @@ void join_poll(ULONGLONG now)
             int sp = m.code[6] == 1;   // the host's SPRINT option
             if (sp != g_coop_sprint_allowed) logf("coop menu: JOIN: the host turned SPRINT %s", sp ? "ON" : "OFF");
             g_coop_sprint_allowed = sp;
+            uint8_t opt = (uint8_t)m.code[7];   // the host's DIFFICULTY / SPECIAL WEAPONS (an older host sends 0: vanilla, on)
+            int dm = (opt & 0x80) && (opt & 1) ? 1 : 0, sw = (opt & 0x80) ? ((opt & 2) ? 1 : 0) : 1;
+            if (dm != g_coop_diffmode_on || sw != g_coop_special_on)
+                logf("coop menu: JOIN: the host's DIFFICULTY %s, SPECIAL WEAPONS %s", dm ? "CO-OP" : "VANILLA", sw ? "ON" : "OFF");
+            g_coop_diffmode_on = dm; g_coop_special_on = sw;
         } else if (m.magic == kActivate && g_join == Join::InLobby && !g_started) {
             g_started = true;
             g_host_ms = now;
@@ -440,6 +454,10 @@ void join_poll(ULONGLONG now)
     }
     show(3, st);
     show(4, g_join == Join::InLobby ? (g_ready ? "YES" : "NO") : "-");
+    if (g_join == Join::InLobby) {   // the host's options, shown to the joiner as the lobby banners
+        snprintf(g_coop_lobby_banner[0], sizeof g_coop_lobby_banner[0], "DIFFICULTY: %s", g_coop_diffmode_on ? "CO-OP" : "VANILLA");
+        snprintf(g_coop_lobby_banner[1], sizeof g_coop_lobby_banner[1], "SPECIAL WEAPONS: %s", g_coop_special_on ? "ON" : "OFF");
+    } else g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = 0;
 }
 
 // The joiner starts the host's mission as the host's own menus did: the LevelSelect handler (FUN_0011B890) with the
@@ -551,6 +569,17 @@ void coop_menu_action(int id)
 
 void coop_menu_change(int id, int dir)
 {
+    if (id == 409 || id == 410) {   // the host lobby: DIFFICULTY (VANILLA / CO-OP) and SPECIAL WEAPONS (host only; to the joiner with the heartbeat)
+        (void)dir;
+        if (g_page == HostLobby && !g_started) {
+            if (id == 409) g_cfg.coop_diffmode = g_cfg.coop_diffmode ? 0 : 1;
+            else g_cfg.coop_special = !g_cfg.coop_special;
+            settings_save();
+            logf("coop menu: HOST: %s %s", id == 409 ? "DIFFICULTY" : "SPECIAL WEAPONS",
+                 id == 409 ? (g_cfg.coop_diffmode ? "CO-OP" : "VANILLA") : (g_cfg.coop_special ? "ON" : "OFF"));
+        }
+        return;
+    }
     if (id == 408) {   // the host lobby: SPRINT on / off (host only; it reaches the joiner with the heartbeat)
         (void)dir;
         if (g_page == HostLobby && !g_started) {
@@ -633,7 +662,7 @@ void coop_menu_poll()
         }
     }
     if (g_page == Menu || g_page == Menu + 1) show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");   // the CO-OP page's HIT MARKER row
-    if (g_page != HostLobby && g_page != JoinCode) return;
+    if (g_page != HostLobby && g_page != JoinCode) { g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = 0; return; }
     ULONGLONG now = GetTickCount64();
     if (g_page == HostLobby) host_poll(now);
     else join_poll(now);

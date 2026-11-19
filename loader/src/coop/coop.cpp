@@ -891,6 +891,10 @@ static bool coop_interp_remote(float out[5], float vel[2])
 // physics moves the body by +0x60 * +0x20 * dt INSIDE the tick (= real speed for the
 // anim); our per-frame feet write remains the drift correction.
 static uint32_t coop_anim_blk(uint32_t body);
+static void coop_clone_clip(uint32_t body, int cls, bool moving);
+static void coop_reload_donor_step(void);
+static int coop_clone_clips_on(void);
+extern volatile uint32_t g_coop_peer_anim; extern volatile uint64_t g_coop_peer_anim_ms; extern volatile int g_clone_anim_free;
 static void coop_loco_body(uint32_t body, float vx, float vz)
 {
     uint32_t o = g_aim_link;              // only our PRIVATE link (never a shared class object)
@@ -928,7 +932,30 @@ static void coop_loco_body(uint32_t body, float vx, float vz)
     // Yaw convention from the samples: F = (sin yaw, 0, cos yaw) -> yaw = atan2(x, z).
     static float body_yaw = 1000.0f;      // 1000 = not set yet: start from the current value
     if (body_yaw > 999.0f) body_yaw = *(volatile float *)(uintptr_t)(o + 0x18);
-    if (sp > 0.0f) {
+    int clip_cls = 0;
+    {   // the partner-model clips: reload > sprint > backward / sideways (the forward walk and idle stay the graph's)
+        bool fresh = g_coop_peer_anim_ms && GetTickCount64() - g_coop_peer_anim_ms < 500;
+        uint32_t bits = fresh ? g_coop_peer_anim : 0;
+        { static int rc = -1; if (rc < 0) { char e[16] = {0}; rc = GetEnvironmentVariableA("COOP_RELOAD_CLIP", e, sizeof e) && e[0] && e[0] != '0'; }
+          g_clone_anim_free = (bits & 2) && rc && coop_clone_clips_on() ? 1 : 0; }   // only with a reload clip set
+        if (bits & 2) clip_cls = 5;
+        else if (sp > 0.0f) {
+            float aimy = *(volatile float *)(uintptr_t)(o + 0x18), mvy = 57.2957795f * atan2f(dx, dz), rel = mvy - aimy;
+            while (rel > 180.0f) rel -= 360.0f;
+            while (rel < -180.0f) rel += 360.0f;
+            if (bits & 1) clip_cls = fabsf(rel) <= 60.0f ? 4 : 0;
+            else if (fabsf(rel) >= 130.0f) clip_cls = 1;
+            else if (fabsf(rel) > 50.0f) clip_cls = rel > 0 ? 2 : 3;
+        }
+    }
+    if (sp > 0.0f && coop_clone_clips_on() && (clip_cls == 1 || clip_cls == 2 || clip_cls == 3)) {
+        // backward / sideways: the legs stay on the AIM (minus the held pose's blade, so the gun lands on the aim) and
+        // the soldier's own back / side clip carries the motion
+        extern volatile int g_hold_ok; extern volatile float g_hold_blade;
+        body_yaw = *(volatile float *)(uintptr_t)(o + 0x18) - (g_hold_ok ? g_hold_blade : 0.0f);
+        while (body_yaw > 180.0f) body_yaw -= 360.0f;
+        while (body_yaw < -180.0f) body_yaw += 360.0f;
+    } else if (sp > 0.0f) {
         body_yaw = 57.2957795f * atan2f(dx, dz);
         // play219: while moving the legs followed the walk direction and the spine twist
         // (clamp +-80) could not reach an aim far off it (strafe / backpedal / looking
@@ -966,6 +993,8 @@ static void coop_loco_body(uint32_t body, float vx, float vz)
             }
         }
     }
+    coop_clone_clip(body, clip_cls, sp > 0.0f);
+    coop_reload_donor_step();   // the partner's reload: the clone's upper body from the donor
     if (sp > 0.0f) {   // legs probe (every 0.5 s while moving): move direction, aim, legs, speed
         static uint64_t lt; static uint32_t ln;
         uint64_t nw = GetTickCount64();
@@ -2498,6 +2527,7 @@ struct AnimEv { uint32_t body, hash, seq; uint8_t which, a3, a4, pad; };
 static AnimEv g_an_out[64]; static int g_an_out_n; static AnimEv g_an_prev[64]; static int g_an_prev_n;
 static uint32_t g_an_seq, g_an_last_in;
 volatile uint32_t g_an_clone_lock;   // the clone's anim block while it holds a forced pose (downed): its own calls are dropped
+extern volatile uint32_t g_an_donor_lock;   // the reload donor's block (defined with coop_reload_donor_step)
 static uint32_t g_an_stats[6];   // host events, joiner drops, joiner replays, snapshot fixes, replays with no puppet, snapshots
 static uint32_t coop_anim_blk(uint32_t body)
 {
@@ -2505,6 +2535,40 @@ static uint32_t coop_anim_blk(uint32_t body)
     if (!coop_safe_copy(&A, body + 0x328, 4) || A < 0x80000000 || A >= 0x84000000) return 0;
     if (!coop_safe_copy(&blk, A + 0x54, 4) || blk < 0x80000000 || blk >= 0x84000000) return 0;
     return blk;
+}
+// ANIM FINDER (owner 20261118: "add a sprinting animation when a player sprints, a reload animation for guns, the
+// shotgun cocking animation the enemy shotgunners have after a player fires his shotgun" + "a reverse animation when a
+// player is moving backward"). The soldier clips carry no names, only hashes - this logs (HOST, log only) every enemy
+// animation call with what that soldier does at that moment, to pick the hashes to play on the partner's model:
+// its weapon type (inventory body+0x278 -> +0x44) and weapon state (W = [inv+0x28], W+0xD8: 1 fire, 4 reload ...),
+// its ground speed (body +0x2D8) and the angle between its motion and its facing (body forward row +0x90; ~180 =
+// moving backward). "coop: anim find: ..." 2500 lines. COOP_ANIM_FIND=0 = off.
+static void coop_anim_find_log(uint32_t body, uint32_t hash, uint32_t which)
+{
+    static int on = -1, n;
+    if (on < 0) { char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_ANIM_FIND", e, sizeof e) && e[0] == '0'); }
+    if (!on || n >= 2500) return;
+    uint32_t inv = body + 0x278, wtype = 0xFF, W = 0, wst = 0xFF, cp = 0; int16_t clip = -1; float spd = 0, F[3] = {0, 0, 0}, p[3] = {0, 0, 0};
+    if (coop_safe_copy(&W, inv + 0x28, 4) && W >= 0x80000000 && W < 0x84000000) {   // -46: inv+0x44 read 0 for all - the type is W's first byte
+        uint8_t t8 = 0xFF; coop_safe_copy(&t8, W, 1); wtype = t8;
+        coop_safe_copy(&wst, W + 0xD8, 4);
+        if (coop_safe_copy(&cp, W + 0xF4, 4) && cp >= 0x80000000 && cp < 0x84000000) coop_safe_copy(&clip, cp + 0x18, 2);   // the magazine
+    }
+    coop_safe_copy(&spd, body + 0x2D8, 4); coop_safe_copy(F, body + 0x90, 12); coop_safe_copy(p, body + 0xA0, 12);
+    static uint32_t lb[16]; static float lp[16][3]; static uint64_t lt[16];
+    int k = -1; for (int i = 0; i < 16; i++) if (lb[i] == body) { k = i; break; }
+    if (k < 0) { static int rr; k = rr++ & 15; lb[k] = body; lt[k] = 0; }
+    uint64_t now = GetTickCount64();
+    float ang = -1, mv = 0;
+    if (lt[k] && now - lt[k] < 1500) {
+        float dx = p[0] - lp[k][0], dz = p[2] - lp[k][2]; mv = sqrtf(dx * dx + dz * dz);
+        float fl = sqrtf(F[0] * F[0] + F[2] * F[2]);
+        if (mv > 0.05f && fl > 0.1f) { float c = (dx * F[0] + dz * F[2]) / (mv * fl); c = c > 1 ? 1 : c < -1 ? -1 : c; ang = 57.2957795f * acosf(c); }
+    }
+    lp[k][0] = p[0]; lp[k][1] = p[1]; lp[k][2] = p[2]; lt[k] = now;
+    n++;
+    logf("coop: anim find: %08x plays %08x via %s | weapon type %u state %u clip %d | speed %.2f moved %.2f m, %.0f deg off facing",
+         body, hash, which ? "now" : "blend", wtype & 0xFF, wst, (int)clip, spd, mv, ang);
 }
 extern "C" void coop_anim_check(void)
 {
@@ -2518,6 +2582,7 @@ extern "C" void coop_anim_check(void)
                 e.which = (uint8_t)g_an_which; e.a3 = (uint8_t)g_an_a3; e.a4 = (uint8_t)g_an_a4; e.pad = 0;
             }
             g_an_stats[0]++;
+            coop_anim_find_log(g_an_hbody[i], g_an_hash, g_an_which);   // the clip hunt (log only)
             {   // COOP_DEATH_ANIM_LOG=1: the animations an enemy gets while dying (the downed pose source)
                 static int dl = -1; if (dl < 0) { char e[8] = {0}; dl = GetEnvironmentVariableA("COOP_DEATH_ANIM_LOG", e, sizeof e) && e[0] == '1'; }
                 float hp = 1; uint32_t life = 0; coop_safe_copy(&hp, g_an_hbody[i] + 0x2F0, 4); coop_safe_copy(&life, g_an_hbody[i] + 0x384, 4);
@@ -2531,6 +2596,7 @@ extern "C" void coop_anim_check(void)
         for (int i = 0; i < g_an_pn; i++) if (g_an_pblk[i] == blk) { g_an_skip = 1; g_an_stats[1]++; return; }
     }
     if (g_an_clone_lock && !g_an_replay && blk == g_an_clone_lock) g_an_skip = 1;   // the clone holds a forced pose (downed)
+    if (g_an_donor_lock && !g_an_replay && blk == g_an_donor_lock) g_an_skip = 1;   // the reload donor plays the reload clip
 }
 __declspec(naked) void coop_thunk_anim_play()      // FUN_00091e00 entry: 56 8B 74 24 08 re-executed
 {
@@ -2628,6 +2694,117 @@ __declspec(naked) void coop_thunk_anim_event()      // replaces call ecx; add es
 }
 typedef char(__cdecl *an_play_fn)(uint32_t blk, uint32_t hash, int a3, int a4);
 typedef char(__cdecl *an_now_fn)(uint32_t blk, uint32_t hash);
+// RELOAD, UPPER BODY ONLY (owner 20261118: "try the reload animation but only keeping the upper body bones rig"; the
+// survey-4 choice "duck clip, upper body only"). The soldiers have no magazine-change clip; at reload time they play
+// 7bfe8a91 (a duck: hunched, the rifle held upright, ~1.7 s). While the partner reloads (packet anim bit 2), OUR parked
+// self model (the same soldier rig, hidden) plays that clip as a DONOR (its block locked against its own graph), and
+// coop_bend_array copies the donor's upper-body bones onto the partner's clone each frame - re-attached at the clone's
+// pelvis, so the clone's legs keep walking - in place of the hold pose and the aim bend, for COOP_RELOAD_MS (1700) or
+// until the reload ends. OFF by default (owner 20261119 after the -52 play: "drop the reload animation too for now");
+// COOP_RELOAD_UPPER=1 = on; COOP_RELOAD_HASH=<hex> picks the clip.
+volatile uint32_t g_an_donor_lock;        // the donor's anim block while it plays the reload for the clone
+volatile int g_reload_donor_on;           // coop_bend_array: take the clone's upper body from the donor
+volatile uint32_t g_reload_donor_frames;
+static uint32_t coop_reload_donor_array(uint32_t rb)
+{
+    uint32_t cblk = g_p10_gdst ? coop_anim_blk(g_p10_gdst) : 0, dblk = g_coop_self_body ? coop_anim_blk(g_coop_self_body) : 0;
+    if (!cblk || !dblk) return 0;
+    uint32_t c54 = *(volatile uint32_t *)(uintptr_t)(cblk + 0x54);
+    uint32_t d = *(volatile uint32_t *)(uintptr_t)(dblk + (rb == c54 ? 0x54 : 0x50));
+    return (d >= 0x80000000 && d < 0x84000000) ? d : 0;
+}
+static void coop_reload_donor_step(void)
+{
+    static int on = -1; static uint32_t hash; static int dur;
+    if (on < 0) {
+        char e[16] = {0}; on = GetEnvironmentVariableA("COOP_RELOAD_UPPER", e, sizeof e) && e[0] == '1';
+        char h[16] = {0}; hash = GetEnvironmentVariableA("COOP_RELOAD_HASH", h, sizeof h) ? strtoul(h, nullptr, 16) : 0x7BFE8A91;
+        char m[16] = {0}; dur = GetEnvironmentVariableA("COOP_RELOAD_MS", m, sizeof m) ? atoi(m) : 2500;   // the reload bit ends it sooner
+    }
+    static bool was; static uint64_t t0; static uint32_t f0;
+    static int td = -1; if (td < 0) { char e[8] = {0}; td = GetEnvironmentVariableA("COOP_RELOAD_TEST_DOWNED", e, sizeof e) && e[0] == '1'; }   // test: watch from the downed cam
+    uint64_t now = GetTickCount64();
+    bool me_dn = g_coop_downed && !td;
+    bool fresh = g_coop_peer_anim_ms && now - g_coop_peer_anim_ms < 500;
+    bool rl = fresh && (g_coop_peer_anim & 2) && on;
+    extern volatile uint32_t g_coop_peer_downed;
+    (void)hash;
+    if (rl && !was && !g_reload_donor_on && g_p10_gdst && !me_dn && !g_coop_peer_downed) {
+        g_reload_donor_on = 1; t0 = now; f0 = g_reload_donor_frames;
+        static int ln; if (ln++ < 60) logf("coop: reload: the partner reloads - their model's upper body takes the duck pose");
+    }
+    if (g_reload_donor_on && (!rl || now - t0 > (uint64_t)dur || me_dn || g_coop_peer_downed)) {
+        g_reload_donor_on = 0;
+        static int ln2; if (ln2++ < 60) logf("coop: reload: done after %u ms (%u bone writes)", (uint32_t)(now - t0), g_reload_donor_frames - f0);
+    }
+    was = rl;
+}
+// PARTNER MODEL CLIPS (owner 20261118: sprint / reload / backward animations on the partner's model; stage 2). The
+// clone's own graph has ONE locomotion cycle (d9143dd0, idle bac47aa3) and its upper body is the HOLD POSE. From the
+// -46 / -47 clip hunt (NOTES "PARTNER MODEL ANIMATIONS"): the soldiers' 4-direction set bacd7cd9 forward, bacd7cda
+// BACKWARD, bacd7cdb / bacd7cdc sideways; RELOAD 7bfe8a91 (the magazine refills right after it, every weapon type);
+// a fast run be3ce8a6. The partner's packet now carries anim bits (1 = sprinting, 2 = reloading: its weapon state 4).
+// cls: 0 = leave the graph (forward walk / idle), 1 = backward, 2 = sideways right, 3 = sideways left, 4 = sprint,
+// 5 = reload. While one of ours plays, the clone's block is locked (g_an_clone_lock: the graph's calls are dropped);
+// back to 0 -> the graph's run / idle is put back and the lock released. COOP_CLONE_CLIPS=0 = off,
+// COOP_STRAFE_SWAP=1 swaps the two sideways clips, COOP_SPRINT_CLIP=<hex> (0 = the graph's run) picks the sprint clip.
+volatile uint32_t g_coop_peer_anim;        // the partner's anim bits (packet field anim)
+volatile uint64_t g_coop_peer_anim_ms;
+volatile int g_clone_anim_free;            // 1 = the clone's upper body follows its animation (the reload): no hold pose / bend
+static int coop_clone_clips_on(void)
+{
+    static int on = -1;
+    // -49 play (owner: "all the new animations were wrong") + the local clip survey (clips_l0): 7bfe8a91 is a DUCK into
+    // cover (enemies reload while ducked), bacd7cdc / be3ce8a6 throw the arms out (a stumble / dodge), be3ce8a7 a low
+    // crouch - not walk directions, a sprint or a reload. OFF by default; COOP_CLONE_CLIPS=1 turns it on (experiments).
+    // -51 (owner: "keep digging"; clip surveys 2 / 3): d90d3c24 = the soldiers' AIMED COMBAT WALK (short steps, upright,
+    // gun raised; d9143dd0 = the graph's run, long strides, gun low) - used for backward / sideways with the legs on the
+    // aim. Sprint = the graph's run (no clip); reload = none (soldiers reload by ducking, 7bfe8a91). ON again;
+    // COOP_CLONE_CLIPS=0 = off.
+    // -52 (owner after the -51 play: "drop the animations except the reload, upper body only"): OFF again
+    if (on < 0) { char e[8] = {0}; on = GetEnvironmentVariableA("COOP_CLONE_CLIPS", e, sizeof e) && e[0] == '1'; }
+    return on;
+}
+static void coop_clone_clip(uint32_t body, int cls, bool moving)
+{
+    static uint32_t cur; static int cur_cls; static int swap = -1; static uint32_t sprint_clip = 1;
+    if (swap < 0) {
+        char e[16] = {0}; swap = GetEnvironmentVariableA("COOP_STRAFE_SWAP", e, sizeof e) && e[0] == '1';
+        char f[16] = {0}; sprint_clip = GetEnvironmentVariableA("COOP_SPRINT_CLIP", f, sizeof f) ? strtoul(f, nullptr, 16) : 0;   // -51: the graph's run
+    }
+    uint32_t blk = coop_anim_blk(body);
+    if (!blk) return;
+    extern volatile uint32_t g_coop_peer_downed;
+    if (g_coop_peer_downed || !coop_clone_clips_on()) cls = 0;
+    if (cls == 4 && !sprint_clip) cls = 0;
+    static uint32_t reload_clip = 1;
+    if (reload_clip == 1) { char e[16] = {0}; reload_clip = GetEnvironmentVariableA("COOP_RELOAD_CLIP", e, sizeof e) ? strtoul(e, nullptr, 16) : 0; }
+    // -51: backward / sideways = the aimed combat walk d90d3c24 (bacd7cda/db/dc were dodge / cover moves); reload none
+    static const uint32_t hashes[6] = {0, 0xD90D3C24, 0xD90D3C24, 0xD90D3C24, 0, 0};
+    if (cls == 5 && !reload_clip) cls = 0;
+    uint32_t want = cls == 4 ? sprint_clip : cls == 5 ? reload_clip : hashes[cls];
+    {   // COOP_DIR_CLIP=<hex> (test): play this hash for backward / sideways instead (d90d3c24 = the soldiers' aimed walk)
+        static uint32_t dirc = 1;
+        if (dirc == 1) { char e[16] = {0}; dirc = GetEnvironmentVariableA("COOP_DIR_CLIP", e, sizeof e) ? strtoul(e, nullptr, 16) : 0; }
+        if (dirc && cls >= 1 && cls <= 3) want = dirc;
+    }
+    if (swap && (cls == 2 || cls == 3)) want = hashes[cls == 2 ? 3 : 2];
+    if (!want) {
+        if (cur) {   // back to the graph: put its own cycle back, then let it drive again
+            uint32_t g = moving ? 0xD9143DD0 : 0xBAC47AA3;
+            g_an_replay = 1; ((an_now_fn)(uintptr_t)xbe_va(0x00091E70))(blk, g); g_an_replay = 0;
+            g_an_clone_lock = 0; cur = 0; cur_cls = 0;
+        }
+        return;
+    }
+    g_an_clone_lock = blk;
+    if (want != cur) {
+        g_an_replay = 1; ((an_now_fn)(uintptr_t)xbe_va(0x00091E70))(blk, want); g_an_replay = 0;
+        static const char *nm[6] = {"graph", "BACKWARD", "SIDEWAYS (right)", "SIDEWAYS (left)", "SPRINT", "RELOAD"};
+        static int ln; if (ln++ < 200) logf("coop: partner clip: %s %08x on the clone %08x", nm[cls], want, body);
+        cur = want; cur_cls = cls;
+    }
+}
 static void install_anim_sync(void)
 {
     char e[8] = {0};
@@ -3462,6 +3639,12 @@ static void coop_route_step(uint32_t ctrl, uint32_t obj)
     while (dy > 180.0f) dy -= 360.0f;
     while (dy < -180.0f) dy += 360.0f;
     yaw = pts[k][3] + t * dy;
+    {   // COOP_ROUTE_YAW_OFS=<deg> (test, 20261118 partner-model clips): look that far off the recorded heading - 180 walks
+        // the ghost BACKWARD, 90 sideways
+        static float yofs = -9999.0f;
+        if (yofs < -9000.0f) { char e[16] = {0}; yofs = GetEnvironmentVariableA("COOP_ROUTE_YAW_OFS", e, sizeof e) ? (float)atof(e) : 0.0f; }
+        yaw += yofs;
+    }
     // keep full health (the pilot cannot fight); never while downed logic is being tested
     float hp = *(volatile float *)(uintptr_t)(obj + 0x2F0);
     float full = (obj == g_player_max_obj && g_player_max_hp > 1.0f) ? g_player_max_hp : 1200.0f;
@@ -3681,7 +3864,7 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
     // side's puppet stands at the remote player's ACTUAL maintained pawn spot with
     // the remote's body orientation - no invented floor offsets.
     if (g_coop_listens != INVALID_SOCKET) {
-        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation
+        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; uint32_t anim; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation; anim: 1 sprint, 2 reload
         static uint32_t pkts;
         for (;;) {
             sockaddr_in from{};
@@ -3856,6 +4039,7 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             g_coop_host_seq = ++pkts;
             g_coop_host_ms = GetTickCount64();
             g_coop_peer_downed = pkt.downed;   // the peer's downed flag (we can respawn them with X)
+            g_coop_peer_anim = pkt.anim; g_coop_peer_anim_ms = GetTickCount64();   // sprint / reload bits (the partner-model clips)
             if (g_cfg.coop_log && (g_coop_host_seq <= 3 || g_coop_host_seq % 180 == 0))
                 logf("coop: recv #%u host pos %.2f %.2f %.2f pawn %.2f %.2f %.2f (seq track ok)",
                      g_coop_host_seq, pkt.pos[0], pkt.pos[1], pkt.pos[2],
@@ -3886,22 +4070,27 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             float hl = sqrtf(hf[0] * hf[0] + hf[2] * hf[2]);
             if (hl > 1e-3f) {
                 float Fh[3] = {hf[0] / hl, 0.0f, hf[2] / hl};
-                const float BACK = 2.6f, UP = 0.6f;
-                float tx = g_coop_host_pawnmat[12] - BACK * Fh[0];
+                // COOP_CHASE_BACK=<m> (test): the camera's distance behind the survivor (negative = IN FRONT, looking back
+                // at them - the clip surveys need the front of the clone); COOP_CHASE_SIDE=<m> moves it to their right
+                static float cb = -999.0f, cs = 0.0f;
+                if (cb < -900.0f) { char e[16] = {0}; cb = GetEnvironmentVariableA("COOP_CHASE_BACK", e, sizeof e) ? (float)atof(e) : 2.6f;
+                                    char e2[16] = {0}; cs = GetEnvironmentVariableA("COOP_CHASE_SIDE", e2, sizeof e2) ? (float)atof(e2) : 0.0f; }
+                const float BACK = cb, UP = 0.6f;
+                float tx = g_coop_host_pawnmat[12] - BACK * Fh[0] + cs * Fh[2];
                 float ty = g_coop_host_pawnmat[13] + UP;
-                float tz = g_coop_host_pawnmat[14] - BACK * Fh[2];
+                float tz = g_coop_host_pawnmat[14] - BACK * Fh[2] - cs * Fh[0];
                 // our eye height above our feet (measured, before the move)
                 float eyeh = *(volatile float *)(uintptr_t)(mo + 0x104) - *(volatile float *)(uintptr_t)(mo + 0xA4);
                 if (!(eyeh > 0.5f && eyeh < 2.5f)) eyeh = 1.5f;
                 // pitch (+ = down) from our eye to the survivor's chest (feet + 1.2)
                 float drop = (ty + eyeh) - (g_coop_host_pawnmat[13] + 1.2f);
-                float cam_pitch = 57.2957795f * atan2f(drop, BACK);
+                float cam_pitch = 57.2957795f * atan2f(drop, fabsf(BACK) > 0.3f ? fabsf(BACK) : 0.3f);
                 volatile float *f = (volatile float *)(uintptr_t)(mo + 0xA0);
                 volatile float *snap = (volatile float *)(uintptr_t)(mo + 0x190);
                 float dx = tx - f[0], dy = ty - f[1], dz = tz - f[2];
                 f[0] += dx; f[1] += dy; f[2] += dz;
                 snap[0] += dx; snap[1] += dy; snap[2] += dz;
-                *(volatile float *)(uintptr_t)(ctrl + 0x18) = g_coop_host_yaw;    // face the survivor's way
+                *(volatile float *)(uintptr_t)(ctrl + 0x18) = g_coop_host_yaw + (BACK < 0.0f ? 180.0f : 0.0f) - (cs != 0.0f ? 57.2957795f * atan2f(cs, fabsf(BACK)) * (BACK < 0.0f ? -1.0f : 1.0f) : 0.0f);    // face the survivor's way (in front: face them)
                 *(volatile float *)(uintptr_t)(ctrl + 0x1C) = cam_pitch;          // looking down at them
                 static int dl;
                 if (dl++ < 3) logf("coop: downed spectator: chase cam at %.1f %.1f %.1f (2.6 m behind, 0.6 m up), yaw %.1f pitch %.1f; our body stays at %.1f %.1f %.1f",
@@ -4592,10 +4781,21 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
         // (pobj+0xF0), [3] = 1.0 valid marker, [12..14] = this player's FEET
         // (pobj+0xA0, game-maintained, on the floor plane). v3 read *(mgr+0x79BC) =
         // the slot-ARRAY pointer (not a body) - never the player.
-        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation
+        struct { uint32_t magic, seq, ctrl, obj; float yaw, pitch, pos[3], pawnmat[15]; uint32_t downed; double tms; uint32_t anim; } pkt;   // tms: the sender's clock (ms, QPC) - interpolation; anim: 1 sprint, 2 reload
         memset(&pkt, 0, sizeof pkt);
         pkt = { 0x434C4152, n, ctrl, obj, yaw, pitch, {m[12], m[13], m[14]}, {}, g_coop_downed };
         pkt.tms = coop_qpc_ms();
+        {   // the partner-model clips: our sprint and our reload (the weapon state machine's 4)
+            uint32_t Wa = (obj >= 0x80000000 && obj < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(obj + 0x278 + 0x28) : 0;
+            int wst = (Wa >= 0x80000000 && Wa < 0x84000000) ? *(volatile int *)(uintptr_t)(Wa + 0xD8) : 0;
+            pkt.anim = (g_coop_sprinting ? 1u : 0u) | (wst == 4 ? 2u : 0u);
+            {   // COOP_FAKE_RELOAD=<from>-<to> (test, seconds since the session start): send the reload bit in that window
+                static float fr0 = -2.0f, fr1 = -1.0f;
+                if (fr0 < -1.5f) { char e[32] = {0}; fr0 = -1.0f; if (GetEnvironmentVariableA("COOP_FAKE_RELOAD", e, sizeof e)) sscanf(e, "%f-%f", &fr0, &fr1); }
+                float ts = g_coop_t0 ? (float)(GetTickCount64() - g_coop_t0) / 1000.0f : -1.0f;
+                if (fr0 >= 0.0f && ts >= fr0 && ts <= fr1) pkt.anim |= 2u;
+            }
+        }
         if (obj >= 0x80000000 && obj < 0x84000000) {
             const volatile float *feet = (const volatile float *)(uintptr_t)(obj + 0xA0);
             const volatile float *fwd = (const volatile float *)(uintptr_t)(obj + 0xF0);
@@ -5539,6 +5739,11 @@ static void coop_door_pull(uint32_t o)
     static const float door[4][3] = {{-442.3f, 69.3f, 124.3f}, {-123.5f, -69.3f, 438.8f}, {-124.2f, -69.3f, 443.5f},   // mission 8
                                      {-0.6f, 2.6f, -383.0f}};                                                            // mission 4
     static const int group[4] = {0, 0, 0, 1};
+    // -47 play (owner: "the door pull teleported the host to the joiner but it was the host who triggered the door"): the
+    // host set off 81d7fee0 AT the door and was 11.8 m from the joiner still above -> the host was moved back up. Only the
+    // player FARTHER from the door (its world point, from the logs) is ever moved: the leader is the one at the door.
+    static const float door_at[2][3] = {{442.3f, -69.3f, -124.3f},    // mission 8: the final room's threshold
+                                        {-382.5f, -3.6f, -12.3f}};    // mission 4: the bottom of the stairs
     int k = -1;
     for (int i = 0; i < 4 && k < 0; i++) {
         float dx = q[0] - door[i][0], dy = q[1] - door[i][1], dz = q[2] - door[i][2];
@@ -5553,6 +5758,15 @@ static void coop_door_pull(uint32_t o)
     const volatile float *f = (const volatile float *)(uintptr_t)(po + 0xA0);
     float dx = f[0] - pf[0], dy = f[1] - pf[1], dz = f[2] - pf[2];
     float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    {
+        const float *da = door_at[group[k]];
+        float ux = f[0] - da[0], uy = f[1] - da[1], uz = f[2] - da[2], px = pf[0] - da[0], py = pf[1] - da[1], pz = pf[2] - da[2];
+        float du = sqrtf(ux * ux + uy * uy + uz * uz), dp = sqrtf(px * px + py * py + pz * pz);
+        if (du <= dp + 2.0f) {
+            logf("coop: door pull: trigger %08x fired - we are at the door (%.1f m from it, the partner %.1f m), no pull", o, du, dp);
+            return;
+        }
+    }
     if (g_coop_downed || d <= 8.0f) {
         logf("coop: door pull: trigger %08x fired - we are %.1f m from the partner%s, no pull", o, d, g_coop_downed ? " (downed)" : "");
         return;
@@ -6741,9 +6955,12 @@ volatile int g_clone_idle;              // coop_loco_body: the clone stands (the
 volatile int g_hold_ok;                 // the clone's upper body is the captured hold pose
 volatile float g_hold_blade;            // its gun yaw in model space (constant)
 volatile uint64_t g_need_twist_ms;      // when it was measured
+extern volatile int g_reload_donor_on; extern volatile uint32_t g_reload_donor_frames;
+static uint32_t coop_reload_donor_array(uint32_t rb);
 static bool coop_bend_array(uint32_t rb, uint32_t ix, int nb, float p, float aim_model_yaw = 1000.0f)
 {
     if (rb < 0x80000000 || rb >= 0x84000000 || ix < 0x80000000 || ix >= 0x84000000 || nb <= 0 || nb > 64) return false;
+    if (g_clone_anim_free) return false;   // the partner reloads: the clone's upper body plays the reload clip as it is
     struct Cache { uint32_t arr; int maxb; float saved[65][16], bent[65][16]; };
     static Cache cache[6]; static int ncache;
     Cache *cc = nullptr;
@@ -6762,6 +6979,21 @@ static bool coop_bend_array(uint32_t rb, uint32_t ix, int nb, float p, float aim
     bool fresh = cc->maxb != maxb || memcmp(cur, cc->bent, sz) != 0;
     if (fresh) memcpy(cc->saved, cur, sz);   // fresh anim pose
     cc->maxb = maxb;
+    {   // COOP_REC_POSE=<from s>,<seconds>,<file> (test, 20261118 reload recording): append every FRESH anim pose of the
+        // clone's first bone array in that window: {uint32 ms since the window start, int maxb, (maxb+1) x 16 floats}
+        static int rec = -1; static float r0, rd; static char rpath[260]; static FILE *rf; static uint32_t rarr;
+        if (rec < 0) { char e[300] = {0}; rec = 0; if (GetEnvironmentVariableA("COOP_REC_POSE", e, sizeof e) && sscanf(e, "%f,%f,%259s", &r0, &rd, rpath) == 3) rec = 1; }
+        if (rec == 1 && fresh && g_coop_t0 && g_p10_gdst) {
+            uint32_t cblk = coop_anim_blk(g_p10_gdst);
+            if (cblk && rb == *(volatile uint32_t *)(uintptr_t)(cblk + 0x50)) {
+                float ts = (float)(GetTickCount64() - g_coop_t0) / 1000.0f;
+                if (ts >= r0 && ts <= r0 + rd) {
+                    if (!rf) { rf = fopen(rpath, "wb"); rarr = rb; logf("coop: pose rec: recording the clone's array %08x to %s", rb, rpath); }
+                    if (rf) { uint32_t ms = (uint32_t)((ts - r0) * 1000.0f); fwrite(&ms, 4, 1, rf); fwrite(&maxb, 4, 1, rf); fwrite(cur, 64, maxb + 1, rf); }
+                } else if (rf && ts > r0 + rd) { fclose(rf); rf = nullptr; rec = 2; logf("coop: pose rec: done"); }
+            }
+        }
+    }
     memcpy(cc->bent, cc->saved, sz);
     // HOLD POSE (owner: "the clone should not have any idle animation at all and just point
     // the gun where the player aims at all times"). Once, capture a steady AIM pose from the
@@ -6947,6 +7179,52 @@ static bool coop_bend_array(uint32_t rb, uint32_t ix, int nb, float p, float aim
             if (bend_h(b, o[13]) <= 1.0f || fabsf(o[12]) > 1.5f || fabsf(o[14]) > 1.5f) continue;   // upper body only
             memcpy(cc->bent[b], cap[b], 64);
             cc->bent[b][12] += dx; cc->bent[b][13] += dy; cc->bent[b][14] += dz;
+        }
+    }
+    if (g_reload_donor_on) {   // the partner reloads: the clone's upper body = the donor's (the duck clip), legs untouched
+        // -52: 7bfe8a91 is a STILL pose (recorded with COOP_REC_POSE: no bone moved > 1 cm over 2.2 s) - one recorded frame
+        // (the 25-bone soldier rig, model space) replaces the parked donor (a hidden body is never animated: its bones
+        // stayed put)
+        static const float kDuck[25][16] = {
+    {1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.00000f, 1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.00000f, 1.00000f, 0.00000f, 0.00000f, 0.00000f, 0.00000f, 1.00000f},
+    {-0.79934f, 0.00000f, -0.60080f, 0.00000f, -0.01815f, 0.99954f, 0.02415f, 0.00000f, 0.60052f, 0.03021f, -0.79898f, 0.00000f, 0.00000f, 0.46527f, -0.01525f, 1.00000f},
+    {-0.79934f, 0.00000f, -0.60080f, 0.00000f, -0.01815f, 0.99954f, 0.02415f, 0.00000f, 0.60052f, 0.03021f, -0.79898f, 0.00000f, 0.00000f, 0.46527f, -0.01525f, 0.90662f},
+    {-0.60098f, -0.79755f, -0.05192f, 0.00000f, -0.33181f, 0.30811f, -0.89156f, 0.00000f, 0.72707f, -0.51863f, -0.44981f, 0.00000f, -0.09467f, 0.39609f, -0.09000f, 0.90662f},
+    {0.11091f, -0.32580f, -0.93886f, 0.00000f, -0.97827f, 0.13045f, -0.16083f, 0.00000f, 0.17488f, 0.93639f, -0.30425f, 0.00000f, 0.09813f, 0.39609f, 0.05491f, 0.90662f},
+    {-0.79665f, 0.22516f, -0.56086f, 0.00000f, 0.20613f, 0.97360f, 0.09803f, 0.00000f, 0.56812f, -0.03752f, -0.82203f, 0.00000f, 0.00111f, 0.54535f, -0.01367f, 0.90662f},
+    {0.94537f, 0.17257f, -0.27621f, 0.00000f, -0.31827f, 0.30943f, -0.89603f, 0.00000f, -0.06916f, 0.93508f, 0.34745f, 0.00000f, -0.32773f, 0.08849f, -0.10993f, 0.90839f},
+    {0.10414f, 0.96741f, 0.23063f, 0.00000f, -0.97681f, 0.14307f, -0.15897f, 0.00000f, -0.18679f, -0.20875f, 0.95988f, 0.00000f, 0.05577f, 0.52285f, 0.41749f, 0.91038f},
+    {-0.79905f, 0.12351f, -0.58836f, 0.00000f, -0.04245f, 0.96464f, 0.26013f, 0.00000f, 0.59968f, 0.23286f, -0.76555f, 0.00000f, 0.02774f, 0.67114f, -0.00101f, 0.85681f},
+    {0.90044f, -0.21348f, -0.37874f, 0.00000f, -0.38975f, -0.01026f, -0.92080f, 0.00000f, 0.19267f, 0.97684f, -0.09247f, 0.00000f, 0.06786f, 0.14564f, -0.23003f, 0.93079f},
+    {-0.08408f, 0.98929f, 0.11895f, 0.00000f, -0.94865f, -0.04295f, -0.31322f, 0.00000f, -0.30476f, -0.13919f, 0.94211f, 0.00000f, 0.00940f, 0.11608f, 0.33274f, 0.80481f},
+    {-0.75487f, 0.03001f, -0.65511f, 0.00000f, -0.23650f, 0.91927f, 0.31462f, 0.00000f, 0.61167f, 0.39247f, -0.68684f, 0.00000f, 0.02249f, 0.79052f, 0.03119f, 0.78695f},
+    {0.11600f, -0.99054f, -0.07237f, 0.00000f, -0.37114f, 0.02439f, -0.92820f, 0.00000f, 0.92119f, 0.13454f, -0.36481f, 0.00000f, 0.11308f, 0.01084f, -0.24713f, 0.95737f},
+    {-0.08408f, 0.98929f, 0.11895f, 0.00000f, -0.94865f, -0.04295f, -0.31322f, 0.00000f, -0.30476f, -0.13919f, 0.94211f, 0.00000f, -0.02285f, 0.02703f, 0.44016f, 0.91602f},
+    {-0.67623f, 0.04814f, -0.73505f, 0.00000f, -0.62243f, 0.49630f, 0.60513f, 0.00000f, 0.39394f, 0.86681f, -0.30565f, 0.00000f, -0.01538f, 0.93770f, 0.08156f, 0.70510f},
+    {-0.81488f, -0.03192f, -0.57867f, 0.00000f, -0.49438f, 0.55933f, 0.66533f, 0.00000f, 0.30243f, 0.82832f, -0.47157f, 0.00000f, -0.05324f, 0.96789f, 0.11837f, 0.59949f},
+    {-0.81736f, -0.20756f, -0.53736f, 0.00000f, -0.53853f, 0.60645f, 0.58492f, 0.00000f, 0.20448f, 0.76755f, -0.60747f, 0.00000f, -0.05631f, 0.87577f, 0.08926f, 0.59949f},
+    {-0.40279f, -0.11967f, -0.90738f, 0.00000f, 0.73033f, -0.63951f, -0.23984f, 0.00000f, -0.55158f, -0.75936f, 0.34499f, 0.00000f, -0.03056f, 0.87395f, 0.11725f, 0.59949f},
+    {-0.98983f, -0.14187f, 0.00079f, 0.00000f, -0.02329f, 0.15681f, -0.98728f, 0.00000f, 0.13995f, -0.97735f, -0.15852f, 0.00000f, -0.09579f, 1.01603f, 0.17563f, 0.52316f},
+    {-0.37557f, -0.82138f, 0.42919f, 0.00000f, -0.88401f, 0.45653f, 0.10009f, 0.00000f, -0.27814f, -0.34185f, -0.89758f, 0.00000f, -0.17747f, 0.93118f, 0.03015f, 0.56210f},
+    {0.04345f, 0.59613f, -0.80163f, 0.00000f, -0.81916f, -0.43795f, -0.37011f, 0.00000f, -0.57171f, 0.67280f, 0.46935f, 0.00000f, 0.04825f, 0.93625f, 0.22284f, 0.56202f},
+    {0.30478f, 0.40081f, 0.86388f, 0.00000f, -0.88401f, 0.45653f, 0.10009f, 0.00000f, -0.35428f, -0.79426f, 0.49347f, 0.00000f, -0.31018f, 0.65075f, 0.13700f, 0.50981f},
+    {0.53403f, -0.34792f, -0.77044f, 0.00000f, -0.81916f, -0.43797f, -0.37009f, 0.00000f, -0.20869f, 0.82883f, -0.51897f, 0.00000f, 0.05517f, 0.71707f, 0.46691f, 0.50378f},
+    {-0.58656f, -0.67450f, 0.44811f, 0.00000f, 0.04878f, 0.52287f, 0.85091f, 0.00000f, -0.80833f, 0.52105f, -0.27375f, 0.00000f, -0.22082f, 0.78038f, 0.33508f, 0.57055f},
+    {-0.08688f, 0.07915f, 0.99300f, 0.00000f, 0.99199f, 0.09725f, 0.07907f, 0.00000f, -0.09032f, 0.99202f, -0.08699f, 0.00000f, -0.08622f, 0.83473f, 0.64066f, 0.50648f},
+        };
+        static float dn[65][16];
+        if (maxb == 24) {
+            memcpy(dn, kDuck, sizeof kDuck);
+            float ddx = cc->saved[1][12] - dn[1][12], ddy = cc->saved[1][13] - dn[1][13], ddz = cc->saved[1][14] - dn[1][14];
+            for (int b = 0; b <= maxb; b++) {
+                const float *o = cc->saved[b];
+                if (bend_h(b, o[13]) <= 1.0f || fabsf(o[12]) > 1.5f || fabsf(o[14]) > 1.5f) continue;   // upper body only
+                memcpy(cc->bent[b], dn[b], 64);
+                cc->bent[b][12] += ddx; cc->bent[b][13] += ddy; cc->bent[b][14] += ddz;
+            }
+            memcpy((void *)(uintptr_t)rb, cc->bent, sz);
+            g_reload_donor_frames++;
+            return fresh;
         }
     }
     const bool held = hold_env && cap_ok && cap_maxb == maxb;
@@ -8214,6 +8492,22 @@ static void coop_aggro_log(void)
                 if (e && e == g_p10_gdst && idx_clone < 0) idx_clone = r;
             }
         }
+        // DOWNED DROP (owner 20261118, -46 play: "the enemies stay aggro on a downed player"): the switch rule below runs
+        // only for an enemy it counts as engaged; five far enemies (50-60 m) kept the downed joiner as their target for
+        // 22-36 s (host 275 -> 297..311). Now any enemy whose brain target (+0x2A8) is a DOWNED player is pointed at the
+        // other player at once when that one is up (both down: the mission fails anyway).
+        if (!g_aggro_off && idx_host >= 0 && idx_clone >= 0 && g_p10_gdst && (idx == idx_host || idx == idx_clone)) {
+            bool host_dn = *(volatile uint32_t *)(uintptr_t)(me + 0x384) != 0, clone_dn = *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) != 0;
+            bool on_dn = idx == idx_host ? host_dn : clone_dn, other_up = idx == idx_host ? !clone_dn : !host_dn;
+            if (on_dn && other_up) {
+                int to = idx == idx_host ? idx_clone : idx_host;
+                coop_set_enemy_target(link, to);
+                if (Threat *dth = coop_threat_get(b, true)) { dth->chosen = to == idx_host ? me : g_p10_gdst; dth->chosen_ms = GetTickCount64(); }
+                static int dl; if (dl++ < 100) logf("coop: aggro: enemy %08x drops the downed %s -> %s", b, idx == idx_host ? "HOST" : "JOINER", to == idx_host ? "HOST" : "JOINER");
+                idx = to;
+                ent = to == idx_host ? me : g_p10_gdst;
+            }
+        }
         // COOP_AGGRO_TEST=<sec> (diagnostics): from that time on, every engaged enemy is
         // credited 400 joiner threat once (deterministic switch test; the scripted
         // Naszran scene's shots go into the ground)
@@ -9133,7 +9427,7 @@ static void coop_enemy_tick(uint32_t pobj)
         if (sp < 0.15f) sp = 0.0f; else { dx = u->v.vx / sp; dz = u->v.vz / sp; }
         *(volatile float *)(uintptr_t)(o + 0x10) = r.byaw;
         float lyaw = r.lyaw, lpitch = r.lpitch, aimyaw = r.byaw - r.bear;   // +0x14 so that the bearing equals the host's
-        if (r.tgt == 2 && pobj >= 0x80000000 && pobj < 0x84000000) {
+        if (r.tgt == 2 && !g_coop_downed && pobj >= 0x80000000 && pobj < 0x84000000) {   // never at us while we are downed
             // the host's enemy is on US: aim from this puppet's eyes at our own chest, measured here (the
             // copies' positions differ by a few cm..m; the host's angle would miss us). Only while the host's
             // look already points our way (within 35 deg), so a turning / moving enemy keeps the host's look.
@@ -12122,8 +12416,115 @@ static void install_damage_hook(void)
 // the spectator trigger. See the DOWNED block above coop_on_player_update.
 volatile uint32_t g_pdh_victim, g_pdh_args;
 volatile void *g_pdh_resume;
+// THE CO-OP DIFFICULTY (owner 20261118, the lobby redesign: "Coop: the regular difficulties plus changes for co-op. For now a
+// damage multiplier for the players, they receive more damage: Normal 1.5x, Hard 2.0x, Black Ops 2.5x"; Easy stays 1x).
+// With the host's DIFFICULTY = CO-OP (g_coop_diffmode_on, synced to the joiner) the damage OUR player takes is scaled by
+// the mission's difficulty (game +0x2014C: 0 easy, 1 normal, 2 hard, 3 black ops) - bullets in the downed hook
+// (FUN_001ed990, arg 3, before the killing-blow clamp) and explosions / generic damage in a hook on FUN_001ed2b0 (the
+// player's +0x2C: hitvec*, dir*, dmg, ...). Each copy scales its own player, so it counts once.
+static float coop_diff_damage_mul(void)
+{
+    if (!g_cfg.coop_role || !g_coop_diffmode_on) return 1.0f;
+    uint32_t game = *(volatile uint32_t *)(uintptr_t)0x002D45F0;
+    if (game < 0x80000000 || game >= 0x84000000) return 1.0f;
+    int d = *(volatile int *)(uintptr_t)(game + 0x2014C);
+    static const float mul[4] = {1.0f, 1.5f, 2.0f, 2.5f};
+    return d >= 0 && d < 4 ? mul[d] : 1.0f;
+}
+static void coop_diff_scale(uint32_t victim, volatile uint32_t *dmg_slot, const char *what)
+{
+    float m = coop_diff_damage_mul();
+    if (m == 1.0f || victim < 0x80000000 || victim >= 0x84000000) return;
+    uint32_t po = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
+    if (!po || victim != po) return;
+    float d = *(volatile float *)dmg_slot;
+    if (!(d > 0.0f) || d > 1.0e6f) return;
+    *(volatile float *)dmg_slot = d * m;
+    static int n; if (n++ < 20) logf("coop: co-op difficulty: %s damage on our player %.1f x %.1f = %.1f", what, d, m, d * m);
+}
+volatile uint32_t g_xdm_victim, g_xdm_args, g_xdm_resume;
+extern "C" void coop_on_player_blast(void)
+{
+    volatile uint32_t *a = (volatile uint32_t *)(uintptr_t)g_xdm_args;   // [0] ret, [1] hitvec*, [2] dir*, [3] dmg
+    coop_diff_scale(g_xdm_victim, &a[3], "blast");
+}
+__declspec(naked) void coop_thunk_player_blast()
+{
+    __asm {
+        pushad
+        mov dword ptr [g_xdm_victim], ecx
+        lea eax, [esp + 0x20]
+        mov dword ptr [g_xdm_args], eax
+        call coop_on_player_blast
+        popad
+        push ebp                           // displaced: 55
+        mov ebp, esp                       // displaced: 8B EC
+        and esp, 0xFFFFFFF8                // displaced: 83 E4 F8
+        jmp dword ptr [g_xdm_resume]
+    }
+}
+// THE SPECIAL WEAPONS SWITCH (owner 20261118: "the game unlocks silver and gold weapons after clearing a level on certain
+// difficulties; the host can choose to turn that on or off"). The level start (FUN_001ede.., world state 0xE) sets world
+// +0x5CB0 (SILVER: the last mission finished at this difficulty or a harder one, or playing Black Ops) and +0x5CB1 (GOLD:
+// Black Ops finished, or playing Black Ops) from the player's own profile, then reads +0x5CB0 at 0x1EE201. With the host's
+// SPECIAL WEAPONS = OFF (g_coop_special_on = 0) both flags are cleared right there on both copies; ON keeps the game's
+// rule (each player's own unlocks). Displaced at 0x1EE1FF: 33 C9 (xor ecx, ecx) 8A AD B0 5C 00 00 (mov ch, [ebp+0x5cb0]).
+volatile uint32_t g_spw_resume, g_spw_clear;
+extern "C" void coop_special_check(void)
+{
+    g_spw_clear = (g_cfg.coop_role && !g_coop_special_on) ? 1 : 0;
+    static int n; if (g_spw_clear && n++ < 20) logf("coop: special weapons OFF (the host's lobby option) - this level's silver / gold flags cleared");
+}
+__declspec(naked) void coop_thunk_special()
+{
+    __asm {
+        pushad
+        call coop_special_check
+        popad
+        cmp dword ptr [g_spw_clear], 0
+        je keep
+        mov byte ptr [ebp + 0x5CB0], 0
+        mov byte ptr [ebp + 0x5CB1], 0
+    keep:
+        xor ecx, ecx
+        mov ch, byte ptr [ebp + 0x5CB0]
+        jmp dword ptr [g_spw_resume]
+    }
+}
+static void install_coop_rules(void)
+{
+    {
+        uint32_t site = xbe_va(0x001ED2B0);
+        auto *code = (uint8_t *)(uintptr_t)site;
+        static const uint8_t kExpect[6] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8};
+        if (memcmp(code, kExpect, 6) != 0) logf("coop: co-op difficulty: 001ed2b0 bytes mismatch - blasts not scaled");
+        else {
+            g_xdm_resume = site + 6;
+            code[0] = 0xE9;
+            int32_t rel = (int32_t)((uintptr_t)coop_thunk_player_blast - (site + 5));
+            memcpy(code + 1, &rel, 4);
+            code[5] = 0x90;
+            logf("coop: co-op difficulty: blast hook installed at FUN_001ed2b0");
+        }
+    }
+    {
+        uint32_t site = xbe_va(0x001EE1FF);
+        auto *code = (uint8_t *)(uintptr_t)site;
+        static const uint8_t kExpect[8] = {0x33, 0xC9, 0x8A, 0xAD, 0xB0, 0x5C, 0x00, 0x00};
+        if (memcmp(code, kExpect, 8) != 0) logf("coop: special weapons: 001ee1ff bytes mismatch - switch not installed");
+        else {
+            g_spw_resume = site + 8;
+            code[0] = 0xE9;
+            int32_t rel = (int32_t)((uintptr_t)coop_thunk_special - (site + 5));
+            memcpy(code + 1, &rel, 4);
+            code[5] = code[6] = code[7] = 0x90;
+            logf("coop: special weapons switch installed at 0x1EE1FF");
+        }
+    }
+}
 extern "C" void coop_on_player_damage(void)
 {
+    if (g_pdh_args >= 0x10000) coop_diff_scale(g_pdh_victim, &((volatile uint32_t *)(uintptr_t)g_pdh_args)[3], "bullet");   // the CO-OP difficulty (first)
     {   // hit-rate counter: an enemy bullet on the host's own player
         uint32_t po0 = (g_coop_last_ctrl >= 0x80000000 && g_coop_last_ctrl < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(g_coop_last_ctrl + 0x8C) : 0;
         if (po0 && g_pdh_victim == po0 && g_pdh_args >= 0x10000) coop_hr_hit(0, ((const volatile uint32_t *)(uintptr_t)g_pdh_args)[6], po0);
@@ -13018,7 +13419,7 @@ static void install_coop_features()
     if (g_cfg.skin_hook) install_skin_hook();   // --skin-hook: arm-aim skeleton work
     if (g_cfg.coop_clone) install_pellet_hook();   // hit sync: per-pellet ray hook
     if (g_cfg.coop_clone) install_damage_hook();   // clone shield + relay: bullets on the clone are skipped (and relayed on the host)
-    if (g_cfg.coop_clone) { install_weapon_guard(); install_null_guard(); install_target_guard(); install_dying_guard(); install_body_guard(); install_puppet_brain(); install_lookup_guard(); install_trigger_sync(); install_spawn_gate(); install_retire_guard(); install_death_guard(); install_pick_guard(); coop_jp_install(); install_anim_sync(); install_projectile_sync(); install_ammo_guard(); install_agent_list_guard(); install_reg_once(); install_throw_trace(); install_objective_sync(); install_prop_sync(); install_piece_sync(); install_pickup_sync(); install_drop_sync(); if (g_cfg.coop_role) { install_no_pause(); install_restart_rule(); } install_clone_shield(); install_explosion_log(); }  // null-weapon guard; clone shield: explosions/stealth damage on the clone is skipped
+    if (g_cfg.coop_clone) { install_weapon_guard(); install_null_guard(); install_target_guard(); install_dying_guard(); install_coop_rules(); install_body_guard(); install_puppet_brain(); install_lookup_guard(); install_trigger_sync(); install_spawn_gate(); install_retire_guard(); install_death_guard(); install_pick_guard(); coop_jp_install(); install_anim_sync(); install_projectile_sync(); install_ammo_guard(); install_agent_list_guard(); install_reg_once(); install_throw_trace(); install_objective_sync(); install_prop_sync(); install_piece_sync(); install_pickup_sync(); install_drop_sync(); if (g_cfg.coop_role) { install_no_pause(); install_restart_rule(); } install_clone_shield(); install_explosion_log(); }  // null-weapon guard; clone shield: explosions/stealth damage on the clone is skipped
     install_sight_trace();   // COOP_SIGHT_TRACE=1: every awareness record + its caller chain
     if (g_cfg.as_log) install_as_log();   // HUD clip discovery
     if (g_cfg.coop_downed || g_cfg.hide_test || g_cfg.msg_test) install_render_gates();   // hide HUD/viewmodel while downed
