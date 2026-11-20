@@ -8,6 +8,7 @@
 #include "d3d/host.h"
 #include "d3d/nv2a_psh.h"
 #include "d3d/pshader.h"
+#include "d3d/ppl.h"
 #include "perf.h"
 #include "d3d/pushbuf.h"
 #include "d3d/state.h"
@@ -1164,6 +1165,7 @@ void release_host_targets()
             t = nullptr;
         }
     g_cur_rt = nullptr;
+    ppl_release_targets(); // the lighting's shadow cube (made again on demand)
 }
 
 // The game's current target and depth buffer bound again, with the viewport and scissor.

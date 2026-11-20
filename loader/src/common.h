@@ -80,6 +80,7 @@ struct Config {
     bool aim_hold = false;     // aim while the aim button is held instead of toggling (input/mouselook.cpp; --hold-aim, PC SETTINGS)
     bool timer_vblank = false; // --timer-vblank: free-running 59.94 Hz vblank instead of following the display
     bool display_vblank = false; // --display-vblank (tests): follow the display even with --background
+    int ppl = 0;                 // black.ini "ppl" / BLACK_PPL: per-pixel lighting prototype (d3d/ppl.h), 0 = off
     bool effects_native = false; // the small effect buffers at their Xbox size (PC SETTINGS); default: render scale, smoothed
     bool seam_fill = true;     // fill hairline cracks between geometry pieces (PC SETTINGS, --no-seamfill)
     bool autoaim = false;      // the game's view pull toward targets, off by default (input/autoaim.cpp; --autoaim, PC SETTINGS)

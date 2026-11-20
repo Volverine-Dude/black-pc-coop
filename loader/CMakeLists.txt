@@ -76,6 +76,8 @@ add_library(blackrt SHARED
   src/d3d/nv2a_vsh.cpp
   src/d3d/nv2a_psh.cpp
   src/d3d/pshader.cpp
+  src/d3d/ppl.cpp
+  src/d3d/ppl_shadow.cpp
   src/d3d/compiler.cpp
   src/d3d/shader_cache.cpp
   src/audio/dsound.cpp

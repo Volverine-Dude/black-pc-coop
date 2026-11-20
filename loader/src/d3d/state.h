@@ -26,6 +26,8 @@ struct VertexShader {
     uint32_t program_type;        // 0x2078 normal, 0x6378 read/write, 0x7778 state
     IDirect3DVertexShader9 *host_vs; // translated program, or null (not translated yet)
     bool translate_failed;
+    IDirect3DVertexShader9 *host_vs_ppl; // the same program with the lighting pass's view-space output (d3d/ppl.h)
+    bool ppl_failed;
 };
 constexpr uint32_t VSH_MAGIC = 0x48535658;
 

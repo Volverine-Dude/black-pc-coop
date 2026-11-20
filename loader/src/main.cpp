@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "d3d/dispatch.h"
+#include "d3d/ppl.h"
 #include "fe/calls.h"
 #include "fe/pages.h"
 #include "region_grow.h"
@@ -644,6 +645,7 @@ int run(void *reserve, unsigned reserve_size)
     if (supported_build) install_autoaim_patch();
     if (supported_build) install_reload_blur_patch();
     if (supported_build) install_cheats();
+    if (supported_build) xd3d::ppl_install();   // per-pixel lighting prototype (BLACK_PPL): explosion lights; off: nothing
     if (supported_build) install_checkpoints();
     if (supported_build) install_menu_speed_patch();
     if (supported_build) install_lean_patch();

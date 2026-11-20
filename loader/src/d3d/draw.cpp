@@ -7,6 +7,7 @@
 #include "d3d/dispatch.h"
 #include "d3d/host.h"
 #include "d3d/pshader.h"
+#include "d3d/ppl.h"
 #include "d3d/pushbuf.h"
 #include "d3d/state.h"
 #include "d3d/vshader.h"
@@ -1088,16 +1089,26 @@ bool begin_draw(DrawCtx &ctx)
     IDirect3DDevice9 *d = host3d::dev();
     if (!d) return false;
     if (!g_cfg.skip_caller.empty() && skip_by_caller()) return false;
+    if (ppl_level()) // lighting: once a frame, this frame's camera, lights and shadow cube before this draw's state
+        ppl_frame_prepare(vs_is_fvf(g_st.vertex_shader) ? nullptr : vs_from_handle(g_st.vertex_shader));
     g_draw_serial++;
     apply_render_states(d);
     bool ps = g_st.pixel_shader != 0;
     apply_texture_stages(d, !ps); // may copy a render target (outside the scene) first
     host3d::begin_scene();
+    uint32_t h = g_st.vertex_shader;
+    bool ppl = false;
+    if (ppl_level()) { // per-pixel light pass (d3d/ppl.h); off: nothing here runs
+        VertexShader *pvs = vs_is_fvf(h) ? nullptr : vs_from_handle(h);
+        ppl = ppl_begin_draw(pvs, ps) && vs_host_shader(pvs);
+        if (!ppl) ppl_cancel();
+        ppl_probe(pvs);
+    }
     IDirect3DPixelShader9 *hps = ps ? ps_host_shader() : nullptr;
     set_ps(d, hps);
     if (hps) upload_ps_constants(d);
     else if (ps) apply_pixel_shader_fallback(d);
-    uint32_t h = g_st.vertex_shader;
+    if (hps && ppl) ppl_upload(d);
     if (vs_is_fvf(h)) {
         if (h) {
             set_vs(d, nullptr);
@@ -1110,6 +1121,7 @@ bool begin_draw(DrawCtx &ctx)
         if (IDirect3DVertexShader9 *hv = vs_host_shader(vs)) {
             set_vs(d, hv);
             upload_vs_constants(d);
+            if (ppl_level()) ppl_upload_vs(d);
             ctx.path = Path::Prog;
             ctx.vs = vs;
         }
@@ -1232,6 +1244,9 @@ void __stdcall D3DDevice_DrawVertices(uint32_t PrimitiveType, uint32_t StartVert
     if (ctx.path == Path::Prog) {
         uint32_t stride = convert_vertices(ctx.vs, StartVertex, VertexCount, nullptr, 0);
         debug_draw("DrawVertices", ctx, PrimitiveType, VertexCount, g_conv.data(), stride / 4);
+        if (ppl_level()) // lighting: static level geometry into the shadow cache
+            ppl_capture(ctx.vs, PrimitiveType, nullptr, VertexCount, 0, g_conv.data(), stride,
+                        ((uint64_t)(uintptr_t)stream_data(0) << 32) ^ ((uint64_t)StartVertex << 16) ^ VertexCount ^ 0x5A5A000000000000ull);
         set_decl(host3d::dev(), decl_for(ctx.vs));
         draw_up(PrimitiveType, VertexCount, g_conv.data(), stride);
         return;
@@ -1292,6 +1307,9 @@ void __stdcall D3DDevice_DrawIndexedVertices(uint32_t PrimitiveType, uint32_t Ve
         }
         uint32_t stride = convert_vertices(ctx.vs, mn, mx - mn + 1, nullptr, 0);
         debug_draw("DrawIndexedVertices", ctx, PrimitiveType, VertexCount, g_conv.data(), stride / 4);
+        if (ppl_level()) // lighting: static level geometry into the shadow cache
+            ppl_capture(ctx.vs, PrimitiveType, pIndexData, VertexCount, mn, g_conv.data(), stride,
+                        ((uint64_t)(uintptr_t)pIndexData << 32) ^ ((uint64_t)(uintptr_t)stream_data(0) << 8) ^ VertexCount);
         if (debug_frame_active() && !g_cfg.debug_frame_end) // single debug frames only (ranges stay fast)
             dump_packed_normal_geometry(ctx.vs, PrimitiveType, VertexCount, pIndexData, mn, mx);
         set_decl(host3d::dev(), decl_for(ctx.vs));

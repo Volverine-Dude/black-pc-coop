@@ -50,6 +50,11 @@ float g_cheat_damage = 1.0f;      // read by the damage thunks
 uint32_t g_cheat_world;           // address of the world pointer (*0x2D45D4) in this build
 uint32_t g_cheat_resume[6];       // per thunk: the instruction after the replaced code
 uint32_t g_cheat_global[2];       // the unlock thunks' original absolute operands
+volatile uint8_t g_ppl_count_shots;           // d3d/ppl.cpp: set when the lighting prototype is on
+volatile uint32_t g_ppl_player_shots;         // rounds the player fired (counted only while the above is set)
+volatile uint32_t g_ppl_shot_weapon;          // the weapon object of the player's last round (type = its byte 0)
+volatile uint32_t g_ppl_enemy_shot[16];       // the shooters (character objects) of everyone else's last 16 rounds
+volatile uint32_t g_ppl_enemy_shot_n;         // rounds written to that ring so far
 }
 
 namespace {
@@ -112,9 +117,35 @@ __declspec(naked) void damage_bullet_thunk()
 }
 
 // 0x1EFBB5 (19 bytes): mov eax, [ebp+0xF4]; dec word [eax+0x18]; mov eax, [ebp+0xF4]; dec dword [eax+0x14]
+// Runs once per round any character fires. With the per-pixel lighting prototype on (d3d/ppl.h), the player's
+// rounds are also counted for its muzzle flash (registers and flags kept; off: one compare).
 __declspec(naked) void ammo_gun_thunk()
 {
     __asm {
+        cmp byte ptr [g_ppl_count_shots], 0
+        je no_count
+        pushfd
+        push ecx
+        mov ecx, dword ptr [g_cheat_world]
+        mov ecx, dword ptr [ecx]
+        add ecx, 0x30
+        cmp ecx, dword ptr [ebp + 0xF0]
+        jne not_player
+        inc dword ptr [g_ppl_player_shots]
+        mov dword ptr [g_ppl_shot_weapon], ebp
+        jmp counted
+    not_player:   // anyone else's round: the shooter goes into a 16-entry ring (their muzzle flash)
+        mov ecx, dword ptr [g_ppl_enemy_shot_n]
+        and ecx, 15
+        push eax
+        mov eax, dword ptr [ebp + 0xF0]
+        mov dword ptr [g_ppl_enemy_shot + ecx * 4], eax
+        pop eax
+        inc dword ptr [g_ppl_enemy_shot_n]
+    counted:
+        pop ecx
+        popfd
+    no_count:
         mov eax, dword ptr [ebp + 0xF4]
         cmp byte ptr [g_cheat_ammo_on], 0
         je take

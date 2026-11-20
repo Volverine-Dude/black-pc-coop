@@ -4,6 +4,8 @@
 // and G (alpha). Encodings follow the public NV_register_combiners / Xbox D3DPIXELSHADERDEF definitions.
 #include "d3d/nv2a_psh.h"
 
+#include "d3d/ppl.h"
+
 #include <cstdio>
 
 namespace xd3d {
@@ -82,7 +84,7 @@ std::string final_input(uint32_t b, bool rgb)
 
 } // namespace
 
-std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube)
+std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube, bool ppl)
 {
     std::string s;
     char b[512];
@@ -92,8 +94,10 @@ std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube)
          "sampler2D s2d0 : register(s0); sampler2D s2d1 : register(s1); sampler2D s2d2 : register(s2); sampler2D s2d3 : register(s3);\n"
          "samplerCUBE scu0 : register(s0); samplerCUBE scu1 : register(s1); samplerCUBE scu2 : register(s2); samplerCUBE scu3 : register(s3);\n"
          "struct PSIn { float4 v0 : COLOR0; float4 v1 : COLOR1; float4 tc0 : TEXCOORD0; float4 tc1 : TEXCOORD1;\n"
-         "              float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; };\n"
-         "float4 main(PSIn I) : COLOR0 {\n"
+         "              float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3;";
+    if (ppl) s += std::string(" float4 tc4 : TEXCOORD4; float4 tc5 : TEXCOORD5; };\n") + ppl_ps_decls();
+    else s += " };\n";
+    s += "float4 main(PSIn I) : COLOR0 {\n"
          "  float4 v0 = I.v0, v1 = I.v1;\n"
          "  float4 tc[4] = { I.tc0, I.tc1, I.tc2, I.tc3 };\n"
          "  float4 t0 = 0, t1 = 0, t2 = 0, t3 = 0;\n"
@@ -239,9 +243,11 @@ std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube)
         s += "    float3 A = " + final_input(abcd >> 24, true) + ", B = " + final_input((abcd >> 16) & 0xFF, true) + ", C = " +
              final_input((abcd >> 8) & 0xFF, true) + ", D = " + final_input(abcd & 0xFF, true) + ";\n";
         s += "    float G = " + final_input((efg >> 8) & 0xFF, false) + ";\n";
-        s += "    return saturate(float4(A * B + (1 - A) * C + D, G));\n  }\n";
+        if (ppl) s += std::string("    float4 res = saturate(float4(A * B + (1 - A) * C + D, G));\n") + ppl_ps_epilogue() + "    return res;\n  }\n";
+        else s += "    return saturate(float4(A * B + (1 - A) * C + D, G));\n  }\n";
     } else {
-        s += "  return saturate(r0);\n";
+        if (ppl) s += std::string("  float4 res = saturate(r0);\n") + ppl_ps_epilogue() + "  return res;\n";
+        else s += "  return saturate(r0);\n";
     }
     s += "}\n";
     return s;

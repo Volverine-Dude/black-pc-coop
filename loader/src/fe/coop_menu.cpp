@@ -597,6 +597,14 @@ void coop_menu_change(int id, int dir)
         show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");
         return;
     }
+    if (id == 4) {   // the CO-OP page: LIGHTING on / off (per-pixel dynamic lights and bump, d3d/ppl.h; solo play too)
+        (void)dir;
+        g_cfg.ppl = g_cfg.ppl ? 0 : 1;
+        settings_save();
+        logf("coop menu: LIGHTING %s", g_cfg.ppl ? "ON" : "OFF");
+        show(3, g_cfg.ppl ? "ON" : "OFF");
+        return;
+    }
     if (g_page != JoinCode) return;
     if (id == 407) {   // READY: in the lobby only, until the host starts
         if (g_join == Join::InLobby && !g_started) { g_ready = !g_ready; logf("coop menu: JOIN: %s", g_ready ? "READY" : "not ready"); }
@@ -661,7 +669,10 @@ void coop_menu_poll()
             fe_goto(to);
         }
     }
-    if (g_page == Menu || g_page == Menu + 1) show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");   // the CO-OP page's HIT MARKER row
+    if (g_page == Menu || g_page == Menu + 1) {   // the CO-OP page's HIT MARKER and LIGHTING rows
+        show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");
+        show(3, g_cfg.ppl ? "ON" : "OFF");
+    }
     if (g_page != HostLobby && g_page != JoinCode) { g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = 0; return; }
     ULONGLONG now = GetTickCount64();
     if (g_page == HostLobby) host_poll(now);

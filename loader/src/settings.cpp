@@ -60,6 +60,7 @@ void settings_load()
         else if (k == "aa") g_cfg.aa = v != 0;
         else if (k == "seamfill") g_cfg.seam_fill = v != 0;
         else if (k == "effectsnative") g_cfg.effects_native = v != 0;
+        else if (k == "ppl") g_cfg.ppl = std::clamp(atoi(val), 0, 2);   // the CO-OP page's LIGHTING (d3d/ppl.h); 2 = + a head lamp (tests)
         else if (k == "fps") g_cfg.fps = fps_setting(atoi(val));
         else if (k == "widescreen") g_cfg.widescreen = v != 0;
         else if (k == "language") { if (language_valid(val)) g_cfg.language = val; }
@@ -128,6 +129,7 @@ void settings_save()
     fprintf(f, "seamfill = %d\n", g_cfg.seam_fill ? 1 : 0);
     fprintf(f, "effectsnative = %d\n", g_cfg.effects_native ? 1 : 0);
     fprintf(f, "hitmarker = %d\n", g_cfg.coop_hitmarker ? 1 : 0);
+    fprintf(f, "ppl = %d\n", g_cfg.ppl);
     fprintf(f, "coop_sprint = %d\n", g_cfg.coop_sprint ? 1 : 0);
     fprintf(f, "coop_difficulty = %d\n", g_cfg.coop_diffmode);
     fprintf(f, "coop_special_weapons = %d\n", g_cfg.coop_special ? 1 : 0);

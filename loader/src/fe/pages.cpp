@@ -1545,7 +1545,8 @@ bool fe_build_pages(const std::wstring &game_dir, const std::wstring &out_root)
         // for a kill" - on the CO-OP page (the join page has no free row): left / right toggles, saved in black.ini
         const std::vector<RowSpec> coop_rows = {{RowSpec::Link, 1, "HOST GAME", "", "CoopHost"},
                                                 {RowSpec::Link, 2, "JOIN GAME", "", "CoopJoin"},
-                                                {RowSpec::Choice, 3, "HIT MARKER", "&PC_V2", "PCCoopChange"}};
+                                                {RowSpec::Choice, 3, "HIT MARKER", "&PC_V2", "PCCoopChange"},
+                                                {RowSpec::Choice, 4, "LIGHTING", "&PC_V3", "PCCoopChange"}};   // dynamic lights (d3d/ppl.h), solo too
         for (int k = 0; k < 2; k++) {
             Movie page(sound);
             choice_page(page, "CO-OP", coop_rows, k ? "BlackTitleMenu2" : "BlackTitleMenu", true, 200 + k);

@@ -6,6 +6,7 @@
 #include "kernel/kexports.h"
 
 #include "d3d/compiler.h"
+#include "d3d/ppl.h"
 #include "d3d/shader_cache.h"
 
 #include <cstring>
@@ -118,6 +119,7 @@ void vs_delete(VertexShader *vs)
 {
     if (!vs) return;
     if (vs->host_vs) vs->host_vs->Release();
+    if (vs->host_vs_ppl) vs->host_vs_ppl->Release();
     if (vs->program) xk::ExFreePool(vs->program);
     vs->magic = 0;
     xk::ExFreePool(vs);
@@ -133,24 +135,29 @@ uint32_t vs_input_mask(const VertexShader *vs)
 IDirect3DVertexShader9 *vs_host_shader(VertexShader *vs)
 {
     if (!vs || !vs->program) return nullptr;
-    if (vs->host_vs || vs->translate_failed) return vs->host_vs;
-    std::string hlsl = vsh_to_hlsl(vs->program, vs->program_insts, vs_input_mask(vs));
+    // LIGHTING (d3d/ppl.h) on: the variant that also passes the view-space position; it can be switched in play,
+    // so both translations are kept (off: the plain one, exactly as before)
+    bool ppl = ppl_level() != 0;
+    IDirect3DVertexShader9 *&host = ppl ? vs->host_vs_ppl : vs->host_vs;
+    bool &failed = ppl ? vs->ppl_failed : vs->translate_failed;
+    if (host || failed) return host;
+    std::string hlsl = vsh_to_hlsl(vs->program, vs->program_insts, vs_input_mask(vs), ppl);
     std::vector<uint8_t> code;
     std::string errors;
     bool ok = compile_cached(hlsl, "nv2a_vsh", {"vs_2_0", "vs_2_a"}, code, errors);   // disk cache, see shader_cache.h
     if (!ok) {
-        vs->translate_failed = true;
+        failed = true;
         logf("[vsh] compile failed for shader %p: %s", vs, errors.c_str());
         static std::atomic<int> dumped{0};
         if (dumped++ < 3) logf("[vsh] HLSL:\n%s", hlsl.c_str());
-    } else if (FAILED(host3d::dev()->CreateVertexShader((const DWORD *)code.data(), &vs->host_vs))) {
-        vs->translate_failed = true;
+    } else if (FAILED(host3d::dev()->CreateVertexShader((const DWORD *)code.data(), &host))) {
+        failed = true;
         logf("[vsh] CreateVertexShader failed for shader %p", vs);
     } else {
         static std::atomic<int> n{0};
         if (++n <= 30) logf("[vsh] shader %p translated (%u instructions)", vs, vs->program_insts);
     }
-    return vs->host_vs;
+    return host;
 }
 
 } // namespace xd3d

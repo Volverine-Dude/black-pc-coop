@@ -202,7 +202,7 @@ const char *hlsl_out(uint8_t a)
 
 } // namespace
 
-std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_mask)
+std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_mask, bool ppl_pos)
 {
     std::string s;
     s += "float4 c[192] : register(c0);\n"
@@ -224,8 +224,11 @@ std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_
          "struct VSOut {\n"
          "  float4 pos : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
          "  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-         "  float fog : FOG; float pts : PSIZE;\n"
-         "};\n"
+         "  float fog : FOG; float pts : PSIZE;\n";
+    if (ppl_pos) s += "  float4 t4 : TEXCOORD4; float4 t5 : TEXCOORD5;\n"; // view position; light -> pixel, world (d3d/ppl.h)
+    s += "};\n";
+    if (ppl_pos) s += "float4 pplProj : register(c201); float4 pplIV[3] : register(c202); float4 pplSL : register(c205);\n"; // d3d/ppl.h ppl_upload_vs
+    s += ""
          "VSOut main(VSIn I) {\n";
     for (int i = 0; i < 16; i++) {
         if (input_mask & (1u << i)) s += "  float4 v" + std::to_string(i) + " = I.v" + std::to_string(i) + ";\n";
@@ -338,6 +341,9 @@ std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_
          "  o.t0 = oT0 * float4(texScale[0].xy, 1, 1); o.t1 = oT1 * float4(texScale[1].xy, 1, 1);\n"
          "  o.t2 = oT2 * float4(texScale[2].xy, 1, 1); o.t3 = oT3 * float4(texScale[3].xy, 1, 1);\n"
          "  o.pts = oPts.x;\n";
+    if (ppl_pos) // view space from the clip position before the gun's vmScale: x = clip x / P00, y = clip y / P11, z = w
+        s += "  o.t4 = float4((oPos.xy - vpOffset.xy) / vpScale.xy * w * pplProj.xy, w, 1);\n"
+             "  o.t5 = float4(dot(pplIV[0], o.t4), dot(pplIV[1], o.t4), dot(pplIV[2], o.t4), 1) - float4(pplSL.xyz, 0);\n";
     // The NV2A fog unit turns the oFog coordinate into a factor with the table mode; D3D9 ignores oFog
     // under table fog, so compute the factor here (the device runs vertex fog on this path).
     if (writes_fog)
