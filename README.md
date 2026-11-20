@@ -16,7 +16,9 @@ What co-op does:
 
 - Shared world: enemies, triggers, objectives, pickups, props and explosions are kept in sync, with the host deciding.
 - The level streams its parts for both players; whoever falls behind is pulled to the partner, the one in front is never pulled back.
-- Downed instead of dead: the partner revives you, or you come back when a main objective is completed; both downed = mission failed, and the host's restart restarts both.
+- Downed instead of dead, with a revive: a downed player has 15 seconds. The partner revives them by standing next to them while a 5-second bar fills; it costs the reviver 25% of their health (not possible at 25% or less), and the revived player gets up with 75%. After the 15 seconds the downed player is out until the next main objective is completed. Both downed = mission failed, and the host's restart restarts both.
+- Host lobby options: DIFFICULTY (VANILLA = the regular game; CO-OP = players take more damage, enemies attack faster, and there are more enemies: each enemy can come with extra copies from the same spot, x1.5 on Normal, x2 on Hard, x2.5 on Black Ops, while the game has room for them) and SPECIAL WEAPONS (silver / gold weapons on or off).
+- Silencers are synced: the joiner's silenced shots stay quiet for the enemies, as the host's do, and each player's silencer shows on the partner's character.
 - Shared level exit with a 20-second countdown, then results and back to the lobby together.
 - Co-op sprint, a hit marker, and shared cinematic skips.
 
@@ -26,14 +28,14 @@ What co-op does:
 2. Allow `black.exe` on **private** networks when Windows Firewall asks (UDP ports 44100, 44000 and 44001).
 3. **Host:** title menu > CO-OP > HOST GAME > LAN. The lobby shows a 6-character code.
 4. **Joiner:** title menu > CO-OP > JOIN GAME > LAN, type the code, CONNECT, set READY to YES.
-5. **Host:** START MISSION, then pick the mission and difficulty. The joiner follows automatically.
+5. **Host:** set DIFFICULTY and SPECIAL WEAPONS in the lobby, then START MISSION and pick the mission and difficulty. The joiner follows automatically.
 
-README-COOP.txt in the zip has the details (revives, the level exit, sprint, the hit marker).
+README-COOP.txt in the zip has the details (the revive, the lobby options, the level exit, sprint, the hit marker).
 
 ## Known limits
 
 - LAN only for now (no internet play).
-- The game allows at most 16 live characters, and co-op uses 2 of them for the partner. If you run past enemies instead of fighting them, the remaining enemies keep their places and later enemies may not spawn.
+- The game allows at most 16 live characters, and co-op uses 2 of them for the partner. If you run past enemies instead of fighting them, the remaining enemies keep their places and later enemies may not spawn. The CO-OP enemy copies use the same 16 places, so they only come while there is room (4 places are always kept for the mission's own enemies).
 - The partner's grenade-launcher rounds hit for both players, but the flying round itself is only drawn on the shooter's screen.
 - The joiner's pause menu has been seen to freeze once; if it happens, please report it with a screenshot.
 - Report problems with `port\black.log` from **both** PCs.

@@ -1637,7 +1637,6 @@ static void coop_hitmarker(const RECT &pic)
     float pop = kill ? 1.25f : 1.0f;
     float r1 = 5.0f * s * pop, r2 = 12.0f * s * pop, hw = (kill ? 1.3f : 1.0f) * s;   // inner / outer radius, half width
     D3DCOLOR col = ((uint32_t)(a * 255.0f) << 24) | (kill ? 0xFF2A2A : 0xFFFFFF);
-    D3DCOLOR sh = ((uint32_t)(a * 150.0f) << 24);       // a dark outline so it reads on bright scenes
     std::vector<CoopFontV> tri;
     auto stroke = [&](float dx, float dy, float w, D3DCOLOR c, float grow) {
         float px = -dy * w, py = dx * w;               // perpendicular (dx, dy is a unit diagonal)
@@ -1649,7 +1648,7 @@ static void coop_hitmarker(const RECT &pic)
     };
     const float k = 0.70710678f;
     const float dirs[4][2] = {{k, k}, {-k, k}, {k, -k}, {-k, -k}};
-    for (auto &d : dirs) stroke(d[0], d[1], hw + 1.0f * s, sh, 1.0f * s);   // outline
+    // owner 20261120: "remove the outline on the hit markers" - only the white / red strokes are drawn
     for (auto &d : dirs) stroke(d[0], d[1], hw, col, 0.0f);
     coop_font_draw(tri, nullptr, nullptr, 0);
 }
