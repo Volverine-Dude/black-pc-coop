@@ -1648,7 +1648,8 @@ static void coop_hitmarker(const RECT &pic)
     };
     const float k = 0.70710678f;
     const float dirs[4][2] = {{k, k}, {-k, k}, {k, -k}, {-k, -k}};
-    // owner 20261120: "remove the outline on the hit markers" - only the white / red strokes are drawn
+    D3DCOLOR sh = ((uint32_t)(a * 150.0f) << 24);       // a dark outline so it reads on bright scenes
+    for (auto &d : dirs) stroke(d[0], d[1], hw + 1.0f * s, sh, 1.0f * s);   // outline (owner 20261120: the original width again)
     for (auto &d : dirs) stroke(d[0], d[1], hw, col, 0.0f);
     coop_font_draw(tri, nullptr, nullptr, 0);
 }

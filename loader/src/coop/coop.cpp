@@ -235,7 +235,7 @@ static int coop_logic_list(int k, uint32_t *arr);   // the class list k of the l
 static void coop_enemy_recv(const EnemyRec *e, int n);
 static void coop_enemy_send(uint32_t pobj, uint32_t seq);
 static void coop_enemy_tick(uint32_t pobj);
-struct EnemyRay { uint32_t body; ShotRay r; };
+struct EnemyRay { uint32_t body; ShotRay r; float tp[3]; uint32_t tok; };   // tp: the clone's chest on the host when the shooter targets it (tok 1)
 // play 20261111_201304: arg 2 ("part") is a POINTER to a vec4 (FUN_001ed990 scales it at
 // 0x1edb5f -> FUN_00011a70, movaps [edx]); the host's value 0343faf0 was host-process memory
 // and the joiner crashed reading it. It now travels as a 16-byte copy (pvec, pvec_ok).
@@ -343,7 +343,7 @@ static uint32_t g_freed_src[4];   // class agents handed back by coop_free_class
 static void coop_clone_gunshot(void);
 static EnemyRay g_enray_out[64]; static int g_enray_out_n;          // host: this frame's enemy pellets
 static EnemyRay g_enray_in[128]; static uint64_t g_enray_ms[128]; static int g_enray_r, g_enray_w;   // joiner
-static uint32_t g_enray_stats[4];   // sent, received, used by puppets, puppet pellets without a ray
+static uint32_t g_enray_stats[5];   // sent, received, used by puppets, puppet pellets without a ray, rays shifted onto us
 static bool is_enemy(uint32_t b, uint32_t pobj);
 static uint32_t enemy_slots(uint32_t out[16]);
 static uint32_t g_kill_dbg_victim; static int g_kill_dbg_dmg;
@@ -675,6 +675,7 @@ static void coop_aim_body(uint32_t body, float yaw, float pitch)
         // "aim_pitch" + our spine bend); the respawn (peer downed -> 0) gives the drive back.
         static int downed_pose;
         extern volatile uint32_t g_coop_peer_downed;
+        extern volatile uint32_t g_coop_peer_anim; extern volatile uint64_t g_coop_peer_anim_ms;
         if (g_coop_peer_downed) {
             pitch = coop_downed_pitch();
             *(volatile uint8_t *)(uintptr_t)(o + 0x40) = 1;
@@ -692,8 +693,17 @@ static void coop_aim_body(uint32_t body, float yaw, float pitch)
                 if (cl++ < 5 && !downed_pose) logf("coop: clone %08x was crouching (link +0x40 %u, body +0x3A1 %u - a frozen donor state) - standing it up",
                                                    body, *(volatile uint8_t *)(uintptr_t)(o + 0x40), *(volatile uint8_t *)(uintptr_t)(body + 0x3A1));
             }
-            *(volatile uint8_t *)(uintptr_t)(o + 0x40) = 0;
-            *(volatile uint8_t *)(uintptr_t)(body + 0x3A1) = 0;
+            // owner 20261120: the clone crouches when its player crouches (packet anim bit 8; the soldier graph plays its
+            // own crouch idle / crouch walk from the anim input "crouching"). COOP_CROUCH_SYNC=0 = off (always standing).
+            uint8_t cr = 0;
+            {   static int cs = -1; if (cs < 0) { char e[8] = {0}; cs = !(GetEnvironmentVariableA("COOP_CROUCH_SYNC", e, sizeof e) && e[0] == '0'); }
+                bool fresh = g_coop_peer_anim_ms && GetTickCount64() - g_coop_peer_anim_ms < 500;
+                cr = cs && fresh && (g_coop_peer_anim & 8u) ? 1 : 0;
+                static uint8_t lastcr; static int crl;
+                if (cr != lastcr && crl < 100) { crl++; logf("coop: crouch sync: the partner %s - clone %08x %s", cr ? "crouches" : "stands up", body, cr ? "crouches" : "stands"); }
+                lastcr = cr; }
+            *(volatile uint8_t *)(uintptr_t)(o + 0x40) = cr;
+            *(volatile uint8_t *)(uintptr_t)(body + 0x3A1) = cr;
             if (downed_pose) {
                 downed_pose = 0;
                 logf("coop: downed pose: the partner is back - clone %08x restored", body);
@@ -942,6 +952,7 @@ static void coop_loco_body(uint32_t body, float vx, float vz)
     static float body_yaw = 1000.0f;      // 1000 = not set yet: start from the current value
     if (body_yaw > 999.0f) body_yaw = *(volatile float *)(uintptr_t)(o + 0x18);
     int clip_cls = 0;
+    bool back = false;   // a backpedal: the legs on the aim, moving away from it -> the walk cycle in reverse
     {   // the partner-model clips: reload > sprint > backward / sideways (the forward walk and idle stay the graph's)
         bool fresh = g_coop_peer_anim_ms && GetTickCount64() - g_coop_peer_anim_ms < 500;
         uint32_t bits = fresh ? g_coop_peer_anim : 0;
@@ -982,7 +993,7 @@ static void coop_loco_body(uint32_t body, float vx, float vz)
             // beyond that keeps the legs on the aim. Was 60.
             static float lim = -1.0f;
             if (lim < 0.0f) { char e[16] = {0}; lim = GetEnvironmentVariableA("COOP_STRAFE_DEG", e, sizeof e) ? (float)atof(e) : 135.0f; }
-            if (fabsf(dd) > lim) body_yaw = aim;
+            if (fabsf(dd) > lim) { body_yaw = aim; back = true; }
             // owner (play 20261114_151810, all weapons): "strafing to the right rotates the upper body of the clone
             // while it should stay on his player aim". The spine twist the bend asks = (aim - legs) - blade (the held
             // pose's gun yaw, ~-20, the Naszran SMG -78), capped at 90: legs on a sideways move asked 110 one way
@@ -1003,6 +1014,47 @@ static void coop_loco_body(uint32_t body, float vx, float vz)
         }
     }
     coop_clone_clip(body, clip_cls, sp > 0.0f);
+    {   // REVERSE WALK (owner 20261120: "make the clone's backward animation using the walk animation in reverse"). The
+        // anim block's clip time +0x14 (= +0x18) counts frames up (~1 per tick, never wrapped by the game: the sampler
+        // loops it by the clip length, blk +0x1C = 40 for the walk d90d3c24, 82 for the idle). While backpedalling we take the
+        // game's step dt (now - what we wrote) and write now - 2*dt, so the sampled time runs DOWN by dt per tick.
+        // COOP_REVERSE_WALK=0 = off.
+        static int rw = -1; if (rw < 0) { char e[8] = {0}; rw = !(GetEnvironmentVariableA("COOP_REVERSE_WALK", e, sizeof e) && e[0] == '0'); }
+        static float wrote = -1.0f; static uint32_t wclip; static int rl; static bool was;
+        uint32_t blk = rw && back && sp > 0.0f ? coop_anim_blk(body) : 0;
+        uint32_t clip = 0, asset = 0; float t = 0.0f, len = 0.0f;
+        if (blk && coop_safe_copy(&asset, blk + 0x0C, 4) && coop_safe_copy(&clip, blk + 0x10, 4) && coop_safe_copy(&t, blk + 0x14, 4) &&
+            coop_safe_copy(&len, blk + 0x1C, 4) && len >= 4.0f && len < 2000.0f && t == t) {
+            float dt = (wrote >= 0.0f && clip == wclip) ? t - wrote : 1.0f;
+            if (dt < 0.0f || dt > 4.0f) dt = 1.0f;
+            float nt = t - 2.0f * dt;
+            while (nt < len) nt += 16.0f * len;          // stay positive (whole loops keep the phase)
+            while (nt > 64.0f * len) nt -= 32.0f * len;
+            *(volatile float *)(uintptr_t)(blk + 0x14) = nt;
+            *(volatile float *)(uintptr_t)(blk + 0x18) = nt;
+            wrote = nt; wclip = clip;
+            if (!was && rl < 60) { rl++; logf("coop: reverse walk: the partner backpedals - clip %08x (len %.0f) on clone %08x runs backward (t %.2f)", clip, len, body, t); }
+            was = true;
+        } else {
+            if (was && rl < 60) { rl++; logf("coop: reverse walk: off again (clone %08x)", body); }
+            was = false; wrote = -1.0f;
+        }
+    }
+    {   // COOP_ANIMT_PROBE=1 (diagnostics): the clone's anim block clip timer, every frame while moving (300 lines)
+        static int pr = -1; if (pr < 0) { char e[8] = {0}; pr = GetEnvironmentVariableA("COOP_ANIMT_PROBE", e, sizeof e) && e[0] == '1'; }
+        static int pl;
+        uint32_t blk = pr ? coop_anim_blk(body) : 0;
+        if (blk && sp > 0.0f && pl < 300) {
+            uint32_t f[8] = {0}; coop_safe_copy(f, blk + 0x08, 32);
+            float *ff = (float *)f;
+            if (pl++ == 0) { uint32_t a[16] = {0}; if (f[1] >= 0x80000000 && f[1] < 0x84000000) coop_safe_copy(a, f[1], 64);
+                logf("coop: animt: clip asset %08x: %08x %08x %08x %08x %08x %08x %08x %08x | %08x %08x %08x %08x %08x %08x %08x %08x", f[1],
+                     a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]); }
+            LARGE_INTEGER q, fq; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&fq);
+            logf("coop: animt: t %.3f blk %08x +08 %08x +0C %08x +10 %08x +14 %.4f +18 %.4f +1C %08x (%.4f) +20 %.4f +24 %.4f | speed %.2f clip_cls %d",
+                 (double)q.QuadPart / fq.QuadPart, blk, f[0], f[1], f[2], ff[3], ff[4], f[5], ff[5], ff[6], ff[7], sp, clip_cls);
+        }
+    }
     coop_reload_donor_step();   // the partner's reload: the clone's upper body from the donor
     if (sp > 0.0f) {   // legs probe (every 0.5 s while moving): move direction, aim, legs, speed
         static uint64_t lt; static uint32_t ln;
@@ -2336,10 +2388,11 @@ static void coop_spawn_force(void)
 // spawn FUN_001b3030 (ESI = spawner) - it does not touch the spawner's spawns-left (+0x2C, only its tick FUN_001b3070
 // counts down), so the mission's own enemies are unchanged; +0x24 then points at the copy. A copy waits until the enemy
 // before it has left the spawn point (1.5 m, at least 1.5 s; given up after 8 s if it stays) and until the entity pool
-// has more than COOP_COPY_RESERVE (4) free entries (given up after 30 s). Copies are counted like any spawn, so the
+// has more than COOP_COPY_RESERVE (3; owner 20261120 "try reserve 3", was 4) free entries (given up after 30 s). Copies are counted like any spawn, so the
 // spawn-count ledger carries them to the joiner: there a spawner behind the host while its enemy still lives spawns its
 // copy the same way (the same spawner -> the same (ctx, ordinal) id). Cleared at part switches and level loads.
 // COOP_COPIES=0 = off; COOP_COPY_MUL=<x> forces the multiplier (tests, any difficulty mode).
+extern volatile uint32_t g_coop_peer_anim; extern volatile uint64_t g_coop_peer_anim_ms;
 struct CopyJob { uint32_t obj, part, pend, last_body, copy_body; float acc; uint64_t born; float at[3]; };
 static CopyJob g_copy[48]; static int g_copy_n; static uint64_t g_copy_part_ms; static uint32_t g_copy_made, g_copy_dropped;
 static float coop_diff_damage_mul(void);
@@ -2362,10 +2415,11 @@ static int coop_pool_free(void)
     int n = 0; for (uint32_t i = 0; i < pl[2]; i++) if (!used[i]) n++;
     return n;
 }
+int coop_pool_free_ext(void) { return coop_pool_free(); }
 static int coop_copy_reserve(void)
 {
     static int r = -1;
-    if (r < 0) { char e[16] = {0}; r = GetEnvironmentVariableA("COOP_COPY_RESERVE", e, sizeof e) ? atoi(e) : 4; if (r < 0) r = 0; }
+    if (r < 0) { char e[16] = {0}; r = GetEnvironmentVariableA("COOP_COPY_RESERVE", e, sizeof e) ? atoi(e) : 3; if (r < 0) r = 0; }
     return r;
 }
 static CopyJob *coop_copy_job(uint32_t obj, bool make)
@@ -2439,8 +2493,16 @@ static void coop_copy_step(void)   // HOST: make the planned copies
         }
         if (!r) continue;
         int fr = coop_pool_free();
+        {   // two-PC play 20261120 (-66, owner: "some enemies desync"): the joiner's pool was full when the host had room -> its
+            // catch-up spawn of the copy waited ("the entity pool is full - 1 spawner(s) behind the host wait") and that enemy
+            // was missing on the joiner. The joiner's free entries ride in its packet (anim bits 8..15, +1): a copy needs room
+            // on BOTH copies.
+            bool fresh = g_coop_peer_anim_ms && now - g_coop_peer_anim_ms < 1000;
+            int pf = fresh ? (int)((g_coop_peer_anim >> 8) & 0xFF) - 1 : -1;
+            if (pf >= 0 && pf < fr) fr = pf;
+        }
         if (fr <= coop_copy_reserve()) {
-            static uint64_t pl; if (now - pl > 10000) { pl = now; logf("coop: copies: %d free pool entr%s (reserve %d) - copies wait", fr, fr == 1 ? "y" : "ies", coop_copy_reserve()); }
+            static uint64_t pl; if (now - pl > 10000) { pl = now; logf("coop: copies: %d free pool entr%s (the fuller of both copies; reserve %d) - copies wait", fr, fr == 1 ? "y" : "ies", coop_copy_reserve()); }
             continue;
         }
         if (!coop_spawner_live(j->obj)) continue;
@@ -5063,6 +5125,20 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
             int wst = (Wa >= 0x80000000 && Wa < 0x84000000) ? *(volatile int *)(uintptr_t)(Wa + 0xD8) : 0;
             pkt.anim = (g_coop_sprinting ? 1u : 0u) | (wst == 4 ? 2u : 0u);
             if (Wa >= 0x80000000 && Wa < 0x84000000 && *(volatile uint8_t *)(uintptr_t)(Wa + 0x108)) pkt.anim |= 4u;   // our weapon is SILENCED
+            // owner 20261120: "sync the model with the crouch status of each player" - our controller +0x40 = crouching
+            // (FUN_001CC490 picks the crouch speeds from it; the same byte the AI link uses -> body +0x3A1)
+            if (ctrl >= 0x80000000 && ctrl < 0x84000000 && *(volatile uint8_t *)(uintptr_t)(ctrl + 0x40)) pkt.anim |= 8u;
+            {   // COOP_FAKE_CROUCH=<from>-<to> (test, seconds since the session start): send the crouch bit in that window
+                static float fc0 = -2.0f, fc1 = -1.0f;
+                if (fc0 < -1.5f) { char e[32] = {0}; fc0 = -1.0f; if (GetEnvironmentVariableA("COOP_FAKE_CROUCH", e, sizeof e)) sscanf(e, "%f-%f", &fc0, &fc1); }
+                float ts = g_coop_t0 ? (float)(GetTickCount64() - g_coop_t0) / 1000.0f : -1.0f;
+                if (fc0 >= 0.0f && ts >= fc0 && ts <= fc1) pkt.anim |= 8u;
+            }
+            {   // our free entity-pool entries (+1, 0 = unknown): the host's copies need room on BOTH copies
+                extern int coop_pool_free_ext(void);
+                int fr = coop_pool_free_ext(); if (fr < 0) fr = 0; if (fr > 250) fr = 250;
+                pkt.anim |= (uint32_t)(fr + 1) << 8;
+            }
             {   // COOP_FAKE_RELOAD=<from>-<to> (test, seconds since the session start): send the reload bit in that window
                 static float fr0 = -2.0f, fr1 = -1.0f;
                 if (fr0 < -1.5f) { char e[32] = {0}; fr0 = -1.0f; if (GetEnvironmentVariableA("COOP_FAKE_RELOAD", e, sizeof e)) sscanf(e, "%f-%f", &fr0, &fr1); }
@@ -5178,8 +5254,8 @@ extern "C" void coop_on_player_update(uint32_t ctrl)
         }
         static uint32_t erl;
         if ((erl++ % 300) == 0 && (g_enray_stats[0] | g_enray_stats[1]))
-            logf("coop: enemy ray: sent %u received %u used by puppets %u | puppet pellets without a host ray %u",
-                 g_enray_stats[0], g_enray_stats[1], g_enray_stats[2], g_enray_stats[3]);
+            logf("coop: enemy ray: sent %u received %u used by puppets %u (shifted onto us %u) | puppet pellets without a host ray %u",
+                 g_enray_stats[0], g_enray_stats[1], g_enray_stats[2], g_enray_stats[4], g_enray_stats[3]);
         static uint32_t sl;
         if ((sl++ % 120) == 0 && (g_shot_stats[0] | g_shot_stats[1]))
             logf("coop: hit sync: rays sent %u received %u used by clone pellets %u (extra replay shots %u) dropped stale %u | joiner hits on enemies %u (damage %.0f)",
@@ -8114,10 +8190,68 @@ static void coop_hr_shot(uint32_t shooter, uint32_t pobj)
     else g_hr_other++;
     if (GetTickCount64() - g_hr_log_ms > 30000) coop_hr_log("30 s");
 }
+// AIM MISS (owner 20261120: "some enemies take their time to start shooting at the joiner"; hit rates in mission 1:
+// HOST still 8-31 %, JOINER still 1-3 %). Log only, HOST: for every enemy pellet whose shooter targets a player (brain
+// +0x2A8 vs +0x378), how far the final ray passes that player's chest (feet + 1.3 m) and how far the weapon's aim point
+// (W +0x10) is from it. "coop: aim miss (30 s): HOST n .. ray mean .. m (<0.4 m ..%) aim pt mean .. | JOINER ...".
+static double g_am_ray[2], g_am_pt[2]; static uint32_t g_am_n[2], g_am_close[2]; static uint64_t g_am_log;
+// HITBOX PROBE (owner 20261120: "apply the same hitbox from the host to the joiner model"): the last enemy ray at each
+// player - its closest pass to the player's vertical axis (horizontal distance) and the height there above the feet;
+// a hit on that player logs it ("coop: hitbox: HOST hit by .. - ray passed .. m from the axis at .. m height").
+struct HbRay { uint32_t shooter; uint64_t ms; float horiz, height; };
+static HbRay g_hb_last[2];
+static void coop_hb_note(int k, uint32_t shooter, const float *feet, const volatile float *o, const volatile float *d)
+{
+    float dxz = d[0] * d[0] + d[2] * d[2];
+    if (dxz < 1e-6f) return;
+    float t = ((feet[0] - o[0]) * d[0] + (feet[2] - o[2]) * d[2]) / dxz;
+    float px = o[0] + t * d[0] - feet[0], pz = o[2] + t * d[2] - feet[2];
+    HbRay &r = g_hb_last[k];
+    r.shooter = shooter; r.ms = GetTickCount64(); r.horiz = sqrtf(px * px + pz * pz); r.height = o[1] + t * d[1] - feet[1];
+}
+static void coop_aim_miss(uint32_t shooter, uint32_t pobj, uint32_t W, const volatile float *o, const volatile float *d)
+{
+    if (g_cfg.coop_role != 1) return;
+    uint32_t br = 0, ti = 0xFFFFFFFF, hi = 0xFFFFFFFE, ci = 0xFFFFFFFD;
+    coop_safe_copy(&br, shooter + 0x324, 4);
+    if (br >= 0x80000000 && br < 0x84000000) coop_safe_copy(&ti, br + 0x2A8, 4);
+    if (pobj >= 0x80000000 && pobj < 0x84000000) coop_safe_copy(&hi, pobj + 0x378, 4);
+    if (g_p10_gdst >= 0x80000000 && g_p10_gdst < 0x84000000) coop_safe_copy(&ci, g_p10_gdst + 0x378, 4);
+    int k = ti == hi ? 0 : ti == ci ? 1 : -1;
+    if (k < 0) return;
+    uint32_t tb = k == 0 ? pobj : g_p10_gdst;
+    float f[3] = {0};
+    if (!coop_safe_copy(f, tb + 0xA0, 12)) return;
+    float c[3] = {f[0] - o[0], f[1] + 1.3f - o[1], f[2] - o[2]};
+    float t = c[0] * d[0] + c[1] * d[1] + c[2] * d[2];
+    float q[3] = {c[0] - t * d[0], c[1] - t * d[1], c[2] - t * d[2]};
+    float m = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+    const volatile float *ap = (const volatile float *)(uintptr_t)(W + 0x10);
+    float pd[3] = {ap[0] - f[0], ap[1] - (f[1] + 1.3f), ap[2] - f[2]};
+    float pm = sqrtf(pd[0] * pd[0] + pd[1] * pd[1] + pd[2] * pd[2]);
+    float dist = sqrtf(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    coop_hb_note(k, shooter, f, o, d);
+    g_am_n[k]++; g_am_ray[k] += m; g_am_pt[k] += pm; if (m < 0.4f) g_am_close[k]++;
+    static int sl[2];
+    if (sl[k] < 40 && (g_am_n[k] % 5) == 1) { sl[k]++;
+        logf("coop: aim miss: %s shooter %08x dist %.1f m - ray passes the chest at %.2f m (behind %s), aim point off by %.2f m (%.2f %.2f %.2f)",
+             k ? "JOINER" : "HOST", shooter, dist, m, t < 0.0f ? "the shooter" : "ok", pm, pd[0], pd[1], pd[2]); }
+    uint64_t now = GetTickCount64();
+    if (now - g_am_log > 30000) {
+        g_am_log = now;
+        logf("coop: aim miss (30 s): HOST n %u ray mean %.2f m (<0.4 m %u%%) aim pt mean %.2f m | JOINER n %u ray mean %.2f m (<0.4 m %u%%) aim pt mean %.2f m",
+             g_am_n[0], g_am_n[0] ? g_am_ray[0] / g_am_n[0] : 0.0, g_am_n[0] ? 100 * g_am_close[0] / g_am_n[0] : 0, g_am_n[0] ? g_am_pt[0] / g_am_n[0] : 0.0,
+             g_am_n[1], g_am_n[1] ? g_am_ray[1] / g_am_n[1] : 0.0, g_am_n[1] ? 100 * g_am_close[1] / g_am_n[1] : 0, g_am_n[1] ? g_am_pt[1] / g_am_n[1] : 0.0);
+    }
+}
 static void coop_hr_hit(int k, uint32_t attacker, uint32_t pobj)
 {
     if (!coop_hr_enabled() || attacker < 0x80000000 || attacker >= 0x84000000 || !is_enemy(attacker, pobj)) return;
     g_hr_hits[k][coop_hr_moving(k, k == 0 ? pobj : g_p10_gdst)]++;
+    {   const HbRay &r = g_hb_last[k & 1];
+        static uint32_t hl[2];
+        if (r.shooter == attacker && GetTickCount64() - r.ms < 300 && hl[k & 1]++ < 150)
+            logf("coop: hitbox: %s hit by %08x - its ray passed %.2f m from the axis at %.2f m height", k ? "JOINER clone" : "HOST", attacker, r.horiz, r.height); }
 }
 extern "C" void coop_on_pellet(void)
 {
@@ -8135,7 +8269,65 @@ extern "C" void coop_on_pellet(void)
     // puppet's pellet takes the next host ray for that body (fresh < 400 ms), so a host
     // bullet that would hit the joiner's clone hits the joiner's real player here.
     if ((g_cfg.coop_role || g_cfg.enemy_test_clone) && owner && is_enemy(owner, pobj)) {
+        {   // ENEMY ACCURACY (owner 20261120: "make the enemies slightly more accurate"). FUN_001cef40 aims an NPC pellet at
+            // the weapon's aim point (W +0x10, a float4 like the origin) and scatters it by W +0xE4; here the scatter is
+            // pulled in: dir = aim + (dir - aim) * k, renormalised. HOST (it decides the bullets), CO-OP difficulty only,
+            // k = COOP_ENEMY_SPREAD (default 0.8 = 20 % tighter; 1 = off; when set it applies in any mode).
+            static float k = -1.0f; static int forced;
+            if (k < 0.0f) { char e[16] = {0}; if (GetEnvironmentVariableA("COOP_ENEMY_SPREAD", e, sizeof e)) { k = (float)atof(e); forced = 1; } else k = 0.8f;
+                            if (k < 0.0f) k = 0.0f; if (k > 2.0f) k = 2.0f; }
+            if (k != 1.0f && g_cfg.coop_role == 1 && (forced || g_coop_diffmode_on)) {
+                const volatile float *ap = (const volatile float *)(uintptr_t)(W + 0x10);
+                float a[3] = {ap[0] - o[0], ap[1] - o[1], ap[2] - o[2]};
+                float al = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+                if (al > 0.5f && al < 1000.0f) {
+                    float n[3], nl;
+                    for (int q = 0; q < 3; q++) { a[q] /= al; n[q] = a[q] + (d[q] - a[q]) * k; }
+                    nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                    if (nl > 0.01f) {
+                        static int sl;
+                        if (sl++ < 20) logf("coop: enemy spread x%.2f: %08x d %.3f %.3f %.3f aim %.3f %.3f %.3f -> %.3f %.3f %.3f", k, owner,
+                                            d[0], d[1], d[2], a[0], a[1], a[2], n[0] / nl, n[1] / nl, n[2] / nl);
+                        for (int q = 0; q < 3; q++) d[q] = n[q] / nl;
+                    }
+                }
+            }
+        }
+        {   // CLONE HITBOX (owner 20261120: "apply the same hitbox from the host to the joiner model"). Measured (local,
+            // the same route each way): enemy rays that hit the HOST passed up to ~0.4 m from its axis (p90 0.41) at 0.25 -
+            // 1.75 m above the feet; rays that hit the joiner's CLONE (an NPC body: per-bone boxes) only at 0.75 - 1.75 m,
+            // p90 0.32 m - no hips / legs, a thinner body. HOST: an enemy ray passing the clone's axis within
+            // COOP_CLONE_HITBOX (radius, default 0.5 m: 0.4 gave 5.9 %, 0.55 9.5 % vs the host 8 % on the same route) between 0.2 and 1.8 m height is turned onto the clone's axis at that
+            // height (clamped to the torso 0.95 - 1.6 m, which the NPC boxes cover), so it hits like the host would be hit;
+            // walls still stop it (the game's ray test runs after this). 0 = off.
+            static float hbr = -1.0f;
+            if (hbr < 0.0f) { char e[16] = {0}; hbr = GetEnvironmentVariableA("COOP_CLONE_HITBOX", e, sizeof e) ? (float)atof(e) : 0.5f; if (hbr < 0.0f) hbr = 0.0f; }
+            if (hbr > 0.0f && g_cfg.coop_role == 1 && g_p10_gdst >= 0x80000000 && g_p10_gdst < 0x84000000 && owner != g_p10_gdst &&
+                *(volatile uint32_t *)(uintptr_t)(g_p10_gdst + 0x384) == 0 && *(volatile float *)(uintptr_t)(g_p10_gdst + 0x2F0) > 0.0f) {
+                float f[3];
+                if (coop_safe_copy(f, g_p10_gdst + 0xA0, 12)) {
+                    float dxz = d[0] * d[0] + d[2] * d[2];
+                    if (dxz > 1e-6f) {
+                        float t = ((f[0] - o[0]) * d[0] + (f[2] - o[2]) * d[2]) / dxz;
+                        float px = o[0] + t * d[0] - f[0], pz = o[2] + t * d[2] - f[2];
+                        float hz = sqrtf(px * px + pz * pz), hy = o[1] + t * d[1] - f[1];
+                        if (t > 0.5f && hz > 0.05f && hz <= hbr && hy >= 0.2f && hy <= 1.8f) {
+                            float ty = hy < 0.95f ? 0.95f : hy > 1.6f ? 1.6f : hy;
+                            float a[3] = {f[0] - o[0], f[1] + ty - o[1], f[2] - o[2]};
+                            float al = sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+                            if (al > 0.1f) {
+                                static uint32_t hl, hn;
+                                hn++;
+                                if (hl < 30 && (hn % 4) == 1) { hl++; logf("coop: clone hitbox: enemy %08x ray passed %.2f m from the clone's axis at %.2f m -> onto its body at %.2f m (%u so far)", owner, hz, hy, ty, hn); }
+                                for (int q = 0; q < 3; q++) d[q] = a[q] / al;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         coop_hr_shot(owner, pobj);
+        coop_aim_miss(owner, pobj, W, o, d);   // diagnostics: how far enemy rays miss each player
         coop_react_shot(owner);   // the reaction probe (diagnostics)
         if (g_cfg.coop_role == 0 && g_cfg.enemy_test_clone) {
             // solo variant: aim at the LOCAL player's chest - do enemy bullets damage a player at all?
@@ -8162,6 +8354,14 @@ extern "C" void coop_on_pellet(void)
             EnemyRay &e = g_enray_out[g_enray_out_n++];
             e.body = owner;
             for (int k = 0; k < 3; k++) { e.r.o[k] = o[k]; e.r.d[k] = d[k]; }
+            e.tok = 0; e.tp[0] = e.tp[1] = e.tp[2] = 0.0f;
+            {   // the shooter's target is the joiner's clone -> send where the clone's chest was (the joiner re-aims at its real self)
+                uint32_t br = 0, ti = 0xFFFFFFFF, ci = 0xFFFFFFFD; float cf[3];
+                coop_safe_copy(&br, owner + 0x324, 4);
+                if (br >= 0x80000000 && br < 0x84000000) coop_safe_copy(&ti, br + 0x2A8, 4);
+                if (g_p10_gdst >= 0x80000000 && g_p10_gdst < 0x84000000) coop_safe_copy(&ci, g_p10_gdst + 0x378, 4);
+                if (ti == ci && coop_safe_copy(cf, g_p10_gdst + 0xA0, 12)) { e.tok = 1; e.tp[0] = cf[0]; e.tp[1] = cf[1] + 1.3f; e.tp[2] = cf[2]; }
+            }
         } else if (g_cfg.coop_role == 2) {
             uint64_t now = GetTickCount64();
             int found = -1;
@@ -8175,6 +8375,33 @@ extern "C" void coop_on_pellet(void)
                 if (el++ < 30) logf("coop: enemy ray: puppet %08x pellet o %.2f %.2f %.2f d %.3f %.3f %.3f -> HOST o %.2f %.2f %.2f d %.3f %.3f %.3f",
                                     owner, o[0], o[1], o[2], d[0], d[1], d[2], r.o[0], r.o[1], r.o[2], r.d[0], r.d[1], r.d[2]);
                 for (int k = 0; k < 3; k++) { o[k] = r.o[k]; d[k] = r.d[k]; }
+                {   // RAY SHIFT (owner 20261120: "when the joiner moves it seems to confuse the enemies or they miss"). The
+                    // host's enemy aimed at our CLONE, which trails us by the network delay, so on our screen a moving
+                    // joiner saw the rays land behind them. The damage stays host-decided (CLHT, from the clone); this is
+                    // what we SEE: the ray keeps its muzzle and passes our real chest exactly as far off as it passed the
+                    // clone's chest on the host. COOP_RAY_SHIFT=0 = off.
+                    static int rs = -1; if (rs < 0) { char e[8] = {0}; rs = !(GetEnvironmentVariableA("COOP_RAY_SHIFT", e, sizeof e) && e[0] == '0'); }
+                    const EnemyRay &er = g_enray_in[found & 127];
+                    if (rs && er.tok && pobj >= 0x80000000 && pobj < 0x84000000) {
+                        const volatile float *pf = (const volatile float *)(uintptr_t)(pobj + 0xA0);
+                        float me[3] = {pf[0], pf[1] + 1.3f, pf[2]};
+                        float sh[3] = {me[0] - er.tp[0], me[1] - er.tp[1], me[2] - er.tp[2]};
+                        float shl = sqrtf(sh[0] * sh[0] + sh[1] * sh[1] + sh[2] * sh[2]);
+                        float c[3] = {er.tp[0] - o[0], er.tp[1] - o[1], er.tp[2] - o[2]};
+                        float t = c[0] * d[0] + c[1] * d[1] + c[2] * d[2];
+                        if (shl > 0.05f && shl < 6.0f && t > 0.5f) {
+                            float aim[3], al;
+                            for (int k = 0; k < 3; k++) aim[k] = o[k] + d[k] * t + sh[k] - o[k];   // the ray's point at the clone + our offset
+                            al = sqrtf(aim[0] * aim[0] + aim[1] * aim[1] + aim[2] * aim[2]);
+                            if (al > 0.1f) {
+                                static uint32_t sl;
+                                if (sl++ < 30) logf("coop: ray shift: puppet %08x ray moved %.2f m onto our real position (the clone was %.1f m from the muzzle)", owner, shl, t);
+                                for (int k = 0; k < 3; k++) d[k] = aim[k] / al;
+                                g_enray_stats[4]++;
+                            }
+                        }
+                    }
+                }
                 g_enray_in[found & 127].body = 0;            // consumed
                 while (g_enray_r != g_enray_w && g_enray_in[g_enray_r & 127].body == 0) g_enray_r++;
                 g_enray_stats[2]++;
@@ -8810,7 +9037,7 @@ static void coop_aggro_log(void)
         uint32_t W = *(volatile uint32_t *)(uintptr_t)(me + 0x278 + 0x28);
         if (W >= 0x80000000 && W < 0x84000000 && *(volatile int *)(uintptr_t)(W + 0xD8) == 1 && !*(volatile uint8_t *)(uintptr_t)(W + 0x108)) hshot_ms = GetTickCount64();   // a silenced shot is not "heard"
     }
-    struct Sight { uint32_t body; uint64_t at; bool j, h; };
+    struct Sight { uint32_t body; uint64_t at; bool j, h; uint64_t jms, hms; };   // jms / hms: last time each player was seen
     static Sight sight[16];
     for (uint32_t i = 0; i < ns; i++) {
         uint32_t b = s[i];
@@ -8887,11 +9114,21 @@ static void coop_aggro_log(void)
         bool heard = !g_aggro_off && clone_up && g_jshot_ms && nowp - g_jshot_ms < 1500 && near30(g_p10_gdst);
         bool heard_h = hshot_ms && nowp - hshot_ms < 1500 && near30(me);
         Sight *sg = &sight[i & 15];
-        if (sg->body != b) { sg->body = b; sg->at = 0; sg->j = sg->h = false; }
+        if (sg->body != b) { sg->body = b; sg->at = 0; sg->j = sg->h = false; sg->jms = sg->hms = 0; }
+        // AGGRO POLISH (owner 20261120, -72 play: "one enemy at the start flip-flopping between the host and the joiner";
+        // 801e66a0 switched on "seen" at 129.9 / 142.1 / 147.1 / 154.9 / 160.2 s, distances 21-24 m to both): a player
+        // stepping behind cover for a moment lost "seen", the other was in view -> a switch after 1 s, and back. Now
+        // SIGHT MEMORY: a player counts as seen for COOP_AGGRO_SEEN_MS (2500) after the last clear line test.
+        static int seen_mem = -1;
+        if (seen_mem < 0) { char e[16] = {0}; seen_mem = GetEnvironmentVariableA("COOP_AGGRO_SEEN_MS", e, sizeof e) ? atoi(e) : 2500; if (seen_mem < 0) seen_mem = 0; }
         if (!g_aggro_off && nowp - sg->at >= 300) {   // a line test per enemy and player at most every 0.3 s
             sg->at = nowp;
-            sg->j = clone_up && coop_enemy_sees(b, g_p10_gdst);
-            sg->h = *(volatile uint32_t *)(uintptr_t)(me + 0x384) == 0 && coop_enemy_sees(b, me);
+            bool sj = clone_up && coop_enemy_sees(b, g_p10_gdst);
+            bool sh = *(volatile uint32_t *)(uintptr_t)(me + 0x384) == 0 && coop_enemy_sees(b, me);
+            if (sj) sg->jms = nowp;
+            if (sh) sg->hms = nowp;
+            sg->j = sj || (clone_up && sg->jms && nowp - sg->jms < (uint64_t)seen_mem);
+            sg->h = sh || (*(volatile uint32_t *)(uintptr_t)(me + 0x384) == 0 && sg->hms && nowp - sg->hms < (uint64_t)seen_mem);
         }
         bool seen = sg->j;
         if (!g_aggro_off && (idle_hit || heard || seen || (ent && (ent == me || ent == g_p10_gdst))) && idx_host >= 0 && idx_clone >= 0) {
@@ -8931,7 +9168,15 @@ static void coop_aggro_log(void)
                 float cur = want == me ? th->host : th->clone, oth = want == me ? th->clone : th->host;
                 bool sw = false; const char *why = "";
                 if (lvCur < 0 && lvOth >= 0) { sw = true; why = "target downed"; }
-                else if (lvOth > lvCur && now - th->chosen_ms >= 1000) { sw = true; why = lvOth == 3 ? "heard" : lvOth == 2 ? "seen" : "hurt"; }
+                // AGGRO POLISH: an enemy keeps a new target at least COOP_AGGRO_HOLD ms (default 4000, was 1000) unless that
+                // target goes down; HEARD (the other player fired within 50 m) still pulls after 1 s - a shot is a real event
+                // and the hold would make enemies ignore the joiner's gunfire again.
+                else if (lvOth > lvCur) {
+                    static int hold = -1;
+                    if (hold < 0) { char e[16] = {0}; hold = GetEnvironmentVariableA("COOP_AGGRO_HOLD", e, sizeof e) ? atoi(e) : 4000; if (hold < 0) hold = 0; }
+                    uint64_t need = lvOth == 3 ? 1000 : (uint64_t)hold;
+                    if (now - th->chosen_ms >= need) { sw = true; why = lvOth == 3 ? "heard" : lvOth == 2 ? "seen" : "hurt"; }
+                }
                 else if (lvOth == lvCur && lvCur <= 1 && now - th->chosen_ms >= 3000 && oth > cur * 1.5f + 10.0f) { sw = true; why = "more threat"; }
                 if (sw) {
                     static uint32_t sl;
@@ -9787,14 +10032,16 @@ static void coop_enemy_tick(uint32_t pobj)
                 // copy of an enemy that targets us often does not face us. COOP_PUPPET_FACE (default on): a puppet the host
                 // has on US always looks / aims at us, and a standing one also turns its body to us; =0 = the old 35 deg rule.
                 static int face = -1;
-                if (face < 0) { char e[8] = {0}; face = !(GetEnvironmentVariableA("COOP_PUPPET_FACE", e, sizeof e) && e[0] == '0'); }
+                // owner 20261120 (after the 0.7.1 play): "remove the enemy facing the joiner fix" - OFF by default now
+                // (COOP_PUPPET_FACE=1 turns it back on); the old 35 deg rule stays, the 10-s facing log stays.
+                if (face < 0) { char e[8] = {0}; face = GetEnvironmentVariableA("COOP_PUPPET_FACE", e, sizeof e) && e[0] == '1'; }
                 {   // how often the host's look misses us (every 10 s: puppet-frames on us, within 35 / 90 deg, beyond)
                     static uint32_t n35, n90, nfar; static uint64_t fl;
                     float ad = fabsf(dyaw);
                     if (ad < 35.0f) n35++; else if (ad < 90.0f) n90++; else nfar++;
                     if (now - fl > 10000 && n35 + n90 + nfar) {
                         fl = now; static int fln;
-                        if (fln++ < 120) logf("coop: enemy aim: puppets on US: host look within 35 deg %u, 35-90 %u, beyond 90 %u (frames, last 10 s)%s", n35, n90, nfar, face ? " - we face them at us" : "");
+                        if (fln++ < 120) logf("coop: enemy aim: puppets on US: host look within 35 deg %u, 35-90 %u, beyond 90 %u (frames, last 10 s)%s", n35, n90, nfar, face ? " - we face them at us" : " - the host's facing kept");
                         n35 = n90 = nfar = 0;
                     }
                 }
@@ -12866,6 +13113,40 @@ __declspec(naked) void coop_thunk_special()
 // the 1.5 and applies in any mode; COOP_REACT=0 = not installed).
 static float g_rs_one = 1.0f;
 static float g_rs_force;
+// LIVE BODY IN THE FREE POOL (two-PC play 20261120, owner: "one enemy disappeared on the host", "vanished mid-fight"):
+// three times a copy spawn took the BODY of a live enemy (801e71e0 alive at 91.2 s -> the copy at 91.85 s, 801e5f20 at
+// 210.15, 801e62e0 at 212.17; different brains, different spawners): the factory takes the first entry of the FREE body
+// pool (mgr +0x79A0: [+4] count, [+0xC] array) - a live body was still listed there (freed twice: a corpse-cleanup race
+// the copies' churn brings out). Every frame (both roles): a free-pool entry that is also in the ACTIVE pawn list (mgr
+// +0x79B0, array +0x79BC) is cleared, so no spawn can take a live body. COOP_POOL_GUARD=0 = off.
+static void coop_free_pool_guard(void)
+{
+    static int on = -1;
+    if (on < 0) { char e[8] = {0}; on = !(GetEnvironmentVariableA("COOP_POOL_GUARD", e, sizeof e) && e[0] == '0'); }
+    if (!on) return;
+    uint32_t mgr = *(volatile uint32_t *)(uintptr_t)0x2D1980;
+    if (mgr < 0x80000000 || mgr >= 0x84000000) return;
+    uint32_t fcnt = 0, farr = 0, acnt = 0, aarr = 0;
+    if (!coop_safe_copy(&fcnt, mgr + 0x79A4, 4) || !coop_safe_copy(&farr, mgr + 0x79AC, 4) ||
+        !coop_safe_copy(&acnt, mgr + 0x79B4, 4) || !coop_safe_copy(&aarr, mgr + 0x79BC, 4)) return;
+    if (fcnt == 0 || fcnt > 64 || acnt == 0 || acnt > 64 || farr < 0x80000000 || farr >= 0x84000000 || aarr < 0x80000000 || aarr >= 0x84000000) return;
+    uint32_t act[64]; if (!coop_safe_copy(act, aarr, acnt * 4)) return;
+    uint32_t fr[64]; if (!coop_safe_copy(fr, farr, fcnt * 4)) return;
+    for (uint32_t i = 0; i < fcnt; i++) {
+        uint32_t b = fr[i];
+        if (b < 0x80000000 || b >= 0x84000000) continue;
+        bool live = false;
+        for (uint32_t k = 0; k < acnt; k++) if (act[k] == b) { live = true; break; }
+        if (!live) continue;
+        float hp = 0.0f; uint32_t life = 9;
+        coop_safe_copy(&hp, b + 0x2F0, 4); coop_safe_copy(&life, b + 0x384, 4);
+        if (!(hp > 0.0f) || life > 1) continue;   // a corpse may sit in both lists while it is cleaned up - only LIVE bodies
+        *(volatile uint32_t *)(uintptr_t)(farr + 4 * i) = 0;
+        static int ln;
+        if (ln++ < 60) logf("coop: free pool guard: live body %08x (hp %.0f, life %u) was still in the FREE body pool (entry %u / %u) - removed so no spawn takes it",
+                            b, hp, life, i, fcnt);
+    }
+}
 static void coop_noise_dump(void)   // once per level: the weapon noise classes (0xB = silent) and our weapon's type
 {
     static uint64_t done_part = 1;
@@ -12882,6 +13163,7 @@ static void coop_noise_dump(void)   // once per level: the weapon noise classes 
 }
 static void coop_react_tick(void)
 {
+    coop_free_pool_guard();   // no spawn may take a live body
     coop_noise_dump();
     float x = g_rs_force > 0.0f ? g_rs_force : (g_cfg.coop_role && g_coop_diffmode_on ? 1.5f : 1.0f);
     float v = 1.0f / x;
