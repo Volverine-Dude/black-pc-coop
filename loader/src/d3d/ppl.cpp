@@ -14,11 +14,14 @@
 #include <unordered_map>
 
 extern "C" volatile uint8_t g_fov_viewmodel;     // fov.cpp: set while the first-person list draws
-extern "C" volatile uint8_t g_ppl_count_shots;   // cheats.cpp ammo thunk (the game's fire routine, once per round):
-extern "C" volatile uint32_t g_ppl_player_shots; //   counts the player's rounds while the first is set
-extern "C" volatile uint32_t g_ppl_shot_weapon;  //   and keeps the weapon object of the last one,
-extern "C" volatile uint32_t g_ppl_enemy_shot[16]; // and everyone else's shooters (a ring)
-extern "C" volatile uint32_t g_ppl_enemy_shot_n;
+// Rounds fired, from the game's per-shot routine FUN_001DBD50 (ppl_thunk_shot below): the player's, with the
+// weapon of the last one, and everyone else's shooters in a ring (enemies, and the partner's clone, whose shots
+// coop.cpp fires through that routine directly).
+volatile uint8_t g_ppl_count_shots;
+volatile uint32_t g_ppl_player_shots;
+volatile uint32_t g_ppl_shot_weapon;
+volatile uint32_t g_ppl_enemy_shot[16];
+volatile uint32_t g_ppl_enemy_shot_n;
 
 namespace xd3d {
 namespace {
@@ -366,6 +369,83 @@ __declspec(naked) void ppl_thunk_explosion()
 
 void ppl_install() { ppl_level(); } // startup: installs the hook when the setting is already on
 
+// Shots: FUN_001DBD50(shot ctx) runs once per round fired by anyone (the pellets inside; ctx+4 = the weapon,
+// weapon+0xF0 = its owner). The normal fire routine calls it, and coop.cpp calls it directly for the partner's
+// clone and for catch-up shots - so the clone's gunfire lights too (owner: "the lighting doesn't work on the
+// clone's model"; v1-v10 counted at the magazine decrement in FUN_001EEFD0, which those shots skip). The hook
+// takes sub esp, 0x2E4 (6 bytes at 0x1DBD56), after the prologue: [ebp+8] = the ctx.
+uint32_t g_ppl_shot_resume;
+
+extern "C" void __cdecl ppl_on_shot(uint32_t ctx)
+{
+    if (!g_ppl_count_shots) return;
+    uint32_t W = 0, owner = 0;
+    if (!safe_read(&W, ctx + 4, 4) || W < 0x80000000 || W >= 0x84000000) return;
+    if (!safe_read(&owner, W + 0xF0, 4) || owner < 0x80000000 || owner >= 0x84000000) return;
+    uint32_t world = *(volatile uint32_t *)(uintptr_t)xbe_va(0x002D45D4);
+    if (owner == world + 0x30) {
+        g_ppl_shot_weapon = W;
+        g_ppl_player_shots++;
+    } else {
+        g_ppl_enemy_shot[g_ppl_enemy_shot_n & 15] = owner;
+        g_ppl_enemy_shot_n++;
+    }
+}
+
+__declspec(naked) void ppl_thunk_shot()
+{
+    __asm {
+        pushfd
+        pushad
+        sub esp, 128
+        movups [esp], xmm0
+        movups [esp + 16], xmm1
+        movups [esp + 32], xmm2
+        movups [esp + 48], xmm3
+        movups [esp + 64], xmm4
+        movups [esp + 80], xmm5
+        movups [esp + 96], xmm6
+        movups [esp + 112], xmm7
+        push dword ptr [ebp + 8]        // the shot ctx
+        call ppl_on_shot
+        add esp, 4
+        movups xmm0, [esp]
+        movups xmm1, [esp + 16]
+        movups xmm2, [esp + 32]
+        movups xmm3, [esp + 48]
+        movups xmm4, [esp + 64]
+        movups xmm5, [esp + 80]
+        movups xmm6, [esp + 96]
+        movups xmm7, [esp + 112]
+        add esp, 128
+        popad
+        popfd
+        sub esp, 0x2E4
+        jmp dword ptr [g_ppl_shot_resume]
+    }
+}
+
+void install_shot_hook()
+{
+    uint32_t site = xbe_va(0x001DBD56);
+    auto *code = (uint8_t *)(uintptr_t)site;
+    static const uint8_t kExpect[6] = {0x81, 0xEC, 0xE4, 0x02, 0x00, 0x00};
+    if (memcmp(code, kExpect, 6) != 0) {
+        logf("[ppl] shot hook: code at 0x%08x does not match - no muzzle flashes", site);
+        return;
+    }
+    g_ppl_shot_resume = site + 6;
+    DWORD old;
+    VirtualProtect(code, 6, PAGE_EXECUTE_READWRITE, &old);
+    code[0] = 0xE9;
+    int32_t rel = (int32_t)((uintptr_t)ppl_thunk_shot - (site + 5));
+    memcpy(code + 1, &rel, 4);
+    code[5] = 0x90;
+    VirtualProtect(code, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, 6);
+    logf("[ppl] shot hook installed at 0x%08x", site);
+}
+
 void install_explosion_hook()
 {
     static bool done;
@@ -388,6 +468,7 @@ void install_explosion_hook()
     VirtualProtect(code, 6, old, &old);
     FlushInstructionCache(GetCurrentProcess(), code, 6);
     logf("[ppl] explosion hook installed at 0x%08x", site);
+    install_shot_hook();
 }
 
 namespace {
@@ -473,6 +554,13 @@ void collect_world_lights(double now)
         l.r = 1.6f, l.g = 1.15f, l.b = 0.65f;
         l.rise_ms = 0, l.decay_ms = 35, l.life_ms = 200;
         add_world_light(l, false);
+        static uint32_t shooters[32], nshooters;   // each shooter named once (the partner's clone among them)
+        bool known = false;
+        for (uint32_t s = 0; s < nshooters; s++) known |= shooters[s] == body;
+        if (!known && nshooters < 32) {
+            shooters[nshooters++] = body;
+            logf("[ppl] new shooter %08x at %.1f %.1f %.1f (rounds by others so far %u)", body, pos[0], pos[1], pos[2], sh_n);
+        }
         if (logged_shots++ < 60)
             logf("[ppl] enemy round: shooter %08x at %.1f %.1f %.1f", body, pos[0], pos[1], pos[2]);
     }
@@ -707,8 +795,14 @@ void census(const VertexShader *vs, const char *verdict)
             w += snprintf(b + w, sizeof b - w, "v%u:%02x ", vs->elements[i].reg, vs->elements[i].xtype);
     else
         w += snprintf(b + w, sizeof b - w, "fvf/none ");
-    snprintf(b + w, sizeof b - w, "| tex 0x%x blend %u (%x/%x) zw %u vm %u | %s", rs[XRS_PSTEXTUREMODES], rs[XRS_ALPHABLENDENABLE],
-             rs[XRS_SRCBLEND], rs[XRS_DESTBLEND], rs[XRS_ZWRITEENABLE], g_fov_viewmodel, verdict);
+    // the model's origin from the camera (view space: row .w terms), to tell e.g. the partner's clone (a few m) from
+    // the enemies; 5 m steps beyond 10 m
+    const float (*c)[4] = g_st.vs_constants;
+    float ox = c[10][3] * g_inv_p00, oy = c[11][3] * g_inv_p11, oz = c[13][3];
+    int dist = (int)sqrtf(ox * ox + oy * oy + oz * oz);
+    if (dist > 10) dist = dist / 5 * 5;
+    snprintf(b + w, sizeof b - w, "| tex 0x%x blend %u (%x/%x) zw %u vm %u @%dm | %s", rs[XRS_PSTEXTUREMODES], rs[XRS_ALPHABLENDENABLE],
+             rs[XRS_SRCBLEND], rs[XRS_DESTBLEND], rs[XRS_ZWRITEENABLE], g_fov_viewmodel, dist, verdict);
     g_census.rows[b]++;
 }
 
@@ -736,8 +830,14 @@ bool ppl_begin_draw(const VertexShader *vs, bool has_ps)
     if (!(pos3 && uv) || !g_inv_p00) { census(vs, "not a textured 3D layout"); return false; }
     const uint32_t *rs = render_state();
     // Blended: a surface layer (plain alpha blend, writes depth: the cobbled ground's top layer over its lit base)
-    // is lit like the base; effects, glass, the flash sprite (additive, or no depth write) are not.
-    bool layer = rs[XRS_SRCBLEND] == 0x302 && rs[XRS_DESTBLEND] == 0x303 && rs[XRS_ZWRITEENABLE];
+    // is lit like the base. So is a plain alpha-blended mesh WITH NORMALS even without depth writes: characters drawn
+    // in the game's fade mode - the partner's clone among them (owner: "the lighting doesn't work on the clone's
+    // model"; its v0 v9 v2 parts came blended, depth write off). Effects stay unlit: additive glows and light shafts,
+    // and particles / sprites (no normals).
+    bool normals = false;
+    for (uint32_t i = 0; i < vs->num_elements; i++) normals |= vs->elements[i].reg == 2;
+    bool plain_alpha = rs[XRS_SRCBLEND] == 0x302 && rs[XRS_DESTBLEND] == 0x303;
+    bool layer = plain_alpha && (rs[XRS_ZWRITEENABLE] || normals);
     if (rs[XRS_ALPHABLENDENABLE] && !layer) { census(vs, "blended"); return false; }
     if ((rs[XRS_PSTEXTUREMODES] & 0x1F) != 1) { census(vs, "stage 0 not 2D"); return false; }
     Resource *t = g_st.textures[0];
