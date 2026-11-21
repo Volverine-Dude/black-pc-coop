@@ -11,6 +11,7 @@ uint32_t vsdt_size(uint32_t xtype); // bytes of one Xbox D3DVSDT_* element
 
 // Translate the NV2A program to a host vertex shader (vs_2_0). Returns null if not possible.
 IDirect3DVertexShader9 *vs_host_shader(VertexShader *vs);
+IDirect3DVertexShader9 *vs_host_shader_sm3(VertexShader *vs); // the lighting variant as vs_3_0 (d3d/ppl.h), or null
 uint32_t vs_input_mask(const VertexShader *vs); // vertex registers the declaration provides
 
 } // namespace xd3d

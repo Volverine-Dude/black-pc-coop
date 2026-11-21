@@ -28,6 +28,8 @@ struct VertexShader {
     bool translate_failed;
     IDirect3DVertexShader9 *host_vs_ppl; // the same program with the lighting pass's view-space output (d3d/ppl.h)
     bool ppl_failed;
+    IDirect3DVertexShader9 *host_vs_sm3; // that variant as vs_3_0, paired with the ps_3_0 light pass (12 lights)
+    bool sm3_failed;
 };
 constexpr uint32_t VSH_MAGIC = 0x48535658;
 

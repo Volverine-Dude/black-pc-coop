@@ -588,6 +588,9 @@ void coop_menu_action(int id)
     }
 }
 
+// the CO-OP page's LIGHTING value as shown (d3d/ppl.h ppl_med): 3 is a test level (MED + a head lamp)
+static const char *lighting_name() { return g_cfg.ppl <= 0 ? "OFF" : g_cfg.ppl == 1 ? "LOW" : "MED"; }
+
 void coop_menu_change(int id, int dir)
 {
     if (id == 409 || id == 410) {   // the host lobby: DIFFICULTY (VANILLA / CO-OP) and SPECIAL WEAPONS (host only; to the joiner with the heartbeat)
@@ -636,12 +639,12 @@ void coop_menu_change(int id, int dir)
         show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");
         return;
     }
-    if (id == 4) {   // the CO-OP page: LIGHTING on / off (per-pixel dynamic lights and bump, d3d/ppl.h; solo play too)
-        (void)dir;
-        g_cfg.ppl = g_cfg.ppl ? 0 : 1;
+    if (id == 4) {   // the CO-OP page: LIGHTING OFF / LOW / MED (per-pixel dynamic lights, d3d/ppl.h; solo play too)
+        int v = (g_cfg.ppl > 2 ? 2 : g_cfg.ppl) + (dir < 0 ? -1 : 1);
+        g_cfg.ppl = v < 0 ? 2 : v > 2 ? 0 : v;
         settings_save();
-        logf("coop menu: LIGHTING %s", g_cfg.ppl ? "ON" : "OFF");
-        show(3, g_cfg.ppl ? "ON" : "OFF");
+        logf("coop menu: LIGHTING %s", lighting_name());
+        show(3, lighting_name());
         return;
     }
     if (g_page != JoinCode) return;
@@ -710,7 +713,7 @@ void coop_menu_poll()
     }
     if (g_page == Menu || g_page == Menu + 1) {   // the CO-OP page's HIT MARKER and LIGHTING rows
         show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");
-        show(3, g_cfg.ppl ? "ON" : "OFF");
+        show(3, lighting_name());
     }
     if (g_page != HostLobby && g_page != JoinCode) { g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = g_coop_lobby_banner[2][0] = 0; return; }
     ULONGLONG now = GetTickCount64();

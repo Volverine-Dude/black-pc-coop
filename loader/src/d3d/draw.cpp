@@ -1102,7 +1102,9 @@ bool begin_draw(DrawCtx &ctx)
         VertexShader *pvs = vs_is_fvf(h) ? nullptr : vs_from_handle(h);
         ppl = ppl_begin_draw(pvs, ps) && vs_host_shader(pvs);
         if (!ppl) ppl_cancel();
+        g_ppl_sm3_want = ppl && ppl_sm3_on() && vs_host_shader_sm3(pvs); // the ps_3_0 light pass needs its vs_3_0 partner
         ppl_probe(pvs);
+        ppl_sun_sample(pvs);
     }
     IDirect3DPixelShader9 *hps = ps ? ps_host_shader() : nullptr;
     set_ps(d, hps);
@@ -1118,7 +1120,8 @@ bool begin_draw(DrawCtx &ctx)
             ctx.fvf = h;
         }
     } else if (VertexShader *vs = vs_from_handle(h)) {
-        if (IDirect3DVertexShader9 *hv = vs_host_shader(vs)) {
+        // a ps_3_0 light pass takes the vs_3_0 build of the same program (D3D9 does not mix shader models 2 and 3)
+        if (IDirect3DVertexShader9 *hv = (ppl && hps && g_ppl_ps_sm3) ? vs_host_shader_sm3(vs) : vs_host_shader(vs)) {
             set_vs(d, hv);
             upload_vs_constants(d);
             if (ppl_level()) ppl_upload_vs(d);
@@ -1225,6 +1228,7 @@ void __stdcall D3DDevice_DrawVerticesUP(uint32_t PrimitiveType, uint32_t VertexC
     if (ctx.path == Path::Prog) {
         uint32_t stride = convert_vertices(ctx.vs, 0, VertexCount, (const uint8_t *)pVertexStreamZeroData, VertexStreamZeroStride);
         debug_draw("DrawVerticesUP", ctx, PrimitiveType, VertexCount, g_conv.data(), stride / 4);
+        if (ppl_level()) ppl_glow_capture(ctx.vs, g_conv.data(), stride, VertexCount); // lighting: the game's glows
         set_decl(host3d::dev(), decl_for(ctx.vs));
         draw_up(PrimitiveType, VertexCount, g_conv.data(), stride);
         return;
@@ -1247,6 +1251,7 @@ void __stdcall D3DDevice_DrawVertices(uint32_t PrimitiveType, uint32_t StartVert
         if (ppl_level()) // lighting: static level geometry into the shadow cache
             ppl_capture(ctx.vs, PrimitiveType, nullptr, VertexCount, 0, g_conv.data(), stride,
                         ((uint64_t)(uintptr_t)stream_data(0) << 32) ^ ((uint64_t)StartVertex << 16) ^ VertexCount ^ 0x5A5A000000000000ull);
+        if (ppl_level()) ppl_glow_capture(ctx.vs, g_conv.data(), stride, VertexCount);
         set_decl(host3d::dev(), decl_for(ctx.vs));
         draw_up(PrimitiveType, VertexCount, g_conv.data(), stride);
         return;
@@ -1310,6 +1315,7 @@ void __stdcall D3DDevice_DrawIndexedVertices(uint32_t PrimitiveType, uint32_t Ve
         if (ppl_level()) // lighting: static level geometry into the shadow cache
             ppl_capture(ctx.vs, PrimitiveType, pIndexData, VertexCount, mn, g_conv.data(), stride,
                         ((uint64_t)(uintptr_t)pIndexData << 32) ^ ((uint64_t)(uintptr_t)stream_data(0) << 8) ^ VertexCount);
+        if (ppl_level()) ppl_glow_capture(ctx.vs, g_conv.data(), stride, mx - mn + 1);
         if (debug_frame_active() && !g_cfg.debug_frame_end) // single debug frames only (ranges stay fast)
             dump_packed_normal_geometry(ctx.vs, PrimitiveType, VertexCount, pIndexData, mn, mx);
         set_decl(host3d::dev(), decl_for(ctx.vs));
@@ -1340,6 +1346,7 @@ void draw_immediate(uint32_t prim, const float *verts, uint32_t count, uint32_t 
     if (!begin_draw(ctx)) return;
     if (ctx.path == Path::Prog) { // the 16 attribute slots are exactly the shader's v0-v15
         debug_draw("immediate", ctx, prim, count, verts, 64);
+        if (ppl_level()) ppl_glow_immediate(ctx.vs, verts, count); // lighting: the game's glows
         uint32_t mask = (attr_mask | vs_input_mask(ctx.vs) | 1u) & 0xFFFF, n = 0;
         uint8_t slot[16];
         for (uint32_t i = 0; i < 16; i++)
@@ -1403,6 +1410,8 @@ void draw_inline_array(uint32_t prim, const uint32_t *data, uint32_t dwords)
         if (!in_stride) return;
         uint32_t count = dwords * 4 / in_stride;
         uint32_t stride = convert_vertices(ctx.vs, 0, count, (const uint8_t *)data, in_stride);
+        // lighting: the game's glows - inline arrays too (the owner's level fires were drawn this way and never seen)
+        if (ppl_level()) ppl_glow_capture(ctx.vs, g_conv.data(), stride, count);
         set_decl(host3d::dev(), decl_for(ctx.vs));
         draw_up(prim, count, g_conv.data(), stride);
         return;

@@ -298,8 +298,11 @@ bool ppl_shadow_bind(IDirect3DDevice9 *d, const float wpos[3])
     return true;
 }
 
+void ppl_lampmap_release(); // ppl.cpp
+
 void ppl_release_targets()
 {
+    ppl_lampmap_release();
     if (g_cube) g_cube->Release();
     if (g_cube_depth) g_cube_depth->Release();
     g_cube = nullptr;

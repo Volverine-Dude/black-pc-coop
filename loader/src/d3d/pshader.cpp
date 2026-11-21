@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace xd3d {
 namespace {
@@ -69,15 +70,17 @@ IDirect3DPixelShader9 *ps_host_shader()
     for (uint32_t i = 0; i < 57; i++)
         if (!(i >= 10 && i <= 25) && i != 43 && i != 44) key[n++] = rs[i];
     key[n++] = def.PSTextureModes;
-    key[n++] = cube | (ppl_this_draw() ? 0x100u : 0u); // the light pass is a separate translation (d3d/ppl.h)
+    key[n++] = cube | (ppl_this_draw() ? 0x100u : 0u) | (ppl_this_draw() && g_ppl_sm3_want ? 0x200u : 0u); // the light pass (d3d/ppl.h), ps_3_0 or not
+    static std::unordered_set<IDirect3DPixelShader9 *> sm3_shaders; // the ps_3_0 light passes (need the vs_3_0 partner)
     static uint32_t last_key[48], last_n;
     static IDirect3DPixelShader9 *last_ps;
-    if (n == last_n && !memcmp(key, last_key, n * 4)) return last_ps; // most draws keep the previous shader
+    if (n == last_n && !memcmp(key, last_key, n * 4)) { g_ppl_ps_sm3 = last_ps && sm3_shaders.count(last_ps); return last_ps; } // most draws keep the previous shader
     std::string k((const char *)key, n * 4);
     auto it = g_cache.find(k);
     if (it != g_cache.end()) {
         memcpy(last_key, key, n * 4);
         last_n = n;
+        g_ppl_ps_sm3 = it->second && sm3_shaders.count(it->second);
         return last_ps = it->second;
     }
 
@@ -85,7 +88,14 @@ IDirect3DPixelShader9 *ps_host_shader()
     std::vector<uint8_t> code;
     std::string errors;
     bool ok = false;
-    if (ppl_this_draw()) { // ddx/ddy: ps_2_a; on failure the plain translation below
+    bool sm3 = false;
+    if (ppl_this_draw() && g_ppl_sm3_want) { // ps_3_0: 12 world lights, fog in the shader (its vs_3_0 partner compiled)
+        std::string lit = psh_to_hlsl(def, cube, true, true);
+        ok = sm3 = compile_cached(lit, "nv2a_psh", {"ps_3_0"}, code, errors);
+        static int nf3;
+        if (!ok && nf3++ < 3) logf("[ppl] ps_3_0 light pass compile failed, shader model 2 instead: %s", errors.c_str());
+    }
+    if (!ok && ppl_this_draw()) { // ddx/ddy: ps_2_a; on failure the plain translation below
         std::string lit = psh_to_hlsl(def, cube, true);
         ok = compile_cached(lit, "nv2a_psh", {"ps_2_a"}, code, errors);
         static int nf;
@@ -107,6 +117,8 @@ IDirect3DPixelShader9 *ps_host_shader()
         log_def(def);
     }
     g_cache[k] = ps; // failures are cached too (drawn with the fallback)
+    if (ps && sm3) sm3_shaders.insert(ps);
+    g_ppl_ps_sm3 = ps && sm3;
     memcpy(last_key, key, n * 4);
     last_n = n;
     return last_ps = ps;

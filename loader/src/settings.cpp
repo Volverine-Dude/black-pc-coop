@@ -60,7 +60,7 @@ void settings_load()
         else if (k == "aa") g_cfg.aa = v != 0;
         else if (k == "seamfill") g_cfg.seam_fill = v != 0;
         else if (k == "effectsnative") g_cfg.effects_native = v != 0;
-        else if (k == "ppl") g_cfg.ppl = std::clamp(atoi(val), 0, 2);   // the CO-OP page's LIGHTING (d3d/ppl.h); 2 = + a head lamp (tests)
+        else if (k == "ppl") g_cfg.ppl = std::clamp(atoi(val), 0, 3);   // the CO-OP page's LIGHTING (d3d/ppl.h): 0 off, 1 low, 2 med; 3 = med + a head lamp (tests)
         else if (k == "fps") g_cfg.fps = fps_setting(atoi(val));
         else if (k == "widescreen") g_cfg.widescreen = v != 0;
         else if (k == "language") { if (language_valid(val)) g_cfg.language = val; }

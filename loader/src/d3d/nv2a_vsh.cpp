@@ -202,7 +202,7 @@ const char *hlsl_out(uint8_t a)
 
 } // namespace
 
-std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_mask, bool ppl_pos)
+std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_mask, bool ppl_pos, bool sm3)
 {
     std::string s;
     s += "float4 c[192] : register(c0);\n"
@@ -224,10 +224,13 @@ std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_
          "struct VSOut {\n"
          "  float4 pos : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
          "  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-         "  float fog : FOG; float pts : PSIZE;\n";
-    if (ppl_pos) s += "  float4 t4 : TEXCOORD4; float4 t5 : TEXCOORD5;\n"; // view position; light -> pixel, world (d3d/ppl.h)
+         "";
+    // vs_3_0 allows 11 outputs without a point size: the lighting variant drops PSIZE (lit draws are no sprites) and
+    // FOG - the fog factor goes in TEXCOORD7.x (the pixel shader takes the up vector and the world light from constants)
+    if (!sm3) s += "  float fog : FOG; float pts : PSIZE;\n";
+    if (ppl_pos) s += "  float4 t4 : TEXCOORD4; float4 t5 : TEXCOORD5; float4 t6 : TEXCOORD6; float4 t7 : TEXCOORD7;\n"; // view position; light -> pixel, world (d3d/ppl.h)
     s += "};\n";
-    if (ppl_pos) s += "float4 pplProj : register(c201); float4 pplIV[3] : register(c202); float4 pplSL : register(c205);\n"; // d3d/ppl.h ppl_upload_vs
+    if (ppl_pos) s += "float4 pplProj : register(c201); float4 pplIV[3] : register(c202); float4 pplSL : register(c205); float4 pplMap : register(c206); float4 pplSun : register(c207);\n"; // d3d/ppl.h ppl_upload_vs
     s += ""
          "VSOut main(VSIn I) {\n";
     for (int i = 0; i < 16; i++) {
@@ -340,19 +343,25 @@ std::string vsh_to_hlsl(const uint32_t *program, uint32_t count, uint32_t input_
          "  o.d0 = oD0; o.d1 = oD1;\n"
          "  o.t0 = oT0 * float4(texScale[0].xy, 1, 1); o.t1 = oT1 * float4(texScale[1].xy, 1, 1);\n"
          "  o.t2 = oT2 * float4(texScale[2].xy, 1, 1); o.t3 = oT3 * float4(texScale[3].xy, 1, 1);\n"
-         "  o.pts = oPts.x;\n";
+         "";
+    if (!sm3) s += "  o.pts = oPts.x;\n";
     if (ppl_pos) // view space from the clip position before the gun's vmScale: x = clip x / P00, y = clip y / P11, z = w
         s += "  o.t4 = float4((oPos.xy - vpOffset.xy) / vpScale.xy * w * pplProj.xy, w, 1);\n"
-             "  o.t5 = float4(dot(pplIV[0], o.t4), dot(pplIV[1], o.t4), dot(pplIV[2], o.t4), 1) - float4(pplSL.xyz, 0);\n";
+             "  o.t5 = float4(dot(pplIV[0], o.t4), dot(pplIV[1], o.t4), dot(pplIV[2], o.t4), 1) - float4(pplSL.xyz, 0);\n"
+             "  o.t6 = float4((o.t5.x + pplSL.x - pplMap.x) * pplMap.z, (o.t5.z + pplSL.z - pplMap.y) * pplMap.z, (o.t5.y + pplSL.y - pplMap.w + 64) / 128, 0);\n"
+             "  o.t7 = float4(pplIV[1].xyz, 0);\n"
+             "  o.t4.w = pplSun.x; o.t5.w = pplSun.y; o.t6.w = pplSun.z; o.t7.w = pplSun.w;\n"; // the world light (ppl.cpp v12g)
+    if (ppl_pos && sm3) s += "  o.t7 = 0;\n";
     // The NV2A fog unit turns the oFog coordinate into a factor with the table mode; D3D9 ignores oFog
     // under table fog, so compute the factor here (the device runs vertex fog on this path).
-    if (writes_fog)
+    if (writes_fog) {
         s += "  float fc = abs(oFog.x), fden = fogParams.y - fogParams.x;\n"
              "  float flin = (fogParams.y - fc) / (abs(fden) > 1e-6 ? fden : 1e-6);\n"
-             "  float fd = fogParams.z * fc;\n"
-             "  o.fog = saturate(dot(fogMode, float4(flin, exp(-fd), exp(-fd * fd), oFog.x)));\n";
-    else
-        s += "  o.fog = 1.0;\n";
+             "  float fd = fogParams.z * fc;\n";
+        s += sm3 ? "  o.t7.x = saturate(dot(fogMode, float4(flin, exp(-fd), exp(-fd * fd), oFog.x)));\n"
+                 : "  o.fog = saturate(dot(fogMode, float4(flin, exp(-fd), exp(-fd * fd), oFog.x)));\n";
+    } else
+        s += sm3 ? "  o.t7.x = 1.0;\n" : "  o.fog = 1.0;\n";
     s += "  return o;\n"
          "}\n";
     return s;

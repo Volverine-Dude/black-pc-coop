@@ -84,18 +84,21 @@ std::string final_input(uint32_t b, bool rgb)
 
 } // namespace
 
-std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube, bool ppl)
+std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube, bool ppl, bool sm3)
 {
     std::string s;
     char b[512];
+    const bool extra = ppl && !sm3 && !ppl_ps_bump(d.PSTextureModes); // lighting: 2 more lights in the bump matrices' place
+    const int pmode = !ppl ? 0 : sm3 ? 2 : extra ? 1 : 0; // ppl_ps_decls / _epilogue: 0 base, 1 +2 lights, 2 ps_3_0 (+9, fog)
     s += "float4 pc[18] : register(c0);\n"  // c0-7 stage C0, c8-15 stage C1, c16/17 final C0/C1
-         "float4 fogColor : register(c18);\n"
-         "float4 bumpMat[4] : register(c19);\n"
+         "float4 fogColor : register(c18);\n";
+    if (!extra) s += "float4 bumpMat[4] : register(c19);\n";
+    s += ""
          "sampler2D s2d0 : register(s0); sampler2D s2d1 : register(s1); sampler2D s2d2 : register(s2); sampler2D s2d3 : register(s3);\n"
          "samplerCUBE scu0 : register(s0); samplerCUBE scu1 : register(s1); samplerCUBE scu2 : register(s2); samplerCUBE scu3 : register(s3);\n"
          "struct PSIn { float4 v0 : COLOR0; float4 v1 : COLOR1; float4 tc0 : TEXCOORD0; float4 tc1 : TEXCOORD1;\n"
          "              float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3;";
-    if (ppl) s += std::string(" float4 tc4 : TEXCOORD4; float4 tc5 : TEXCOORD5; };\n") + ppl_ps_decls();
+    if (ppl) s += std::string(" float4 tc4 : TEXCOORD4; float4 tc5 : TEXCOORD5; float4 tc6 : TEXCOORD6; float4 tc7 : TEXCOORD7;") + std::string("") + " };\n" + ppl_ps_decls(pmode);
     else s += " };\n";
     s += "float4 main(PSIn I) : COLOR0 {\n"
          "  float4 v0 = I.v0, v1 = I.v1;\n"
@@ -243,10 +246,10 @@ std::string psh_to_hlsl(const PixelShaderDef &d, uint32_t tex_cube, bool ppl)
         s += "    float3 A = " + final_input(abcd >> 24, true) + ", B = " + final_input((abcd >> 16) & 0xFF, true) + ", C = " +
              final_input((abcd >> 8) & 0xFF, true) + ", D = " + final_input(abcd & 0xFF, true) + ";\n";
         s += "    float G = " + final_input((efg >> 8) & 0xFF, false) + ";\n";
-        if (ppl) s += std::string("    float4 res = saturate(float4(A * B + (1 - A) * C + D, G));\n") + ppl_ps_epilogue() + "    return res;\n  }\n";
+        if (ppl) s += std::string("    float4 res = saturate(float4(A * B + (1 - A) * C + D, G));\n") + ppl_ps_epilogue(pmode) + "    return res;\n  }\n";
         else s += "    return saturate(float4(A * B + (1 - A) * C + D, G));\n  }\n";
     } else {
-        if (ppl) s += std::string("  float4 res = saturate(r0);\n") + ppl_ps_epilogue() + "  return res;\n";
+        if (ppl) s += std::string("  float4 res = saturate(r0);\n") + ppl_ps_epilogue(pmode) + "  return res;\n";
         else s += "  return saturate(r0);\n";
     }
     s += "}\n";

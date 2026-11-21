@@ -120,6 +120,7 @@ void vs_delete(VertexShader *vs)
     if (!vs) return;
     if (vs->host_vs) vs->host_vs->Release();
     if (vs->host_vs_ppl) vs->host_vs_ppl->Release();
+    if (vs->host_vs_sm3) vs->host_vs_sm3->Release();
     if (vs->program) xk::ExFreePool(vs->program);
     vs->magic = 0;
     xk::ExFreePool(vs);
@@ -158,6 +159,25 @@ IDirect3DVertexShader9 *vs_host_shader(VertexShader *vs)
         if (++n <= 30) logf("[vsh] shader %p translated (%u instructions)", vs, vs->program_insts);
     }
     return host;
+}
+
+// The lighting variant compiled as vs_3_0: a ps_3_0 light pass (12 world lights) needs a vs_3_0 partner (D3D9 does not
+// mix shader model 3 with 2). Null when it does not compile: the draw keeps the shader model 2 pair.
+IDirect3DVertexShader9 *vs_host_shader_sm3(VertexShader *vs)
+{
+    if (!vs || !vs->program) return nullptr;
+    if (vs->host_vs_sm3 || vs->sm3_failed) return vs->host_vs_sm3;
+    std::string hlsl = vsh_to_hlsl(vs->program, vs->program_insts, vs_input_mask(vs), true, true);
+    std::vector<uint8_t> code;
+    std::string errors;
+    if (!compile_cached(hlsl, "nv2a_vsh", {"vs_3_0"}, code, errors) ||
+        FAILED(host3d::dev()->CreateVertexShader((const DWORD *)code.data(), &vs->host_vs_sm3))) {
+        vs->sm3_failed = true;
+        vs->host_vs_sm3 = nullptr;
+        static std::atomic<int> nf{0};
+        if (nf++ < 5) logf("[ppl] vs_3_0 build failed for shader %p (the draw keeps shader model 2): %s", vs, errors.c_str());
+    }
+    return vs->host_vs_sm3;
 }
 
 } // namespace xd3d
