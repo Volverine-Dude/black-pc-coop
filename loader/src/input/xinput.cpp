@@ -354,7 +354,18 @@ void read_pad(uint32_t port, XGamepad &g)
     // AND the keyboard/mouse bindings - so a downed keyboard player is locked out too
     // and a keyboard survivor's X key revives. The downed player has no control
     // (coop.cpp parks the pawn beside the survivor and copies their look).
-    if (g_coop_downed && !g_coop_mission_failed) memset(&g, 0, sizeof g);   // (the mission failed screen needs the pad)
+    // pd1 (owner 20261120: "pausing ingame can cause the pause menu to hang without being able to control anything"):
+    // the world keeps running under the co-op pause menu, so a player can go down while it is open - and the downed
+    // wipe below then took every menu key too. The pause menu (and the mission failed screen) keep the pad; while
+    // downed in play START still goes through, so a downed player can open the pause menu (quit, settings).
+    static bool pd_logged;
+    if (g_coop_downed && !g_coop_mission_failed && !coop_game_paused()) {
+        uint16_t start = g.wButtons & 0x10;
+        memset(&g, 0, sizeof g);
+        g.wButtons = start;
+    }
+    if (g_coop_downed && coop_game_paused() && !pd_logged) { pd_logged = true; logf("[input] co-op: downed with the pause menu open - the menu keeps its keys"); }
+    if (!g_coop_downed) pd_logged = false;
     {   // co-op SPRINT (owner 20261115: "a sprint button bound to L1, only the host can turn it on or off; faster, the
         // weapon lowered, faster bobbing; the player can't fire while sprinting"). Held L1 / the Sprint key while pushing
         // forward (left stick up), not aiming, not downed. coop/coop.cpp scales the run speed, d3d/draw.cpp lowers the gun;

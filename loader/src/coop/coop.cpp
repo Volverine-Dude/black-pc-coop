@@ -804,6 +804,14 @@ static Snap g_snap[32]; static uint32_t g_snap_w;
 static void coop_snap_push(double st, const float pos[3], float yaw, float pitch)
 {
     if (!(st > 0.0)) return;
+    // REJOIN (owner two-PC play 20261120: the joiner saw the host frozen at its spot from the first session after the
+    // host restarted its game and joined again): the sender's clock starts again at 0 in a new process, so every new
+    // snapshot looked older than the last one and was thrown away. A clock more than 3 s back = a new sender: start over.
+    if (g_snap_w && st < g_snap[(g_snap_w - 1) & 31].st - 3000.0) {
+        logf("coop: partner position: the partner's clock went back %.1f s (its game restarted) - snapshots start over",
+             (g_snap[(g_snap_w - 1) & 31].st - st) / 1000.0);
+        g_snap_w = 0;
+    }
     if (g_snap_w && st <= g_snap[(g_snap_w - 1) & 31].st) return;   // old / repeated packet (UDP order)
     if (g_snap_w) {   // itpr1: the sender's state changes at the game's 30 Hz but its packets go out more often - an
                       // unchanged copy made every other snapshot pair still (86 of 180 frames standing); skip it (but
@@ -2251,6 +2259,23 @@ extern "C" void coop_spawn_gate_check(void)
     }
     if (g_sp_sync != 1 || g_cfg.coop_role != 2) return;
     uint32_t sp = g_sg_esi;
+    {   // sw1 (owner two-PC play 20261121: "still some enemies that spawn on the joiner but not the host"): at the part-switch
+        // teleport (joiner 877.6) the spawn table is dropped and indexed again ~300 ms later; a spawner that fired in that
+        // window was not in the (empty) table and went through unheld - spawners #24 / #25 made two enemies the host
+        // never had (own AI, no puppet: +2 enemies on the joiner from then on), and the re-index then credited other
+        // spawners for the reused bodies. The joiner now holds every spawn while the table is dropped (3 s at most);
+        // a held spawner tries again after its short delay and meets the gate below.
+        static ULONGLONG drop_since; static uint32_t wl;
+        ULONGLONG now = GetTickCount64();
+        if (g_sp_n == 0) {
+            if (!drop_since) drop_since = now;
+            if (now - drop_since < 3000) {
+                g_sg_deny = 1;
+                if (wl++ < 40) logf("coop: spawn sync: JOINER spawner %08x held - the spawn table is being indexed again (%.2f s)", sp, (now - drop_since) / 1000.0);
+                return;
+            }
+        } else drop_since = 0;
+    }
     int i = -1;
     for (int k = 0; k < g_sp_n; k++) if (g_sp_obj[k] == sp) { i = k; break; }
     if (i < 0) return;                                            // not an indexed spawner: leave it alone
@@ -3942,8 +3967,9 @@ static void coop_revive_step(uint32_t ctrl)
     }
     float hp = *(volatile float *)(uintptr_t)(po + 0x2F0);
     float mx = (po == g_player_max_obj && g_player_max_hp > 1.0f) ? g_player_max_hp : 1200.0f;
-    float cost = 0.25f * mx;
-    if (hp <= cost + 0.5f) {
+    // REVIVE COST (owner 20261120, the host's lobby option): OFF = a revive costs nothing (and low health does not block it)
+    float cost = g_coop_revcost_on ? 0.25f * mx : 0.0f;
+    if (cost > 0.0f && hp <= cost + 0.5f) {
         if (prog) logf("coop: revive: stopped - our health %.0f is 25 %% or less", hp);
         prog = 0; g_coop_revive_prog = 0;
         strncpy(g_coop_warn_msg, "NOT ENOUGH HEALTH TO REVIVE - YOU NEED MORE THAN 25%", sizeof g_coop_warn_msg - 1);
@@ -3966,8 +3992,9 @@ static void coop_revive_step(uint32_t ctrl)
     rp.feet[0] = pf[0] + ax * push; rp.feet[1] = pf[1]; rp.feet[2] = pf[2] + az * push;
     rp.yaw = 57.2957795f * atan2f(-ax, -az);          // the revived player faces us
     for (int r = 0; r < 3; r++) sendto(g_coop_sock, (const char *)&rp, (int)sizeof rp, 0, (const sockaddr *)&g_coop_target, sizeof g_coop_target);
-    logf("coop: revive: DONE - the partner stands up at %.1f %.1f %.1f; our health %.0f -> %.0f (-25 %%)", rp.feet[0], rp.feet[1], rp.feet[2], hp, hp - cost);
-    strncpy(g_coop_info_msg, "PARTNER REVIVED - 25% OF YOUR HEALTH USED", sizeof g_coop_info_msg - 1);
+    logf("coop: revive: DONE - the partner stands up at %.1f %.1f %.1f; our health %.0f -> %.0f (%s)", rp.feet[0], rp.feet[1], rp.feet[2], hp, hp - cost,
+         cost > 0.0f ? "-25 %" : "REVIVE COST off");
+    strncpy(g_coop_info_msg, cost > 0.0f ? "PARTNER REVIVED - 25% OF YOUR HEALTH USED" : "PARTNER REVIVED", sizeof g_coop_info_msg - 1);
     g_coop_info_msg_until = now + 3000;
     g_coop_peer_downed = 0; cool = now + 2500; prog = 0; g_coop_revive_prog = 0;
 }
@@ -12403,6 +12430,122 @@ static void coop_prop_recv(const uint8_t *raw, int len)
 // clears +0x210C8 for the world update only and sets it back - the world (AI, physics, our co-op step) keeps
 // running while the menu (and the game's own input block) stays. Env COOP_NO_PAUSE=0 = off.
 volatile uint32_t g_np_on, g_np_world_fn, g_np_runs;
+// PAUSE BANK GATE (owner two-PC play 20261121: "the pause hang is still there"; joiner log 949-971; owner: "keep the
+// gun ... and not pause the game while in the pause menu, it could cause desync"). Opening the pause menu pauses the
+// sound and lets the weapon's sound bank go (fpguns\bg1_gk1.db + .WDD: the gun's SOUNDS, not its model). In co-op the
+// world kept running under the menu and the sound-bank scheduler FUN_00147900 (run each frame by the sound update
+// FUN_00150600) asked for that bank again at once; with little room its load was retried every 100 ms for 22 s and the
+// menu's own page (PseMenu.bin) waited behind it - a pause menu that never came up. While the pause menu is up the
+// scheduler now does nothing (the game's sound is paused then anyway); the world keeps running, and the bank loads as
+// soon as the menu closes. Hook at the scheduler's entry (81 EC 18 01 00 00 = sub esp, 0x118, re-executed).
+volatile unsigned long long g_pse_open_ms;
+volatile uint32_t g_bank_deny, g_bank_resume;
+// pb2 (owner two-PC play 20261121 on -83: "the host pause menu still hangs" - host 1128.6: the menu's page came 4.5 s
+// late, 1204.5: 14.6 s, the gun bank bg1_gk1.db reopened every ~85 ms all along although the scheduler above was held):
+// the bank's job was already in the game's file loader. The loader (0x1fbbb0, run on its own thread) walks its 10 job
+// slots (0x13C bytes each) in a fixed order and works only on the FIRST pending one - the bank's slot comes before the
+// menu page's, and its open / alloc kept failing and retrying, so the page never got its turn. While the pause menu is
+// up, a slot that holds a sound-bank job (callback LAB_00141090 at +0x110, set by FUN_00147900) and is not in the middle
+// of a read is passed over; the menu's page loads; the bank job carries on when the menu closes.
+volatile uint32_t g_bank_cb, g_ld_cont, g_ld_read, g_ld_next, g_bank_slot_skips;
+// NO STOPPING HINTS (owner two-PC play 20261121: "the joiner had tutorial hints that would freeze his game and add a blur,
+// both shouldn't be there ... could cause desync and most likely caused the crash on the joiner"). Joiner 291.7 - 302.2:
+// a tutorial hint (PRESS A TO CONTINUE) stopped its whole game for 10.5 s - world, co-op step and all - then the co-op
+// sync caught up in one frame (7 kills, forced spawns) and 3 s later the joiner crashed (0x69955). The HUD's hint code
+// asks FUN_0012a900 whether a hint id is one of the 5 "stopping" hints (table 0x28AA80); yes = game +0x21098 = 3 (the
+// game stops) + the blur (0x131c47..). In co-op it now always answers no: the hint shows as a normal on-screen tip that
+// goes away by itself - no stop, no blur, on either player.
+volatile uint32_t g_hint_resume;
+__declspec(naked) void coop_thunk_hint()   // 0x12a900: B8 80 AA 28 00 (mov eax, 0x28aa80) re-executed
+{
+    __asm {
+        cmp dword ptr [g_np_on], 0
+        jne nostop
+        mov eax, 0x0028AA80
+        jmp dword ptr [g_hint_resume]
+    nostop:
+        xor al, al
+        ret
+    }
+}
+__declspec(naked) void coop_thunk_loader()   // 0x1fbbc0: 8A 50 FF 84 D2 (mov dl, [eax-1]; test dl, dl) + 75 22
+{
+    __asm {
+        mov dl, byte ptr [eax - 1]
+        test dl, dl
+        jne readcheck
+        cmp dword ptr [g_bank_deny], 0
+        je normal
+        push ecx
+        mov ecx, dword ptr [eax - 0x25]       // slot +0x110 (eax = slot + 0x135)
+        cmp ecx, dword ptr [g_bank_cb]
+        pop ecx
+        jne normal
+        lock inc dword ptr [g_bank_slot_skips]
+        jmp dword ptr [g_ld_next]
+    normal:
+        jmp dword ptr [g_ld_cont]
+    readcheck:   // pb3: the failing bank job sits in the READ state and starts over each tick (slot +0x11C = 0 bytes
+                 // read, the file reopened) - at that point no read is in progress, so it can be passed over too
+        cmp dword ptr [g_bank_deny], 0
+        je reading
+        push ecx
+        mov ecx, dword ptr [eax - 0x25]       // slot +0x110: the job's callback
+        cmp ecx, dword ptr [g_bank_cb]
+        jne readpop
+        cmp dword ptr [eax - 0x19], 0         // slot +0x11C: bytes read so far
+        jne readpop
+        pop ecx
+        lock inc dword ptr [g_bank_slot_skips]
+        jmp dword ptr [g_ld_next]
+    readpop:
+        pop ecx
+    reading:
+        jmp dword ptr [g_ld_read]
+    }
+}
+static bool coop_pause_menu_up()
+{
+    uint32_t S = *(volatile uint32_t *)(uintptr_t)0x002D45F0;
+    if (!(S >= 0x80000000 && S < 0x84000000 && *(volatile uint8_t *)(uintptr_t)(S + 0x210C8) != 0)) return false;
+    uint32_t fe = *(volatile uint32_t *)(uintptr_t)xbe_va(0x002D199C);
+    const char *page = fe ? (const char *)(uintptr_t)(fe + 0x3840) : "";
+    return _strnicmp(page, "PauseMenu", 9) == 0;
+}
+extern "C" void coop_bank_gate_check(void)
+{
+    static ULONGLONG start; static uint32_t skipped; static bool page_logged;
+    bool up = g_np_on && coop_pause_menu_up();
+    ULONGLONG now = GetTickCount64();
+    if (up) {
+        if (!start) { start = now; skipped = 0; page_logged = false; }
+        skipped++;
+        if (!page_logged && g_pse_open_ms >= start) {
+            page_logged = true;
+            logf("coop: pause: the menu's page was read %.2f s after the pause (sound banks on hold, the world runs)", (g_pse_open_ms - start) / 1000.0);
+        }
+    } else if (start) {
+        logf("coop: pause: menu closed after %.1f s - sound-bank loads held %u times, a queued bank job passed over %u times; they run again",
+             (now - start) / 1000.0, skipped, g_bank_slot_skips);
+        g_bank_slot_skips = 0;
+        start = 0;
+    }
+    g_bank_deny = up ? 1 : 0;
+}
+__declspec(naked) void coop_thunk_bank()
+{
+    __asm {
+        pushad
+        call coop_bank_gate_check
+        popad
+        cmp dword ptr [g_bank_deny], 0
+        jne skipbank
+        sub esp, 0x118
+        jmp dword ptr [g_bank_resume]
+    skipbank:
+        ret 4
+    }
+}
 __declspec(naked) void coop_thunk_world()
 {
     __asm {
@@ -12624,6 +12767,41 @@ static void install_no_pause(void)
     memcpy(c + 1, &rel, 4);
     g_np_on = 1;
     logf("coop: no-pause installed at 0x20f7ff (the world update runs under the in-level pause menu)");
+    {   // the pause bank gate (see coop_thunk_bank)
+        static const uint8_t kBank[6] = {0x81, 0xEC, 0x18, 0x01, 0x00, 0x00};
+        uint32_t b = xbe_va(0x00147900);
+        auto *bc = (uint8_t *)(uintptr_t)b;
+        if (memcmp(bc, kBank, 6) != 0) logf("coop: pause bank gate: 0x147900 is not sub esp, 0x118 - not installed");
+        else {
+            g_bank_resume = b + 6;
+            int32_t r2 = (int32_t)((uintptr_t)coop_thunk_bank - (b + 5));
+            bc[0] = 0xE9; memcpy(bc + 1, &r2, 4); bc[5] = 0x90;
+            logf("coop: pause bank gate installed at 0x147900 (no sound-bank loads while the pause menu is up)");
+            {   // no stopping hints (see coop_thunk_hint)
+                static const uint8_t kHint[5] = {0xB8, 0x80, 0xAA, 0x28, 0x00};
+                uint32_t hsite = xbe_va(0x0012A900);
+                auto *hc = (uint8_t *)(uintptr_t)hsite;
+                if (memcmp(hc, kHint, 5) != 0) logf("coop: no stopping hints: 0x12a900 is not mov eax, 0x28aa80 - not installed");
+                else {
+                    g_hint_resume = hsite + 5;
+                    int32_t r4 = (int32_t)((uintptr_t)coop_thunk_hint - (hsite + 5));
+                    hc[0] = 0xE9; memcpy(hc + 1, &r4, 4);
+                    logf("coop: no stopping hints installed at 0x12a900 (tutorial hints show as tips - no game stop, no blur)");
+                }
+            }
+            static const uint8_t kLd[7] = {0x8A, 0x50, 0xFF, 0x84, 0xD2, 0x75, 0x22};
+            uint32_t l = xbe_va(0x001FBBC0);
+            auto *lc = (uint8_t *)(uintptr_t)l;
+            if (memcmp(lc, kLd, 7) != 0) logf("coop: pause loader skip: 0x1fbbc0 is not the job-slot test - not installed");
+            else {
+                g_bank_cb = xbe_va(0x00141090);
+                g_ld_cont = xbe_va(0x001FBBC7); g_ld_read = xbe_va(0x001FBBE9); g_ld_next = xbe_va(0x001FBBD3);
+                int32_t r3 = (int32_t)((uintptr_t)coop_thunk_loader - (l + 5));
+                lc[0] = 0xE9; memcpy(lc + 1, &r3, 4);
+                logf("coop: pause loader skip installed at 0x1fbbc0 (a queued sound-bank job waits while the pause menu is up)");
+            }
+        }
+    }
 }
 // AGENT LIST GUARD (mf6 joiner crash 0x195e61 at the RESTART reload): FUN_001abd30 (level unload) runs
 // FUN_00195e00 on each of the 16 brains; a brain whose +0x134 says "in the agent list" (1 / 2) is unlinked
@@ -14410,12 +14588,19 @@ static void install_exit_sync()
 volatile int g_coop_load_ui;
 volatile uint32_t g_orig_load;
 uint32_t g_load_seq; static uint32_t g_peer_load_seq, g_load_sent_seq;
+// REJOIN (owner two-PC play 20261120: "loading sync doesnt work"): g_load_seq counts every load since this game started,
+// so after a second session in the same window (or one copy restarted) the two copies' numbers no longer matched - the
+// barrier opened at once ("both loaded after 0.0 s") or waited for a number the partner never sends. The barrier now
+// numbers loads from this session's start (coop_activate sets g_load_base); g_load_seq itself keeps counting (level
+// prepare and the per-load caches compare against it).
+static uint32_t g_load_base;
+static inline uint32_t coop_load_n() { return g_load_seq - g_load_base; }
 static ULONGLONG g_load_wait_since, g_load_send_ms, g_load_go_ms;
 static void coop_load_recv(uint32_t seq)
 {
     if (seq > g_peer_load_seq) {
         g_peer_load_seq = seq;
-        logf("coop: loading: the partner finished load #%u (ours #%u%s)", seq, g_load_seq, g_load_wait_since ? ", we wait" : "");
+        logf("coop: loading: the partner finished load #%u (ours #%u%s)", seq, coop_load_n(), g_load_wait_since ? ", we wait" : "");
     }
 }
 static void coop_load_send(uint32_t seq)
@@ -14431,7 +14616,7 @@ static void coop_load_keepalive()
     if (!g_load_sent_seq || !g_cfg.coop_role) return;
     ULONGLONG now = GetTickCount64();
     if (g_load_go_ms && now - g_load_go_ms > 5000) return;
-    if (now - g_load_send_ms >= 250) { g_load_send_ms = now; coop_load_send(g_load_sent_seq); }
+    if (now - g_load_send_ms >= 250) { g_load_send_ms = now; coop_load_send(g_load_sent_seq - g_load_base); }
 }
 static uint32_t __stdcall coop_load_gate(uint32_t world)
 {
@@ -14440,7 +14625,7 @@ static uint32_t __stdcall coop_load_gate(uint32_t world)
     if (prev == 1 || prev == 0x37) {   // a load starts
         g_load_seq++;
         g_load_wait_since = 0; g_load_go_ms = 0; g_coop_load_ui = 0;
-        if (g_cfg.coop_role) logf("coop: loading: load #%u starts", g_load_seq);
+        if (g_cfg.coop_role) logf("coop: loading: load #%u starts", coop_load_n());
     }
     uint32_t r = ((LoadFn)(uintptr_t)g_orig_load)(world);
     if (!g_cfg.coop_role || g_coop_sock == INVALID_SOCKET) return r;
@@ -14460,19 +14645,19 @@ static uint32_t __stdcall coop_load_gate(uint32_t world)
         if (g_load_sent_seq != g_load_seq) {
             g_load_sent_seq = g_load_seq; g_load_send_ms = 0;
             g_load_wait_since = now;
-            logf("coop: loading: load #%u done here - telling the partner%s", g_load_seq,
-                 g_peer_load_seq >= g_load_seq ? " (it is done too)" : ", waiting for it");
+            logf("coop: loading: load #%u done here - telling the partner%s", coop_load_n(),
+                 g_peer_load_seq >= coop_load_n() ? " (it is done too)" : ", waiting for it");
             coop_load_keepalive();
         }
-        if (g_peer_load_seq < g_load_seq && now - g_load_wait_since < 120000) {
+        if (g_peer_load_seq < coop_load_n() && now - g_load_wait_since < 120000) {
             *(volatile uint32_t *)(uintptr_t)(world + 0x5AE0) = 0x16;   // not yet: the last load step again next frame
             g_coop_load_ui = 1;
             return r & 0xFFFFFF00;
         }
         g_coop_load_ui = 0;
         g_load_go_ms = now;
-        logf("coop: loading: load #%u - %s after %.1f s of waiting - the level starts", g_load_seq,
-             g_peer_load_seq >= g_load_seq ? "both loaded" : "NO WORD FROM THE PARTNER (120 s)", (now - g_load_wait_since) / 1000.0);
+        logf("coop: loading: load #%u - %s after %.1f s of waiting - the level starts", coop_load_n(),
+             g_peer_load_seq >= coop_load_n() ? "both loaded" : "NO WORD FROM THE PARTNER (120 s)", (now - g_load_wait_since) / 1000.0);
     }
     return r;
 }
@@ -14518,6 +14703,14 @@ void coop_activate(int role, uint32_t peer_ip)
     g_peer_alive_ms = 0;
     if (g_cfg.coop_role && g_coop_sock != INVALID_SOCKET) { logf("coop: activate: already active (role %d)", g_cfg.coop_role); return; }
     g_session_over = false; g_quit_in = 0; g_coop_end_msg[0] = 0;
+    // REJOIN (owner two-PC play 20261120): a second session in the same window kept the first partner's numbers - the
+    // loading barrier, the position snapshots and the event sequence filters threw the new partner's packets away.
+    logf("coop: activate: new session - partner state cleared (loads so far %u, snapshots %u)", g_load_seq, g_snap_w);
+    g_load_base = g_load_seq; g_peer_load_seq = 0; g_load_sent_seq = 0;
+    g_load_wait_since = 0; g_load_send_ms = 0; g_load_go_ms = 0; g_coop_load_ui = 0;
+    g_snap_w = 0;
+    g_an_last_in = 0; g_ob_last_in = 0; g_pj_last_in = 0;
+    g_coop_peer_skip = 0; g_coop_peer_intro = 0;
     in_addr ia; ia.s_addr = peer_ip;
     char ip[32] = {0};
     inet_ntop(AF_INET, &ia, ip, sizeof ip);

@@ -298,6 +298,9 @@ NTSTATUS open_common(const char *what, HANDLE *FileHandle, ACCESS_MASK access, X
     }
     logf("[k] %s('%s' -> %s, access 0x%x, share %u, disp %u, opts 0x%x) -> 0x%08x handle %p", what, req.c_str(),
          r.xbox_path.c_str(), access, share, disp, opts, s, NT_OK(s) ? h : nullptr);
+    {   // co-op pause hold (coop/coop.cpp coop_np_hold): the moment the pause menu's page file is opened
+        if (NT_OK(s) && req.size() >= 11 && _stricmp(req.c_str() + req.size() - 11, "PseMenu.bin") == 0) g_pse_open_ms = GetTickCount64();
+    }
     if (!NT_OK(s))
         logf("[k]     attrs 0x%x, alloc %lld, host access 0x%x opts 0x%x disp %u", attrs, alloc ? alloc->QuadPart : -1LL, a, o, d);
     return s;

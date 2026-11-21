@@ -31,7 +31,9 @@ volatile int g_coop_code_len = -1;
 volatile int g_coop_skip_ui;
 volatile int g_coop_diffmode_on;          // this session's DIFFICULTY (host: its option; joiner: the host's, from the heartbeat)
 volatile int g_coop_special_on = 1;       // this session's SPECIAL WEAPONS (same)
-char g_coop_lobby_banner[2][64];          // the lobby's top banners (status / player 2 on the host; the host's options on the joiner)
+char g_coop_lobby_banner[3][64];
+volatile int g_coop_skipmovies_on;
+volatile int g_coop_revcost_on = 1;        // this session's REVIVE COST (same)         // this session's SKIP MOVIES (host: its option; joiner: the host's, from the heartbeat)          // the lobby's top banners (status / player 2 on the host; the host's options on the joiner)
 
 namespace {
 
@@ -250,7 +252,7 @@ void host_poll(ULONGLONG now)
     if (g_have_joiner && now - g_beat_ms >= kBeatMs) {
         g_beat_ms = now;
         char hb[8]; memcpy(hb, g_code, sizeof hb); hb[6] = g_cfg.coop_sprint ? 1 : 0;   // the host's SPRINT option rides the heartbeat
-        hb[7] = (char)(0x80 | (g_cfg.coop_diffmode ? 1 : 0) | (g_cfg.coop_special ? 2 : 0));   // and DIFFICULTY / SPECIAL WEAPONS (0x80 = present)
+        hb[7] = (char)(0x80 | (g_cfg.coop_diffmode ? 1 : 0) | (g_cfg.coop_special ? 2 : 0) | (g_cfg.coop_skipmovies ? 4 : 0) | (g_cfg.coop_revivecost ? 8 : 0));   // + SKIP MOVIES   // and DIFFICULTY / SPECIAL WEAPONS (0x80 = present)
         send_to(g_joiner, kBeat, hb);
         if (g_started) send_to(g_joiner, kActivate, g_code);   // until the mission goes (a lost CLAC)
     }
@@ -260,14 +262,25 @@ void host_poll(ULONGLONG now)
         sendto(g_sock, (const char *)&g_go, sizeof g_go, 0, (const sockaddr *)&g_joiner, sizeof g_joiner);
         if (!g_go_sends) { logf("coop menu: HOST: the mission went to the joiner - lobby closed"); net_close(); g_page = None; return; }
     }
-    show(0, g_sock == INVALID_SOCKET ? "-" : g_code);
+    show(0, g_cfg.coop_skipmovies ? "ON" : "OFF");
     show(1, g_cfg.coop_diffmode ? "CO-OP" : "VANILLA");
     show(2, g_cfg.coop_special ? "ON" : "OFF");
     show(3, g_cfg.coop_sprint ? "ON" : "OFF");
+    show(5, g_cfg.coop_revivecost ? "ON" : "OFF");
+    g_coop_revcost_on = g_cfg.coop_revivecost ? 1 : 0;
+    {   // owner 20261120: LEAVE LOBBY gave its row to REVIVE COST - "have a mention that pressing B will make you leave the lobby"
+        static const char kLeave[] = "PRESS B / ESC TO LEAVE THE LOBBY";
+        if (!g_coop_info_msg[0] || strcmp(g_coop_info_msg, kLeave) == 0 || now > g_coop_info_msg_until) {
+            strncpy(g_coop_info_msg, kLeave, sizeof g_coop_info_msg - 1);
+            g_coop_info_msg_until = now + 300;
+        }
+    }
     // the lobby redesign (owner 20261118): STATUS and PLAYER 2 are banners at the top of the screen
     snprintf(g_coop_lobby_banner[0], sizeof g_coop_lobby_banner[0], "STATUS: %s", g_sock == INVALID_SOCKET ? "PORT BUSY" : g_started ? "STARTING..." :
              g_start_refused ? "PLAYER 2 NOT READY" : !g_have_joiner ? "WAITING FOR PLAYER 2" : g_peer_ready ? "ALL READY" : "PLAYER 2 JOINED");
     snprintf(g_coop_lobby_banner[1], sizeof g_coop_lobby_banner[1], "PLAYER 2: %s", !g_have_joiner ? "-" : g_peer_ready ? "READY" : "NOT READY");
+    snprintf(g_coop_lobby_banner[2], sizeof g_coop_lobby_banner[2], "CODE: %s", g_sock == INVALID_SOCKET ? "-" : g_code);
+    g_coop_skipmovies_on = g_cfg.coop_skipmovies ? 1 : 0;
     g_coop_sprint_allowed = g_cfg.coop_sprint ? 1 : 0;   // the host's own options
     g_coop_diffmode_on = g_cfg.coop_diffmode ? 1 : 0;
     g_coop_special_on = g_cfg.coop_special ? 1 : 0;
@@ -419,6 +432,12 @@ void join_poll(ULONGLONG now)
             if (dm != g_coop_diffmode_on || sw != g_coop_special_on)
                 logf("coop menu: JOIN: the host's DIFFICULTY %s, SPECIAL WEAPONS %s", dm ? "CO-OP" : "VANILLA", sw ? "ON" : "OFF");
             g_coop_diffmode_on = dm; g_coop_special_on = sw;
+            int sk = (opt & 0x80) && (opt & 4) ? 1 : 0;
+            if (sk != g_coop_skipmovies_on) logf("coop menu: JOIN: the host's SKIP MOVIES %s", sk ? "ON" : "OFF");
+            g_coop_skipmovies_on = sk;
+            int rc = (opt & 0x80) ? ((opt & 8) ? 1 : 0) : 1;   // an older host sends no bit: the cost stays
+            if (rc != g_coop_revcost_on) logf("coop menu: JOIN: the host's REVIVE COST %s", rc ? "ON" : "OFF");
+            g_coop_revcost_on = rc;
         } else if (m.magic == kActivate && g_join == Join::InLobby && !g_started) {
             g_started = true;
             g_host_ms = now;
@@ -457,7 +476,9 @@ void join_poll(ULONGLONG now)
     if (g_join == Join::InLobby) {   // the host's options, shown to the joiner as the lobby banners
         snprintf(g_coop_lobby_banner[0], sizeof g_coop_lobby_banner[0], "DIFFICULTY: %s", g_coop_diffmode_on ? "CO-OP" : "VANILLA");
         snprintf(g_coop_lobby_banner[1], sizeof g_coop_lobby_banner[1], "SPECIAL WEAPONS: %s", g_coop_special_on ? "ON" : "OFF");
-    } else g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = 0;
+        snprintf(g_coop_lobby_banner[2], sizeof g_coop_lobby_banner[2], "SKIP MOVIES: %s - REVIVE COST: %s", g_coop_skipmovies_on ? "ON" : "OFF",
+                 g_coop_revcost_on ? "ON" : "OFF");
+    } else g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = g_coop_lobby_banner[2][0] = 0;
 }
 
 // The joiner starts the host's mission as the host's own menus did: the LevelSelect handler (FUN_0011B890) with the
@@ -580,6 +601,24 @@ void coop_menu_change(int id, int dir)
         }
         return;
     }
+    if (id == 412) {   // the host lobby: REVIVE COST on / off (host only; it reaches the joiner with the heartbeat)
+        (void)dir;
+        if (g_page == HostLobby && !g_started) {
+            g_cfg.coop_revivecost = !g_cfg.coop_revivecost;
+            settings_save();
+            logf("coop menu: HOST: REVIVE COST %s", g_cfg.coop_revivecost ? "ON" : "OFF");
+        }
+        return;
+    }
+    if (id == 411) {   // the host lobby: SKIP MOVIES on / off (host only; it reaches the joiner with the heartbeat)
+        (void)dir;
+        if (g_page == HostLobby && !g_started) {
+            g_cfg.coop_skipmovies = !g_cfg.coop_skipmovies;
+            settings_save();
+            logf("coop menu: HOST: SKIP MOVIES %s", g_cfg.coop_skipmovies ? "ON" : "OFF");
+        }
+        return;
+    }
     if (id == 408) {   // the host lobby: SPRINT on / off (host only; it reaches the joiner with the heartbeat)
         (void)dir;
         if (g_page == HostLobby && !g_started) {
@@ -673,7 +712,7 @@ void coop_menu_poll()
         show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");
         show(3, g_cfg.ppl ? "ON" : "OFF");
     }
-    if (g_page != HostLobby && g_page != JoinCode) { g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = 0; return; }
+    if (g_page != HostLobby && g_page != JoinCode) { g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = g_coop_lobby_banner[2][0] = 0; return; }
     ULONGLONG now = GetTickCount64();
     if (g_page == HostLobby) host_poll(now);
     else join_poll(now);
@@ -698,6 +737,7 @@ void coop_menu_char(wchar_t c)
 // co-op receive loop runs in the play tick, which does not run during a movie: the gate reads the partner's CLSK
 // itself (coop_poll_control). A movie that just ends goes on as always.
 static bool g_skip_wait, g_skip_pass, g_skip_was_down;
+static ULONGLONG g_mv_since, g_mv_try;   // SKIP MOVIES: the movie's start, the last skip press (cleared between movies)
 static int g_skip_inject;
 bool coop_skip_holding() { return g_cfg.coop_role && movies_playing() && !g_skip_pass && g_skip_inject == 0; }
 void coop_skip_gate(uint16_t &buttons, uint8_t analog[8], bool &enter)
@@ -711,6 +751,7 @@ void coop_skip_gate(uint16_t &buttons, uint8_t analog[8], bool &enter)
     bool press = down && !g_skip_was_down;
     g_skip_was_down = down;
     if (!movie) {   // between movies: reset; a partner's press is stale 5 s after the movie
+        g_mv_since = g_mv_try = 0;
         g_skip_wait = g_skip_pass = false;
         g_skip_inject = 0;
         if (g_coop_peer_skip && off_since && now - off_since > 5000) g_coop_peer_skip = 0;
@@ -718,6 +759,20 @@ void coop_skip_gate(uint16_t &buttons, uint8_t analog[8], bool &enter)
         return;
     }
     coop_poll_control();
+    {   // SKIP MOVIES (owner 20261120, the host's lobby option): every movie of the session skips itself on both copies -
+        // one real A press 0.5 s after the movie starts (an earlier press can be lost); again every 2 s while it still plays
+        if (!g_mv_since) g_mv_since = now;
+        if (g_coop_skipmovies_on && g_skip_inject == 0 && now - g_mv_since > 500 && (!g_mv_try || now - g_mv_try > 2000)) {
+            logf("coop: skip: SKIP MOVIES is on - the movie is skipped%s", g_mv_try ? " (again: it still plays)" : "");
+            g_mv_try = now;
+            g_skip_wait = false;
+            g_skip_pass = true;
+            g_skip_inject = 8;
+        }
+    }
+    // sk5 (owner two-PC play 20261120: a briefing movie played in full): a press that went out before the partner's
+    // movie was open could be lost - while we wait, CLSK goes out again every second
+    if (g_skip_wait && !g_skip_pass) { static ULONGLONG rs; if (now - rs >= 1000) { rs = now; coop_send_skip(); } }
     if (g_coop_peer_skip && now - g_coop_peer_skip_ms > 60000) g_coop_peer_skip = 0;
     if (g_skip_wait && g_coop_peer_skip && !g_skip_inject) {   // both pressed: one real A press for the game
         logf("coop: skip: both players pressed - the movie is skipped");

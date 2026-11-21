@@ -1564,13 +1564,17 @@ bool fe_build_pages(const std::wstring &game_dir, const std::wstring &out_root)
             // owner 20261118 (the lobby redesign): STATUS and PLAYER 2 moved to two banners at the top of the screen
             // (fe/coop_menu.cpp g_coop_lobby_banner, drawn by d3d/device.cpp); their rows became two host options:
             // DIFFICULTY (VANILLA / CO-OP: players take more damage) and SPECIAL WEAPONS (the game's silver / gold weapons)
-            Movie lobby(sound);   // rows show &PC_V<row>: the code, the difficulty mode, special weapons, sprint
-            choice_page(lobby, "LAN LOBBY", {{RowSpec::Choice, 403, "CODE", "&PC_V0", "PCCoopChange"},
+            // owner 20261120: "remove the code menu section on the host lobby and put it in a banner ... and add a skip
+            // movie toggle instead" - the code is the third banner; row 0 is SKIP MOVIES (host only)
+            Movie lobby(sound);   // rows show &PC_V<row>: skip movies, the difficulty mode, special weapons, sprint
+            choice_page(lobby, "LAN LOBBY", {{RowSpec::Choice, 411, "SKIP MOVIES", "&PC_V0", "PCCoopChange"},
                                              {RowSpec::Choice, 409, "DIFFICULTY", "&PC_V1", "PCCoopChange"},
                                              {RowSpec::Choice, 410, "SPECIAL WEAPONS", "&PC_V2", "PCCoopChange"},
                                              {RowSpec::Choice, 408, "SPRINT", "&PC_V3", "PCCoopChange"},   // owner 20261115: host-only option
                                              {RowSpec::Action, 41, "START MISSION", "", "PCCoop"},
-                                             {RowSpec::Action, 42, "LEAVE LOBBY", "", "PCCoop"}}, "CoopHost", true, 220);   // step 4: only with player 2 READY (fe/coop_menu.cpp opens mission select)
+                                             // owner 20261120: "replace LEAVE LOBBY" (six rows at most) - Back leaves the lobby
+                                             // the same way; a bottom note says so (fe/coop_menu.cpp host_poll)
+                                             {RowSpec::Choice, 412, "REVIVE COST", "&PC_V5", "PCCoopChange"}}, "CoopHost", true, 220);   // step 4: only with player 2 READY (fe/coop_menu.cpp opens mission select)
             add_movie(c, "cooplobby", lobby.build());
             Movie code(sound);
             choice_page(code, "JOIN LAN GAME", {{RowSpec::Choice, 401, "CODE", "&PC_V0", "PCCoopChange"},
