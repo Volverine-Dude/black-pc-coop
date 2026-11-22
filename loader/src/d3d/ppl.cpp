@@ -120,7 +120,8 @@ float flash_intensity()
                 logf("[ppl] weapon type %d%s fired (fire type %d, magazine now %d): %s flash, gain %.2f reach %.1f m decay %.0f ms",
                      type, silenced ? " SUPPRESSED" : "", fire_type, clip, g_flash.name, g_flash.gain, g_flash.reach, g_flash.decay_ms);
             }
-            if (g_flash_pulses++ < 300) logf("[ppl] flash pulse %u: player rounds %u, weapon type %d%s", g_flash_pulses, shots, type, silenced ? " (suppressed)" : "");
+            // (20 lines, was 300: a log write can block the game thread - the perf recording caught 600-750 ms frames in it)
+            if (g_flash_pulses++ < 20) logf("[ppl] flash pulse %u: player rounds %u, weapon type %d%s", g_flash_pulses, shots, type, silenced ? " (suppressed)" : "");
             static uint32_t seed = 0x9E3779B9u;
             seed = seed * 1664525u + 1013904223u;
             peak = 0.75f + 0.25f * (float)(seed >> 8) / 16777216.0f;
@@ -2082,15 +2083,6 @@ static void impact_flashes(uint32_t f, uint32_t mgr, const uint16_t *idx, uint32
         if (!warm || flashes >= 24 || impact_kind(def) != 1) continue; // (a cap for a frame of many hits)
         float m[3];
         if (!safe_read(m, inst + 0x50, 12) || !std::isfinite(m[0]) || !std::isfinite(m[1]) || !std::isfinite(m[2])) continue;
-        static uint32_t dl;
-        if (dl < 100) { // the first new impacts (one hit = one instance: checked on mission 4)
-            dl++;
-            char nm[16] = {};
-            safe_read(nm, def, 15);
-            for (char &ch : nm)
-                if (ch && (ch < 0x20 || ch >= 0x7F)) ch = '.';
-            logf("[ppl] impact %s inst %08X at %.2f %.2f %.2f", nm, inst, m[0], m[1], m[2]);
-        }
         spark_flash_at(m);
         flashes++;
     }
@@ -2098,7 +2090,7 @@ static void impact_flashes(uint32_t f, uint32_t mgr, const uint16_t *idx, uint32
 
 void update_emitters(uint32_t f)
 {
-    if (!ppl_med()) { g_em_ok = false; return; } // LIGHTING LOW: no fires
+    if (!ppl_level()) { g_em_ok = false; return; }
     static uint32_t done;
     if (done == f) return;
     done = f;
@@ -2126,6 +2118,9 @@ void update_emitters(uint32_t f)
     if (cnt && !safe_read(idx, arr, cnt * 2u)) return;
     g_em_ok = true;
     impact_flashes(f, mgr, idx, cnt);
+    // owner: "put the sparks on the LOW setting of LIGHTING if it doesnt cost much": LOW reads the list for the metal
+    // impacts' flashes (above) and stops here - no fires, glows or lamps (MED)
+    if (!ppl_med()) { g_em_ok = false; return; }
     g_em_live = cnt;
     auto take = [&](uint32_t inst, uint32_t obj) {
         uint32_t def = 0;
@@ -2959,7 +2954,7 @@ void ppl_frame_prepare(const VertexShader *vs)
     g_vp_frame = f;
     frame_world_lights();
     static const bool off = getenv("BLACK_PPL_SHADOWS") && getenv("BLACK_PPL_SHADOWS")[0] == '0';
-    if (!off && g_vl_n) ppl_shadow_render(g_vl[0].wpos, g_vl[0].pos, g_vl[0].reach);
+    if (!off && g_vl_n && !g_vl[0].spark) ppl_shadow_render(g_vl[0].wpos, g_vl[0].pos, g_vl[0].reach); // no cube for a spark flash (ppl_upload)
 }
 
 extern float g_sun[3], g_sun_w; // the world light (below)
@@ -3092,7 +3087,10 @@ void ppl_upload(IDirect3DDevice9 *d)
         L[3][0] = L[3][1] = L[3][2] = 0.0f, L[3][3] = 14.0f;
         C[3][0] = hl, C[3][1] = hl, C[3][2] = hl * 1.05f, C[3][3] = 0.8f;
     }
-    if (g_vl_n && ppl_shadow_bind(d, g_vl[0].wpos)) C[1][3] = 1.0f; // slot 1 = g_vl[0], if the cube is for it
+    // slot 1 = g_vl[0], if the cube is for it. Not for a spark flash (owner: sparks on LOW "if it doesnt cost much"):
+    // each new spark that was the strongest light rebuilt the cube (15-20k triangles into 6 faces) for a light that
+    // sits on the surface it hit and lives 170 ms
+    if (g_vl_n && !g_vl[0].spark && ppl_shadow_bind(d, g_vl[0].wpos)) C[1][3] = 1.0f;
     // world lights 4-5 in c19-c22 (the bump-map matrices: free when no stage bump-maps; ppl_ps_decls(true)). Set
     // after upload_ps_constants, which sends c0-c22 again on every draw.
     if (g_ppl_ps_sm3) { // ps_3_0: world lights 4-12 in c32-c40 (position, reach) / c41-c49 (colour), the fog switch c50
