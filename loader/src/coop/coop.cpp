@@ -5802,12 +5802,13 @@ static void coop_squad_donor_step()
                 if (!r || *(volatile uint32_t *)(uintptr_t)(t + 8) != 6) continue;
                 bool ok2 = r >= 0x80000000 && r < 0x84000000 && coop_safe_copy(&b2, r + 0x38, 4) && coop_safe_copy(&l2, r + 0x3C, 4) &&
                            l2 < 0x10000 && (l2 == 0 || (b2 >= 0x80000000 && b2 < 0x84000000 && coop_safe_copy(&p2, b2, 4)));
-                // sd2 (owner two-PC play 20261122: "both players crashed after loading a second mission in the same
-                // session"): only 1e was flushed - 1d / 1f still read as live (their old memory was reused by the new
-                // level), the donor's registration left slot 6 EMPTY, and the clone built from a squad type with no
-                // character crashed both copies (null call, 0x96eea). Slot 6 itself is left over, so every slot-6 type is.
+                // sd4 (owner two-PC play 20261122 on 0.9.6-fix: both copies crashed at 0x1c5c70, a level-part switch
+                // ~5 min into mission 3): sd2 flushed EVERY slot-6 type, but a live one is this level's OWN (mission 3
+                // registers squad type 1f; its body +0x320 record then held resource 0). Only a dead one is left over;
+                // sd3 now gets the squad character registered, so the live types find it in slot 6.
+                if (ok2) { logf("coop: squad donor: type %02x kept (this level's own)", i); continue; }
                 *(volatile uint32_t *)(uintptr_t)t = 0;
-                logf("coop: squad donor: type %02x flushed%s", i, ok2 ? " (its memory looked readable - reused by this level)" : "");
+                logf("coop: squad donor: type %02x flushed", i);
             }
             have = 0; tw0 = 0;
         }
@@ -9559,7 +9560,15 @@ static uint32_t coop_build_missing(const EnemyRec &r)
         static uint32_t fl; if ((fl++ % 50) == 0) logf("coop: build missing: host enemy id %08x is from part %u, ours is %d - too far behind to build safely", r.id, r.part, ours);
         return 0;
     }
-    if (r.part != 0xFF && ours >= 0 && ours > (int32_t)r.part) why = "its part is behind ours (the spawner is gone here)";
+    if (r.part != 0xFF && ours >= 0 && ours > (int32_t)r.part) {
+        // bm9 (owner two-PC play 20261122: the joiner crashed at 0x93d8c in the model code, mission 4 part 6): at part 5
+        // it built a host enemy of part 4, then at part 6 four more - part 4's data was being overwritten, they stayed
+        // in the game (hidden), and 0.7 s later a spawn crashed in the model setup. Earlier crashes #21 / #23 came from
+        // such bodies too. An enemy of a part we have already left is not built at all: it fights the partner back
+        // there, where we are not.
+        static uint32_t bl; if ((bl++ % 50) == 0) logf("coop: build missing: host enemy id %08x is from part %u, behind ours (%d) - not built (its part's data is going away here)", r.id, r.part, ours);
+        return 0;
+    }
     else if (!sp_here && now - m.first >= 10000 && (r.part == 0xFF || ours >= (int32_t)r.part)) why = "its spawner is not in our table";
     else if (coop_build_test()) why = "COOP_BUILD_TEST";
     if (!why) return 0;
