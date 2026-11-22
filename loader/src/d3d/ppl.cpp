@@ -1659,8 +1659,35 @@ bool g_em_ok;
 // out over 2 s after the last one (the light: 4 m above it, strobing).
 // owner: "make it 3x less big" (a ground pool ~5.3 m across), "bring it ... to 6m high", then "from 6m to 4.5m":
 // 4.5 m above the flames' base with a reach of 7 m keeps that pool (sqrt(7^2 - 4.5^2) = 5.4 m)
-constexpr float kFireReach = 7.0f, kFireUp = 4.5f;
-struct FireSite { float pos[3], vis, gate, lit; uint32_t born, seen, id, hold, hits; bool used, on; };
+// owner: "lower the glint from 4.5m to 2m": 2 m up, reach 5.8 m keeps the same pool (sqrt(5.8^2 - 2^2) = 5.4 m)
+constexpr float kFireReach = 5.8f, kFireUp = 2.0f;
+// owner: "if the flame emitters dies the glint dies with it ... the glint need to recognise its parent flame emitter":
+// an emitter-born site keeps its parent (the effect instance + definition); the frame the parent leaves the game's
+// live lists the site is marked dead and fades out in kFireDie frames (1/4 s)
+constexpr uint32_t kFireDie = 15;
+// owner: "the flame were gone but the glint stayed ... the emitters doesnt die right away", then "6s before the emitters
+// dies": the glint ends 6 s before its emitter's end. The end is known ahead (BLACK_PPL_FLDUMP, mission 4): each of the
+// instance's particle systems (pointers at +0x00..+0x1C, 1 once ended) holds its start time (+0x48), the game clock
+// (+0x4C) and its lifetime (+0xA4), in seconds - FL_G_ISE_M02: 18.9 s (ps0, the emitter died at 18.7 s) and 10.7 s (ps1)
+// then "youre maybe right for 7.6 sec": 7.6 s (FL_G_ISE_M02's flame system, ps1, ends ~7.6-8 s before the emitter)
+constexpr float kFireEarly = 8.6f; // owner: "alright let make it 8.2s", then "lets settle for 8.6s"
+// seconds until the effect instance ends (its last particle system), or -1 when not known
+float effect_time_left(uint32_t inst)
+{
+    uint32_t sub[8];
+    if (!safe_read(sub, inst, sizeof sub)) return -1.0f;
+    float end = -1.0f, now = 0.0f;
+    bool any = false;
+    for (uint32_t ps : sub) {
+        if (ps < 0x80000000u || ps >= 0x84000000u) continue;
+        float t[2], life;
+        if (!safe_read(t, ps + 0x48, 8) || !safe_read(&life, ps + 0xA4, 4)) continue;
+        if (!(std::isfinite(t[0]) && std::isfinite(t[1]) && std::isfinite(life)) || life <= 0.0f || life > 3600.0f) return -1.0f; // endless: unknown
+        end = std::fmax(end, t[0] + life), now = t[1], any = true;
+    }
+    return any ? end - now : -1.0f;
+}
+struct FireSite { float pos[3], vis, gate, lit; uint32_t born, seen, id, hold, hits, pinst, pdef, dead; bool used, on, gone; };
 FireSite g_fs[32];
 uint32_t g_fs_ids;
 
@@ -1882,16 +1909,17 @@ void update_emitters(uint32_t f)
         if (e.flame && f - e.born >= 15 && !at_player) {
             FireSite *site = nullptr, *fr = nullptr;
             for (FireSite &x : g_fs) {
+                // one site per flame emitter, found by its parent (was: by position, within 1 m)
                 if (x.used) {
-                    float dx = x.pos[0] - e.pos[0], dz = x.pos[2] - e.pos[2], dy = x.pos[1] - e.pos[1];
-                    // one site per flame emitter (owner: "at each flame emitters"): within 1 m only (was 3 m)
-                    if (dx * dx + dz * dz < 1.0f && dy > -2.0f && dy < 2.0f) { site = &x; break; }
+                    // an ended site stays bound (no new site for its emitter) until the emitter is gone
+                    if (x.pinst == e.inst && x.pdef == e.def) { site = &x; break; }
                 } else if (!fr) fr = &x;
             }
             if (!site && fr) {
                 site = fr;
                 *site = FireSite{};
                 site->used = true, site->born = f, site->vis = -1.0f, site->id = ++g_fs_ids, site->hold = 120, site->hits = 99;
+                site->pinst = e.inst, site->pdef = e.def;
                 memcpy(site->pos, e.pos, 12);
             }
             if (site) {
@@ -1901,8 +1929,49 @@ void update_emitters(uint32_t f)
             }
         }
     }
+    // the parent check: an emitter-born site whose emitter is gone this frame dies with it
+    for (FireSite &x : g_fs) {
+        if (!x.used || !x.pinst) continue;
+        bool alive = false;
+        for (const Emitter &e : g_em)
+            if (e.used && e.seen == f && e.inst == x.pinst && e.def == x.pdef) { alive = true; break; }
+        x.gone = !alive;
+        if (x.dead) continue;
+        const float left = alive ? effect_time_left(x.pinst) : -1.0f;
+        if (alive && !(left >= 0.0f && left < kFireEarly)) x.seen = f; // its parent burns: so does the site (also while the player stands in it)
+        else {
+            x.dead = f ? f : 1;
+            static uint32_t died_lines;
+            if (died_lines++ < 200)
+                logf("[ppl] fire site #%u ended (%s, inst %08X) at %.1f %.1f %.1f after %.1fs", x.id,
+                     alive ? "its emitter ends in 8.6 s" : "its emitter died", x.pinst, x.pos[0], x.pos[1], x.pos[2], (f - x.born) / 60.0f);
+        }
+    }
+    {   // BLACK_PPL_FLDUMP=1 (diagnostic): each flame emitter's instance (0x70) and its particle systems (first 0xC0
+        // bytes each), every 1/2 s - to find what tells its flames are gone (owner: "the flame were gone but the glint stayed")
+        static const bool on = getenv("BLACK_PPL_FLDUMP") && getenv("BLACK_PPL_FLDUMP")[0] == '1';
+        static uint32_t lines;
+        if (on && f % 30 == 0 && lines < 6000)
+            for (const Emitter &e : g_em) {
+                if (!e.used || !e.flame || e.seen != f) continue;
+                uint32_t q[28];
+                if (!safe_read(q, e.inst, sizeof q)) continue;
+                char hx[1400];
+                int hw = 0;
+                for (int i = 0; i < 28; i++) hw += snprintf(hx + hw, sizeof hx - hw, "%08x ", q[i]);
+                logf("[fld] %08x %s age %.1f inst | %s", e.inst, e.name, (f - e.born) / 60.0f, hx), lines++;
+                for (int k = 0; k < 8; k++) {
+                    if (q[k] < 0x80000000u || q[k] >= 0x84000000u) continue;
+                    uint32_t ps[48];
+                    if (!safe_read(ps, q[k], sizeof ps)) continue;
+                    hw = 0;
+                    for (int i = 0; i < 48; i++) hw += snprintf(hx + hw, sizeof hx - hw, "%08x ", ps[i]);
+                    logf("[fld] %08x %s age %.1f ps%d %08x | %s", e.inst, e.name, (f - e.born) / 60.0f, k, q[k], hx), lines++;
+                }
+            }
+    }
     for (FireSite &x : g_fs)
-        if (x.used && f - x.seen > x.hold) x.used = false;
+        if (x.used && (f - x.seen > x.hold || (x.dead && f - x.dead >= kFireDie && (x.gone || !x.pinst)))) x.used = false;
     g_em_fires = fires;
     static uint32_t last, lines;
     if (f - last >= 300 && lines < 200) { // census every 5 s
@@ -2083,6 +2152,7 @@ void frame_world_lights()
         // very close and fade out")
         const int since = (int)(f - e.seen);
         float lv = std::fmin(1.0f, 1.0f - (float)(since - ((int)e.hold - 90)) / 90.0f) * glow_gain * 1.6f;
+        if (e.dead) lv *= std::fmax(0.0f, 1.0f - (float)(f - e.dead) / (float)kFireDie); // its emitter died: out in 1/4 s
         if (walls) {
             lv *= wall_gate(vis_for(lp, f, budget), e.vis, e.on, e.gate);
             if (lv <= 0.01f) continue;
