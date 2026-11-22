@@ -712,9 +712,45 @@ float vis_for(const float pos[3], uint32_t f, int &budget)
 // program places with per-sprite constants, so the vertices alone say nothing): the NV2A MAC / ILU ops as in
 // nv2a_vsh.cpp's translation, r12 = oPos. Returns the WORLD position: the program's screen position -> clip (the
 // host viewport, as the translated shaders do) -> view (1/P00, 1/P11, w) -> world (the frame's rows, transposed).
+// Owner: "frame drops ... the games speed slow down as well". The perf recording (mission 4, MED): ppl_glow_capture
+// -> vs_world_pos was ~18 % of the frame, most of it vsh_decode run again for every instruction of every sprite
+// vertex. Each program is now decoded once (kept per program, its words checked once a frame in case a freed
+// shader's memory is reused by another).
+struct DecodedVsh {
+    const uint32_t *prog = nullptr;
+    uint32_t insts = 0, checked = ~0u;
+    std::vector<uint32_t> words;
+    std::vector<VshInst> ins;
+};
+static const DecodedVsh *vsh_decoded(const VertexShader *vs)
+{
+    static DecodedVsh cache[32];
+    static int next;
+    const uint32_t f = g_frame_count.load();
+    const uint32_t n = vs->program_insts < 136 ? vs->program_insts : 136;
+    for (DecodedVsh &d : cache) {
+        if (d.prog != vs->program || d.insts != n) continue;
+        if (d.checked != f) {
+            if (memcmp(d.words.data(), vs->program, (size_t)n * 16) != 0) break; // reused memory: decode again below
+            d.checked = f;
+        }
+        return &d;
+    }
+    DecodedVsh *d = nullptr;
+    for (DecodedVsh &x : cache)
+        if (x.prog == vs->program && x.insts == n) d = &x;
+    if (!d) d = &cache[next], next = (next + 1) % 32;
+    d->prog = vs->program, d->insts = n, d->checked = f;
+    d->words.assign(vs->program, vs->program + (size_t)n * 4);
+    d->ins.resize(n);
+    for (uint32_t i = 0; i < n; i++) vsh_decode(vs->program + i * 4, d->ins[i]);
+    return d;
+}
+
 bool vs_world_pos(const VertexShader *vs, const float (*vin)[4], float world[3])
 {
     if (!vs || !vs->program || !g_vp_ok) return false;
+    const DecodedVsh *dec = vsh_decoded(vs);
     const float (*c)[4] = g_st.vs_constants;
     float r[13][4] = {};
     r[12][3] = 1.0f;
@@ -730,9 +766,8 @@ bool vs_world_pos(const VertexShader *vs, const float (*vin)[4], float world[3])
         }
         for (int i = 0; i < 4; i++) o[i] = s.neg ? -b[s.swz[i]] : b[s.swz[i]];
     };
-    for (uint32_t i = 0; i < vs->program_insts && i < 136; i++) {
-        VshInst in;
-        vsh_decode(vs->program + i * 4, in);
+    for (uint32_t i = 0; i < dec->insts; i++) {
+        const VshInst &in = dec->ins[i];
         if (in.mac == MAC_NOP && in.ilu == ILU_NOP) {
             if (in.final) break;
             continue;
@@ -895,15 +930,46 @@ float g_sprite_tint[3] = {1, 1, 1}; // the current sprite draw's texture colour 
 // spark and muzzle textures. A glow drawn with one is a fire at once (no wait, never a spark burst).
 bool g_sprite_fire;
 // the orange (fire / spark texture) particles of the last two frames, for telling a fire emitter by what rises above it
-float g_fq[2][512][3];
+float g_fq[2][1024][3];
 int g_fq_n[2];
 uint32_t g_fq_frame[2];
+// the particle textures seen drawn (the game's texture handle) and whether each is a fire texture (orange, as
+// g_sprite_fire): a flame emitter's particle systems are told apart by their texture (update_emitters)
+struct TexFire { uint32_t tex; bool fire; };
+TexFire g_tex_fire[64];
+int g_tex_fire_n;
+void tex_fire_note(uint32_t tex, bool fire)
+{
+    for (int i = 0; i < g_tex_fire_n; i++)
+        if (g_tex_fire[i].tex == tex) { g_tex_fire[i].fire = fire; return; }
+    if (g_tex_fire_n < 64) g_tex_fire[g_tex_fire_n++] = {tex, fire};
+}
+int tex_fire_known(uint32_t tex) // 1 fire, 0 not fire, -1 never drawn
+{
+    for (int i = 0; i < g_tex_fire_n; i++)
+        if (g_tex_fire[i].tex == tex) return g_tex_fire[i].fire ? 1 : 0;
+    return -1;
+}
+// BLACK_PPL_FLDUMP: every particle quad of the last two frames: middle, texture, colour (vertex x texture), alpha
+struct PartQuad { float p[3], c[3], a; uint32_t tex; };
+PartQuad g_pq[2][2048];
+int g_pq_n[2];
+uint32_t g_pq_frame[2];
+void part_quad_note(const float *p, const float *c, float a)
+{
+    const uint32_t f = g_frame_count.load();
+    const int b = f & 1;
+    if (g_pq_frame[b] != f) g_pq_frame[b] = f, g_pq_n[b] = 0;
+    if (g_pq_n[b] >= 2048) return;
+    PartQuad &q = g_pq[b][g_pq_n[b]++];
+    memcpy(q.p, p, 12), memcpy(q.c, c, 12), q.a = a, q.tex = (uint32_t)(uintptr_t)g_st.textures[0];
+}
 void fire_quad_note(const float *p)
 {
     const uint32_t f = g_frame_count.load();
     const int b = f & 1;
     if (g_fq_frame[b] != f) g_fq_frame[b] = f, g_fq_n[b] = 0;
-    if (g_fq_n[b] < 512) memcpy(g_fq[b][g_fq_n[b]++], p, 12);
+    if (g_fq_n[b] < 1024) memcpy(g_fq[b][g_fq_n[b]++], p, 12);
 }
 
 // ---- The game's own glows as lights (v12): lamp halos, fires, embers ----
@@ -979,9 +1045,9 @@ void cone_capture(const VertexShader *vs, const float *conv, uint32_t sf, uint32
     int ncl = 0;
     static float wp[2048][3], cc[2048][3];
     uint32_t m = 0;
+    float vin[16][4] = {}; // set up once per draw (as in ppl_glow_capture)
+    for (int r = 0; r < 16; r++) vin[r][3] = 1.0f;
     for (uint32_t v = 0; v < n && m < 2048; v++) {
-        float vin[16][4] = {};
-        for (int r = 0; r < 16; r++) vin[r][3] = 1.0f;
         const float *src = conv + (size_t)v * sf;
         for (uint32_t i = 0; i < vs->num_elements; i++) memcpy(vin[vs->elements[i].reg & 15], src + i * 4, 16);
         if (!vs_world_pos(vs, vin, wp[m])) continue;
@@ -1097,6 +1163,46 @@ static void glow_add(const float *pos, uint32_t pos_stride, const float *col, ui
 void ppl_glow_sprites(const float *pos, uint32_t pos_stride, const float *col, uint32_t col_stride, uint32_t n)
 {
     if (!ppl_med()) return; // LIGHTING LOW: no glows / spark flashes (the 0.9.0 lighting)
+    // every quad drawn with a fire texture, before any filter (owner: "disable the glint if it doesnt emit anymore
+    // flame texture"): dark or large flame sprites count too. Not the first-person gun's.
+    if (g_sprite_fire && !g_fov_viewmodel && n >= 4 && n <= 4096) {
+        const uint32_t per = (n >= 8 && n % 4 == 0) ? 4 : n;
+        for (uint32_t q = 0; q + per <= n; q += per) {
+            float mid[3] = {0, 0, 0};
+            for (uint32_t v = q; v < q + per; v++)
+                for (int k = 0; k < 3; k++) mid[k] += pos[(size_t)v * pos_stride + k] / per;
+            fire_quad_note(mid);
+        }
+    }
+    static const bool pq_on = getenv("BLACK_PPL_FLDUMP") && getenv("BLACK_PPL_FLDUMP")[0] == '1';
+    if (pq_on) { // BLACK_PPL_FLDUMP: every quad as drawn, before any filter (blend in the alpha slot's sign: < 0 = not blended)
+        const uint32_t *rs0 = render_state();
+        const bool blended = rs0[XRS_ALPHABLENDENABLE] && !rs0[XRS_ZWRITEENABLE];
+        const uint32_t per = (n >= 8 && n % 4 == 0) ? 4 : n;
+        for (uint32_t q = 0; q + per <= n; q += per) {
+            float mid[3] = {0, 0, 0}, c[3] = {0, 0, 0}, a = 0;
+            for (uint32_t v = q; v < q + per; v++) {
+                const float *pp = pos + (size_t)v * pos_stride;
+                for (int k = 0; k < 3; k++) mid[k] += pp[k] / per;
+                if (col) {
+                    const float *cc = col + (size_t)v * col_stride;
+                    for (int k = 0; k < 3; k++) c[k] += cc[k] / per;
+                    a += cc[3] / per;
+                } else c[0] = c[1] = c[2] = a = 1.0f;
+            }
+            for (int k = 0; k < 3; k++) c[k] *= g_sprite_tint[k];
+            part_quad_note(mid, c, blended ? a : -a - 0.001f);
+        }
+        static uint32_t last_s, slines;
+        const uint32_t f = g_frame_count.load();
+        if (f - last_s >= 60 && slines < 400 && g_sprite_fire && n >= 4) { // one sample a second: where fire quads are drawn
+            last_s = f, slines++;
+            const float *p0 = pos;
+            logf("[fld] fire quads %08X: %u verts, first at %.1f %.1f %.1f, camera %.1f %.1f %.1f, blend %u/%u zw %u",
+                 (uint32_t)(uintptr_t)g_st.textures[0], n, p0[0], p0[1], p0[2], g_vp_eye[0], g_vp_eye[1], g_vp_eye[2],
+                 rs0[XRS_SRCBLEND], rs0[XRS_DESTBLEND], rs0[XRS_ZWRITEENABLE]);
+        }
+    }
     static const bool off = getenv("BLACK_PPL_GLOWS") && getenv("BLACK_PPL_GLOWS")[0] == '0';
     if (off || !ppl_level() || n < 1 || n > 4096 || g_fov_viewmodel) return;
     const uint32_t *rs = render_state();
@@ -1141,7 +1247,7 @@ static void glow_add(const float *pos, uint32_t pos_stride, const float *col, ui
     float w = (c[0] + c[1] + c[2]) / 3.0f * (a > 0 ? a : 1.0f) * std::fmin(size, 3.0f);
     if (w < 0.01f) return;
     float mid[3] = {(lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f};
-    if (g_sprite_fire) fire_quad_note(mid);
+    // (fire quads: noted in ppl_glow_sprites, before the filters)
     // effects that follow the player (the forest's fireflies, dust around the camera) are not light sources: a glow
     // within 3 m of the camera would light the scene as if the player carried a lamp. They were dropped; now they are
     // kept as "near" (owner: "every single bullet sparks should produce light" - close impacts were lost): a near
@@ -1223,6 +1329,7 @@ static bool glow_sprite_tint()
     // orange: green 35-80 % of red, blue under 45 % (mission 0: 81F2B100 0.89 0.63 0.37 = fire; 80D71500 0.83 0.12 0.02
     // = too red, not fire)
     g_sprite_fire = known && t[0] > 0.35f && t[1] > 0.35f * t[0] && t[1] < 0.8f * t[0] && t[2] < 0.45f * t[0];
+    if (known) tex_fire_note((uint32_t)(uintptr_t)g_st.textures[0], g_sprite_fire);
     {   // census every 10 s: the particle textures, their colour, blend, and how often drawn just after a shot
         static std::unordered_map<const void *, std::array<float, 7>> cen; // draws, r, g, b, alpha draws, after-shot draws, fire
         static uint32_t last, lines;
@@ -1447,9 +1554,11 @@ void ppl_glow_capture(const VertexShader *vs, const float *conv, uint32_t stride
     }
     static float wpos[256][4], col[256][4];
     uint32_t m = 0;
+    // the program's inputs: registers the declaration does not feed stay (0, 0, 0, 1); set up once per draw, each
+    // vertex overwrites only its own registers (perf: this was cleared for every vertex)
+    float vin[16][4] = {};
+    for (int r = 0; r < 16; r++) vin[r][3] = 1.0f;
     for (uint32_t v = 0; v < n && m < 256; v++) {
-        float vin[16][4] = {};
-        for (int r = 0; r < 16; r++) vin[r][3] = 1.0f;
         const float *src = conv + (size_t)v * sf;
         for (uint32_t i = 0; i < vs->num_elements; i++) memcpy(vin[vs->elements[i].reg & 15], src + i * 4, 16);
         if (!vs_world_pos(vs, vin, wpos[m])) continue;
@@ -1687,7 +1796,112 @@ float effect_time_left(uint32_t inst)
     }
     return any ? end - now : -1.0f;
 }
-struct FireSite { float pos[3], vis, gate, lit; uint32_t born, seen, id, hold, hits, pinst, pdef, dead; bool used, on, gone; };
+// The game's particle texture table (BLACK_PPL_FLDUMP, mission 4): 16-byte entries {texture, 0, id, 0} with ids in
+// order (0x22 -> 81F2D280, 0x23 -> 81F2D880 = the flame texture, 0x24 -> 81F2DB00); a particle system's definition
+// (+0x40) starts with that id in its high 16 bits. Found by a memory scan for a drawn fire texture's entry, kept while
+// its entries still read back.
+uint32_t g_ptex_base; // the entry of g_ptex_id0
+uint32_t g_ptex_id0, g_ptex_n;
+uint32_t g_ptex_scan_frame = 0xFFFFFFFFu;
+static bool ptex_entry(uint32_t a, uint32_t &tex, uint32_t &id)
+{
+    uint32_t e[4];
+    if (!safe_read(e, a, 16) || e[1] || e[3] || e[2] >= 0x1000 || e[0] < 0x80000000u || e[0] >= 0x84000000u) return false;
+    tex = e[0], id = e[2];
+    return true;
+}
+static void ptex_find(uint32_t f)
+{
+    if (g_ptex_scan_frame != 0xFFFFFFFFu && f - g_ptex_scan_frame < 3600) return; // at most every 60 s (a full scan: ~25 ms)
+    g_ptex_scan_frame = f;
+    g_ptex_n = 0;
+    static uint32_t chunk[16384];
+    for (uint32_t base = 0x80000000u; base < 0x84000000u; base += sizeof chunk) {
+        if (!safe_read(chunk, base, sizeof chunk)) continue;
+        for (uint32_t i = 0; i + 8 <= 16384; i++) {
+            if (chunk[i + 1] || chunk[i + 3] || chunk[i + 5] || chunk[i + 7] || chunk[i + 2] >= 0x1000 || chunk[i + 6] != chunk[i + 2] + 1) continue;
+            if (tex_fire_known(chunk[i]) != 1) continue; // the entry of a drawn fire texture, followed by the next id
+            uint32_t a = base + i * 4, tex, id, want = chunk[i + 2];
+            while (ptex_entry(a - 16, tex, id) && id + 1 == want) a -= 16, want = id; // back to the first entry
+            uint32_t n = 0, b = a, prev = 0;
+            while (ptex_entry(b, tex, id) && (n == 0 || id == prev + 1)) prev = id, b += 16, n++;
+            g_ptex_base = a, g_ptex_n = n;
+            ptex_entry(a, tex, g_ptex_id0);
+            logf("[ppl] particle texture table at %08X: ids %u..%u", a, g_ptex_id0, g_ptex_id0 + n - 1);
+            return;
+        }
+    }
+}
+static uint32_t ptex_for(uint32_t id, uint32_t f)
+{
+    uint32_t tex, eid;
+    for (int pass = 0; pass < 2; pass++) {
+        if (g_ptex_n && id >= g_ptex_id0 && id < g_ptex_id0 + g_ptex_n && ptex_entry(g_ptex_base + (id - g_ptex_id0) * 16, tex, eid) && eid == id)
+            return tex;
+        if (pass == 0) ptex_find(f);
+    }
+    return 0;
+}
+// a new fire site's parent, one line: each particle system's texture id, texture, fire or not, emission time, lifetime
+void parent_systems_log(uint32_t id, uint32_t inst, const char *name)
+{
+    static uint32_t lines;
+    if (lines >= 300) return;
+    lines++;
+    const uint32_t f = g_frame_count.load();
+    uint32_t sub[8];
+    if (!safe_read(sub, inst, sizeof sub)) return;
+    char buf[900];
+    int w = snprintf(buf, sizeof buf, "[ppl] fire site #%u: parent %s (inst %08X):", id, name, inst);
+    for (int k = 0; k < 8 && w < 820; k++) {
+        if (sub[k] < 0x80000000u || sub[k] >= 0x84000000u) continue;
+        uint32_t def = 0, head = 0;
+        float t[2] = {}, emit = 0, life = 0;
+        safe_read(&def, sub[k] + 0x40, 4), safe_read(t, sub[k] + 0x48, 8), safe_read(&life, sub[k] + 0xA4, 4);
+        if (def >= 0x80000000u && def < 0x84000000u) safe_read(&head, def, 4), safe_read(&emit, def + 8, 4);
+        const uint32_t tex = ptex_for(head >> 16, f);
+        const int fire = tex ? tex_fire_known(tex) : -1;
+        w += snprintf(buf + w, sizeof buf - w, " | ps%d id %u tex %08X %s emit %.1f life %.1f age %.1f", k, head >> 16, tex,
+                      fire == 1 ? "FIRE" : fire == 0 ? "other" : "?", emit, life, t[1] - t[0]);
+    }
+    logf("%s", buf);
+}
+// seconds since the instance's last flame system (a fire texture) stopped emitting: start +0x48 + the definition's
+// emission time (+0x08), against the clock +0x4C (FL_G_ISE_M02: flames emit 10 s, its other system 15 s); < 0 while
+// one emits; -1e9 when no flame system of it is known
+float parent_flames_since(uint32_t inst, bool *endless)
+{
+    if (endless) *endless = false;
+    const uint32_t f = g_frame_count.load();
+    uint32_t sub[8];
+    if (!safe_read(sub, inst, sizeof sub)) return -1e9f;
+    float stop = -1e30f, now = 0.0f;
+    bool any = false;
+    for (uint32_t ps : sub) {
+        if (ps < 0x80000000u || ps >= 0x84000000u) continue;
+        uint32_t def = 0, head = 0;
+        float t[2], emit;
+        if (!safe_read(&def, ps + 0x40, 4) || !safe_read(t, ps + 0x48, 8) || !safe_read(&head, def, 4) || !safe_read(&emit, def + 8, 4)) continue;
+        now = t[1];
+        const uint32_t tex = ptex_for(head >> 16, f);
+        if (!tex || tex_fire_known(tex) != 1 || !std::isfinite(emit) || emit <= 0.0f) continue;
+        if (emit > 3600.0f) { // "forever" (gas tanks: 31536000 s = a year): its flames end by being drawn no more
+            if (endless) *endless = true;
+            continue;
+        }
+        stop = std::fmax(stop, t[0] + emit), any = true;
+    }
+    return any ? now - stop : -1e9f;
+}
+// owner: "disable the glint if it doesnt emit anymore flame texture after 0.5s" / "the glint need to check its parent
+// emitters": the parent's particle systems with a fire texture (parent_flames_since) are its flames; the glint ends
+// 0.5 s after the last of them stops emitting. Without a known flame system the 8.6 s rule above stays.
+constexpr float kFireAfterFlames = 0.5f;
+// Endless flame systems (gas tanks: they "emit" forever while their flames are long gone - screenshots, mission 1):
+// the glint checks the flame quads drawn at it instead; none for kFireQuiet frames while it is on screen -> it fades
+// out (quiet); flames drawn there again bring it back. Off screen the game draws no particles: no verdict.
+constexpr uint32_t kFireQuiet = 30;
+struct FireSite { float pos[3], vis, gate, lit, qlv; uint32_t born, seen, id, hold, hits, pinst, pdef, dead, flame_f; bool used, on, gone, quiet; };
 FireSite g_fs[32];
 uint32_t g_fs_ids;
 
@@ -1919,7 +2133,7 @@ void update_emitters(uint32_t f)
                 site = fr;
                 *site = FireSite{};
                 site->used = true, site->born = f, site->vis = -1.0f, site->id = ++g_fs_ids, site->hold = 120, site->hits = 99;
-                site->pinst = e.inst, site->pdef = e.def;
+                site->pinst = e.inst, site->pdef = e.def, site->flame_f = f, site->qlv = 1.0f;
                 memcpy(site->pos, e.pos, 12);
             }
             if (site) {
@@ -1936,22 +2150,87 @@ void update_emitters(uint32_t f)
         for (const Emitter &e : g_em)
             if (e.used && e.seen == f && e.inst == x.pinst && e.def == x.pdef) { alive = true; break; }
         x.gone = !alive;
+        static const bool pq_log = getenv("BLACK_PPL_FLDUMP") && getenv("BLACK_PPL_FLDUMP")[0] == '1';
+        if (pq_log && (f - x.born) % 60 == 0) { // the quads drawn at the site last frame, per texture: count, mean colour
+            const int pb = (f - 1) & 1;
+            uint32_t tx[8] = {};
+            int tn[8] = {}, nt = 0;
+            float tc[8][4] = {};
+            if (g_pq_frame[pb] == f - 1)
+                for (int q = 0; q < g_pq_n[pb]; q++) {
+                    const PartQuad &Q = g_pq[pb][q];
+                    float dx = Q.p[0] - x.pos[0], dy = Q.p[1] - x.pos[1], dz = Q.p[2] - x.pos[2];
+                    if (!(dx * dx + dz * dz < 16.0f && dy > -1.0f && dy < 8.0f)) continue;
+                    int k = 0;
+                    while (k < nt && tx[k] != Q.tex) k++;
+                    if (k == nt) {
+                        if (nt == 8) continue;
+                        tx[nt++] = Q.tex;
+                    }
+                    tn[k]++, tc[k][0] += Q.c[0], tc[k][1] += Q.c[1], tc[k][2] += Q.c[2], tc[k][3] += Q.a;
+                }
+            char tb[700];
+            int tw = 0;
+            for (int k = 0; k < nt; k++)
+                tw += snprintf(tb + tw, sizeof tb - tw, " | %08X%s x%d rgb %.2f %.2f %.2f a %.2f", tx[k], tex_fire_known(tx[k]) == 1 ? " FIRE" : "", tn[k],
+                               tc[k][0] / tn[k], tc[k][1] / tn[k], tc[k][2] / tn[k], tc[k][3] / tn[k]);
+            float cv[3] = {x.pos[0], x.pos[1] + 1.0f, x.pos[2]}, v[3];
+            const bool vis = world_to_view(cv, v) && v[2] > 1.0f && fabsf(v[0]) < v[2] * g_inv_p00 && fabsf(v[1]) < v[2] * g_inv_p11;
+            logf("[fld] site #%u age %.0fs %s:%s", x.id, (f - x.born) / 60.0f, vis ? "on screen" : "off screen", nt ? tb : " none");
+        }
+        if (alive && f - x.born == 120) // its particle systems exist by now (none in the first ~1 s)
+            for (const Emitter &e : g_em)
+                if (e.used && e.inst == x.pinst && e.def == x.pdef) { parent_systems_log(x.id, x.pinst, e.name); break; }
         if (x.dead) continue;
-        const float left = alive ? effect_time_left(x.pinst) : -1.0f;
-        if (alive && !(left >= 0.0f && left < kFireEarly)) x.seen = f; // its parent burns: so does the site (also while the player stands in it)
+        // the parent's flames: seconds since its last flame system stopped emitting (< 0: still emitting); none known:
+        // the 8.6 s rule
+        bool endless = false;
+        const float since_flames = alive ? parent_flames_since(x.pinst, &endless) : -1e9f;
+        if (alive && endless) { // flames drawn at the site last frame?
+            int nq = 0;
+            if (have)
+                for (int q = 0; q < g_fq_n[b] && !nq; q++) {
+                    const float *pp = g_fq[b][q];
+                    float dx = pp[0] - x.pos[0], dy = pp[1] - x.pos[1], dz = pp[2] - x.pos[2];
+                    if (dx * dx + dz * dz < 16.0f && dy > -1.0f && dy < 8.0f) nq++;
+                }
+            if (nq) {
+                if (x.quiet) {
+                    static uint32_t bl;
+                    if (bl++ < 200) logf("[ppl] fire site #%u: flames drawn again, glint back (age %.1fs)", x.id, (f - x.born) / 60.0f);
+                }
+                x.flame_f = f, x.quiet = false;
+            } else if (!x.quiet && f - x.flame_f > kFireQuiet) {
+                float cv[3] = {x.pos[0], x.pos[1] + 1.0f, x.pos[2]}, v[3];
+                const bool on_screen = world_to_view(cv, v) && v[2] > 1.0f && v[2] < 60.0f && fabsf(v[0]) < v[2] * g_inv_p00 * 0.9f &&
+                                       fabsf(v[1]) < v[2] * g_inv_p11 * 0.9f;
+                if (on_screen) {
+                    x.quiet = true;
+                    static uint32_t ql;
+                    if (ql++ < 200)
+                        logf("[ppl] fire site #%u quiet: its flames are drawn no more (%.1fs), at %.1f %.1f %.1f, age %.1fs", x.id,
+                             (f - x.flame_f) / 60.0f, x.pos[0], x.pos[1], x.pos[2], (f - x.born) / 60.0f);
+                }
+            }
+        } else x.quiet = false;
+        x.qlv += ((x.quiet ? 0.0f : 1.0f) - x.qlv) * 0.15f;
+        const bool flames_known = since_flames > -1e8f;
+        const float left = alive && !flames_known ? effect_time_left(x.pinst) : -1.0f;
+        const bool ended = flames_known ? since_flames >= kFireAfterFlames : (left >= 0.0f && left < kFireEarly);
+        if (alive && !ended) x.seen = f; // its parent burns: so does the site (also while the player stands in it)
         else {
             x.dead = f ? f : 1;
             static uint32_t died_lines;
             if (died_lines++ < 200)
                 logf("[ppl] fire site #%u ended (%s, inst %08X) at %.1f %.1f %.1f after %.1fs", x.id,
-                     alive ? "its emitter ends in 8.6 s" : "its emitter died", x.pinst, x.pos[0], x.pos[1], x.pos[2], (f - x.born) / 60.0f);
+                     !alive ? "its emitter died" : flames_known ? "its emitter's flames stopped 0.5 s ago" : "its emitter ends in 8.6 s", x.pinst, x.pos[0], x.pos[1], x.pos[2], (f - x.born) / 60.0f);
         }
     }
     {   // BLACK_PPL_FLDUMP=1 (diagnostic): each flame emitter's instance (0x70) and its particle systems (first 0xC0
         // bytes each), every 1/2 s - to find what tells its flames are gone (owner: "the flame were gone but the glint stayed")
         static const bool on = getenv("BLACK_PPL_FLDUMP") && getenv("BLACK_PPL_FLDUMP")[0] == '1';
         static uint32_t lines;
-        if (on && f % 30 == 0 && lines < 6000)
+        if (on && f % 30 == 0 && lines < 20000)
             for (const Emitter &e : g_em) {
                 if (!e.used || !e.flame || e.seen != f) continue;
                 uint32_t q[28];
@@ -1962,11 +2241,56 @@ void update_emitters(uint32_t f)
                 logf("[fld] %08x %s age %.1f inst | %s", e.inst, e.name, (f - e.born) / 60.0f, hx), lines++;
                 for (int k = 0; k < 8; k++) {
                     if (q[k] < 0x80000000u || q[k] >= 0x84000000u) continue;
-                    uint32_t ps[48];
+                    uint32_t ps[128];
                     if (!safe_read(ps, q[k], sizeof ps)) continue;
+                    static char hx2[1300];
+                    hw = 0;
+                    for (int i = 48; i < 128; i++) hw += snprintf(hx2 + hw, sizeof hx2 - hw, "%08x ", ps[i]);
+                    logf("[fld] %08x %s age %.1f ps%d+c0 %08x | %s", e.inst, e.name, (f - e.born) / 60.0f, k, q[k], hx2), lines++;
                     hw = 0;
                     for (int i = 0; i < 48; i++) hw += snprintf(hx + hw, sizeof hx - hw, "%08x ", ps[i]);
                     logf("[fld] %08x %s age %.1f ps%d %08x | %s", e.inst, e.name, (f - e.born) / 60.0f, k, q[k], hx), lines++;
+                    static bool scanned;
+                    if (!scanned) { // where the flame texture handle is kept (a texture table indexed by the definitions' ids?)
+                        scanned = true;
+                        int hits = 0;
+                        static uint32_t chunk[16384];
+                        for (uint32_t base = 0x80000000u; base < 0x84000000u && hits < 40; base += sizeof chunk) {
+                            if (!safe_read(chunk, base, sizeof chunk)) continue;
+                            for (uint32_t i = 0; i < 16384 && hits < 40; i++)
+                                if (chunk[i] == 0x81F2D880u || chunk[i] == 0x81F2DB00u || chunk[i] == 0x80C98180u) {
+                                    uint32_t nb[8] = {};
+                                    safe_read(nb, base + i * 4 - 16, 32);
+                                    logf("[fld] tex %08x at %08x | %08x %08x %08x %08x [%08x] %08x %08x %08x", chunk[i], base + i * 4, nb[0], nb[1], nb[2], nb[3], nb[4], nb[5], nb[6], nb[7]);
+                                    hits++;
+                                }
+                        }
+                    }
+                    static uint32_t seen_def[64];
+                    static int nsd;
+                    const uint32_t pd = ps[16];
+                    bool known = false;
+                    for (int i = 0; i < nsd; i++) known |= seen_def[i] == pd;
+                    if (!known && nsd < 64 && pd >= 0x80000000u && pd < 0x84000000u) { // the system's definition, and one level of pointers in it
+                        seen_def[nsd++] = pd;
+                        uint32_t d[32];
+                        if (safe_read(d, pd, sizeof d)) {
+                            hw = 0;
+                            for (int i = 0; i < 32; i++) hw += snprintf(hx + hw, sizeof hx - hw, "%08x ", d[i]);
+                            logf("[fld] psdef %08x (%s ps%d) | %s", pd, e.name, k, hx), lines++;
+                            for (int i = 0; i < 32; i++) {
+                                if (d[i] < 0x80000000u || d[i] >= 0x84000000u || d[i] == pd) continue;
+                                uint32_t g[32];
+                                if (!safe_read(g, d[i], sizeof g)) continue;
+                                char nm[33] = {};
+                                memcpy(nm, g, 32);
+                                for (char &ch : nm) if (ch && (ch < 0x20 || ch >= 0x7F)) ch = '.';
+                                hw = 0;
+                                for (int j = 0; j < 32; j++) hw += snprintf(hx + hw, sizeof hx - hw, "%08x ", g[j]);
+                                logf("[fld]   psdef %08x +%02x -> %08x \"%s\" | %s", pd, i * 4, d[i], nm, hx), lines++;
+                            }
+                        }
+                    }
                 }
             }
     }
@@ -2153,6 +2477,7 @@ void frame_world_lights()
         const int since = (int)(f - e.seen);
         float lv = std::fmin(1.0f, 1.0f - (float)(since - ((int)e.hold - 90)) / 90.0f) * glow_gain * 1.6f;
         if (e.dead) lv *= std::fmax(0.0f, 1.0f - (float)(f - e.dead) / (float)kFireDie); // its emitter died: out in 1/4 s
+        if (e.pinst) lv *= e.qlv; // endless flames drawn no more: out (back when drawn again)
         if (walls) {
             lv *= wall_gate(vis_for(lp, f, budget), e.vis, e.on, e.gate);
             if (lv <= 0.01f) continue;
