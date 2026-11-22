@@ -1573,6 +1573,7 @@ namespace {
 
 // Last frame's sprite clusters -> tracked glows (called once a frame, before the lights are picked)
 double g_glow_now; // frame_world_lights: this frame's time
+bool g_em_ok; // update_emitters: the game's effect list was read this frame (spark flashes come from it then)
 
 bool near_blast(const float p[3], double ms, float r)
 {
@@ -1674,12 +1675,18 @@ void update_glows(uint32_t f)
             for (int wi = 16; wi < 32 && !flashed_near; wi++) {
                 const WorldLight &wl = g_wl[wi];
                 // owner: "sparks still play flash twice": 300 ms / 3 m (was 150 ms / 2.5 m)
-                if (!wl.spark || g_glow_now - wl.at > 300.0 || g_glow_now < wl.at) continue;
+                if (!wl.spark || g_glow_now - wl.at > 150.0 || g_glow_now < wl.at) continue; // owner: "put it at 100ms" (was 300), then "at 150ms"
                 float dx = wl.pos[0] - p[0], dy = wl.pos[1] - p[1], dz = wl.pos[2] - p[2];
-                flashed_near = dx * dx + dy * dy + dz * dz < 9.0f;
+                flashed_near = dx * dx + dy * dy + dz * dz < 1.0f; // owner: "put it at one per 1m" (was 3 m)
             }
-            const bool flashed_before = g_glow[best].flash_f && f - g_glow[best].flash_f < 24; // one flash per glow per 400 ms
-            if (burst && recent_shot && !flashed_near && !flashed_before && !g_glow[best].firetex) {
+            const bool flashed_before = g_glow[best].flash_f && f - g_glow[best].flash_f < 9; // one flash per glow per 150 ms (was 400, then 100)
+            // owner: "can we remove the ms limit ?": no time limits (they were 150 ms per spot within 1 m, and per glow):
+            // every new spark sprite after a shot flashes. kSparkLimit = true brings them back.
+            constexpr bool kSparkLimit = false;
+            // owner: "instead of spawn one light at each sprite, can we adjust it to the emitter", "one light per
+            // emitter": the flashes come from the impact emitters now (impact_flashes); the sprites only while the
+            // game's effect list cannot be read
+            if (!g_em_ok && burst && recent_shot && (!kSparkLimit || (!flashed_near && !flashed_before)) && !g_glow[best].firetex) {
                 g_glow[best].flash_f = f;
                 // owner: a ricochet should flash: a tiny, short flash in the sparks' colour
                 WorldLight fl = {};
@@ -1687,13 +1694,13 @@ void update_glows(uint32_t f)
                 fl.at = g_glow_now; // this frame's time: full strength in the frame it is first drawn
                 // owner: "the sparks produce nearly nothing", "increase the values", then "the sparks are not instant
                 // and the radius is too big": 1.5 m, full strength at once, then a very quick fade
-                fl.gain = 3.0f; // owner: "bullet sparks are still missing" - made and in a slot, but too faint and too brief to see
+                fl.gain = 3.2f; /* then "slightly less bright": 3.6 -> 3.2 */ // owner: "bullet sparks are still missing" - made and in a slot, but too faint and too brief to see; then "slightly more light for the bullet sparks": 3.0 -> 3.6
                 {   // close to the eye (rounds hitting the player's cover): a quarter at 0.8 m, full from 3 m
                     float ex = p[0] - g_vp_eye[0], ey = p[1] - g_vp_eye[1], ez = p[2] - g_vp_eye[2];
                     float de = sqrtf(ex * ex + ey * ey + ez * ez);
                     fl.gain *= std::fmin(std::fmax(0.25f + 0.75f * (de - 0.8f) / 2.2f, 0.25f), 1.0f);
                 }
-                fl.reach = 2.0f;
+                fl.reach = 2.3f; // (was 2.0: "slightly more light")
                 fl.spark = true;
                 fl.r = 0.6f + 0.8f * col[0], fl.g = 0.5f + 0.7f * col[1], fl.b = 0.3f + 0.5f * col[2];
                 fl.rise_ms = 0, fl.hold_ms = 33, fl.decay_ms = 40, fl.life_ms = 170; // owner: "fade out slower" // full for 2 frames, then a very quick fade
@@ -1761,8 +1768,7 @@ static float wall_gate(float t, float &vis, bool &on, float &gate)
 // above): it gets a steady, strobing orange light 4 m above its origin (owner: "4m above the point of origin").
 struct Emitter { uint32_t inst, def, born, seen, obj; float pos[3], score, maxscore, vis, gate; bool used, on, fire, impact, flame; char name[16]; };
 Emitter g_em[128];
-uint32_t g_em_live, g_em_fires, g_em_attached;
-bool g_em_ok;
+uint32_t g_em_live, g_em_fires, g_em_attached; // (g_em_ok: above, by g_glow_now)
 // Effect instances live only a few seconds (mission 0: all under 5 s) - a burning fire is effects respawned at one spot.
 // A fire SITE is a place where orange-rising emitters keep appearing: it burns from 0.5 s after it starts, and fades
 // out over 2 s after the last one (the light: 4 m above it, strobing).
@@ -2004,6 +2010,92 @@ void name_effect_def(uint32_t def)
     logf("%s", out);
 }
 
+// One spark flash per bullet impact (owner: "one light per emitter"): each hit makes one impact effect instance
+// (IM_G_MET_M90 metal, IM_G_CON_M90 concrete, ...); the frame a new one appears in the live list, one flash at it.
+// Not: hits on people (IM_A_*, blood) and the soft ground (water, mud, dirt, sand: splashes and dust). The tracker
+// (g_em) has 128 slots and heavy fire keeps ~300 impacts alive: this keeps its own set of instances already seen.
+struct ImpactSeen { uint32_t inst, def, seen; };
+static ImpactSeen g_imp[2048];
+static uint32_t g_imp_scan; // the last frame scanned (a gap: everything is taken as old, no burst of flashes)
+static int impact_kind(uint32_t def) // 1 = sparks, 0 = no flash
+{
+    static std::unordered_map<uint32_t, int> kind;
+    auto it = kind.find(def);
+    if (it != kind.end()) return it->second;
+    char nm[16] = {};
+    int k = 0;
+    // owner: "it seems to lit even when theres no metal sparks": metal only (IM_G_MET_*). Mission 4: 269 metal hits,
+    // 82 concrete, 25 glass, 20 wood, 3 tree - concrete / glass / wood throw dust and chips, no sparks
+    if (safe_read(nm, def, 15) && !strncmp(nm, "IM_G_MET", 8)) k = 1;
+    kind.emplace(def, k);
+    return k;
+}
+static void spark_flash_at(const float at[3])
+{
+    WorldLight fl = {};
+    // a little off the surface toward the eye: on the surface the wall it hit would face it edge-on (no light)
+    float ex = g_vp_eye[0] - at[0], ey = g_vp_eye[1] - at[1], ez = g_vp_eye[2] - at[2];
+    float de = sqrtf(ex * ex + ey * ey + ez * ez);
+    const float off = de > 0.5f ? 0.3f / de : 0.0f;
+    fl.pos[0] = at[0] + ex * off, fl.pos[1] = at[1] + ey * off, fl.pos[2] = at[2] + ez * off;
+    fl.at = g_glow_now;
+    fl.gain = 2.1f * std::fmin(std::fmax(0.25f + 0.75f * (de - 0.8f) / 2.2f, 0.25f), 1.0f); // as the sprite flashes; owner: "make the light less bright": 3.2 -> 2.6, then "20 % less bright again": 2.1
+    fl.reach = 2.3f;
+    fl.spark = true;
+    fl.r = 1.32f, fl.g = 0.95f, fl.b = 0.5f; // the spark texture's warm white (0.89 0.63 0.37)
+    fl.rise_ms = 0, fl.hold_ms = 33, fl.decay_ms = 40, fl.life_ms = 170;
+    add_world_light(fl, false);
+    g_spark_stat[0]++;
+}
+static void impact_flashes(uint32_t f, uint32_t mgr, const uint16_t *idx, uint32_t cnt)
+{
+    const bool warm = g_imp_scan == f - 1;
+    g_imp_scan = f;
+    if (f % 600 == 0) { // drop the ones gone (keeps the probe chains short): rebuild with the live ones
+        static ImpactSeen keep[2048];
+        int nk = 0;
+        for (ImpactSeen &x : g_imp)
+            if (x.inst && f - x.seen <= 1) keep[nk++] = x;
+        memset(g_imp, 0, sizeof g_imp);
+        for (int i = 0; i < nk; i++) {
+            uint32_t h = ((keep[i].inst >> 4) * 2654435761u ^ keep[i].def) & 2047;
+            while (g_imp[h].inst) h = (h + 1) & 2047;
+            g_imp[h] = keep[i];
+        }
+    }
+    int flashes = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (idx[i] >= 768) continue;
+        const uint32_t inst = mgr + idx[i] * 0x70u;
+        uint32_t def = 0;
+        if (!safe_read(&def, inst + 0x60, 4) || def < 0x80000000u || def >= 0x84000000u) continue;
+        uint32_t h = ((inst >> 4) * 2654435761u ^ def) & 2047, free_h = ~0u;
+        bool found = false;
+        for (int probe = 0; probe < 2048; probe++, h = (h + 1) & 2047) {
+            ImpactSeen &x = g_imp[h];
+            if (!x.inst) { if (free_h == ~0u) free_h = h; break; }
+            if (x.inst == inst && x.def == def && f - x.seen <= 1) { x.seen = f, found = true; break; }
+            if (free_h == ~0u && f - x.seen > 1) free_h = h; // gone: reusable
+        }
+        if (found || free_h == ~0u) continue;
+        g_imp[free_h] = {inst, def, f};
+        if (!warm || flashes >= 24 || impact_kind(def) != 1) continue; // (a cap for a frame of many hits)
+        float m[3];
+        if (!safe_read(m, inst + 0x50, 12) || !std::isfinite(m[0]) || !std::isfinite(m[1]) || !std::isfinite(m[2])) continue;
+        static uint32_t dl;
+        if (dl < 100) { // the first new impacts (one hit = one instance: checked on mission 4)
+            dl++;
+            char nm[16] = {};
+            safe_read(nm, def, 15);
+            for (char &ch : nm)
+                if (ch && (ch < 0x20 || ch >= 0x7F)) ch = '.';
+            logf("[ppl] impact %s inst %08X at %.2f %.2f %.2f", nm, inst, m[0], m[1], m[2]);
+        }
+        spark_flash_at(m);
+        flashes++;
+    }
+}
+
 void update_emitters(uint32_t f)
 {
     if (!ppl_med()) { g_em_ok = false; return; } // LIGHTING LOW: no fires
@@ -2033,6 +2125,7 @@ void update_emitters(uint32_t f)
     static uint16_t idx[768];
     if (cnt && !safe_read(idx, arr, cnt * 2u)) return;
     g_em_ok = true;
+    impact_flashes(f, mgr, idx, cnt);
     g_em_live = cnt;
     auto take = [&](uint32_t inst, uint32_t obj) {
         uint32_t def = 0;
@@ -2970,7 +3063,11 @@ void ppl_upload(IDirect3DDevice9 *d)
     // c23 texel size of texture 0, bump height, this draw's light gain
     uint32_t w = 1, h = 1, dd, lv;
     pixel_container_dims((PixelContainer *)g_st.textures[0], &w, &h, &dd, &lv);
-    k[0][0] = 1.0f / (float)(w ? w : 1), k[0][1] = 1.0f / (float)(h ? h : 1), k[0][2] = g_draw_char ? bump * 0.33f : bump;
+    k[0][0] = 1.0f / (float)(w ? w : 1), k[0][1] = 1.0f / (float)(h ? h : 1), k[0][2] = g_draw_char ? -1.0f : bump;
+    // owner: "there is visible square on the clone model when ppl light come on": the pixel shader's normal is the
+    // triangle's (ddx / ddy of the position), so a low-poly character lit its facets one by one, and the bump from a
+    // low-res texture added texel squares. A draw with a vertex normal (characters, props, the gun) now sends -1 here:
+    // no bump, a soft wrap term that hardly follows the facets, no highlight (the shader, ppl_ps_epilogue_base)
     k[0][3] = g_draw_gun ? gun_gain : 1.0f;
     float (*L)[4] = &k[1], (*C)[4] = &k[5]; // c24..c27 position + reach, c28..c31 colour
     for (int i = 0; i < 4; i++) L[i][3] = 1.0f;  // unused slots: zero colour
@@ -3200,8 +3297,8 @@ const char *ppl_ps_epilogue(int mode)
             s.insert(at, "    [unroll] for (int lk = 0; lk < 9; lk++) {\n" // world lights 4-12: no shadow
                          "      float3 L = pplL3[lk].xyz - P; float d2 = dot(L, L); float a = saturate(1 - d2 / (pplL3[lk].w * pplL3[lk].w)); a *= a;\n"
                          "      L *= rsqrt(max(d2, 1e-6));\n"
-                         "      float ndl = saturate(dot(Nb, L)) * saturate(dot(N, L) * 8);\n"
-                         "      float sp = pow(saturate(dot(Nb, normalize(L + V))), 24) * 0.5 * gloss * (ndl > 0);\n"
+                         "      float ndl = chr > 0 ? saturate(dot(N, L) * 0.35 + 0.65) : saturate(dot(Nb, L)) * saturate(dot(N, L) * 8);\n"
+                         "      float sp = pow(saturate(dot(Nb, normalize(L + V))), 24) * 0.5 * gloss * (ndl > 0) * (1 - chr);\n"
                          "      add += pplC3[lk].rgb * a * (pplL3[lk].w > 0 ? t0.rgb * ndl + sp : sp * 2.5);\n"
                          "    }\n");
             s += "  if (pplFog.x > 0) res.rgb = lerp(fogColor.rgb, res.rgb, saturate(I.tc7.x));\n"; // the fog factor (TEXCOORD7.x)
@@ -3224,8 +3321,8 @@ const char *ppl_ps_epilogue(int mode)
         s.insert(at, "    [unroll] for (int lj = 0; lj < 2; lj++) {\n" // world lights 4-5: no shadow
                      "      float3 L = pplL2[lj].xyz - P; float d2 = dot(L, L); float a = saturate(1 - d2 / (pplL2[lj].w * pplL2[lj].w)); a *= a;\n"
                      "      L *= rsqrt(max(d2, 1e-6));\n"
-                     "      float ndl = saturate(dot(Nb, L)) * saturate(dot(N, L) * 8);\n"
-                     "      float sp = pow(saturate(dot(Nb, normalize(L + V))), 24) * 0.5 * gloss * (ndl > 0);\n"
+                     "      float ndl = chr > 0 ? saturate(dot(N, L) * 0.35 + 0.65) : saturate(dot(Nb, L)) * saturate(dot(N, L) * 8);\n"
+                     "      float sp = pow(saturate(dot(Nb, normalize(L + V))), 24) * 0.5 * gloss * (ndl > 0) * (1 - chr);\n"
                      "      add += pplC2[lj].rgb * a * (pplL2[lj].w > 0 ? t0.rgb * ndl + sp : sp * 2.5);\n"
                      "    }\n");
         return s;
@@ -3241,7 +3338,8 @@ static const char *ppl_ps_epilogue_base()
            "    const float3 LUM = float3(0.299, 0.587, 0.114);\n"
            "    float hl = dot(tex2D(s2d0, uv - float2(pplTex.x, 0)).rgb, LUM), hr = dot(tex2D(s2d0, uv + float2(pplTex.x, 0)).rgb, LUM);\n"
            "    float hd = dot(tex2D(s2d0, uv - float2(0, pplTex.y)).rgb, LUM), hu = dot(tex2D(s2d0, uv + float2(0, pplTex.y)).rgb, LUM);\n"
-           "    float2 dh = float2(hr - hl, hu - hd) / (2 * pplTex.xy) * pplTex.z;\n"
+           "    float2 dh = float2(hr - hl, hu - hd) / (2 * pplTex.xy) * max(pplTex.z, 0);\n"
+           "    float chr = pplTex.z < 0;\n" // a character (or prop / gun): soft light, no facets
            "    float3 dp1 = ddx(P), dp2 = ddy(P);\n"
            "    float2 duv1 = ddx(uv), duv2 = ddy(uv);\n"
            "    float3 N = normalize(cross(dp1, dp2));\n"
@@ -3258,8 +3356,8 @@ static const char *ppl_ps_epilogue_base()
            "    [unroll] for (int li = 0; li < 4; li++) {\n"
            "      float3 L = pplL[li].xyz - P; float d2 = dot(L, L); float a = saturate(1 - d2 / (pplL[li].w * pplL[li].w)); a *= a;\n"
            "      L *= rsqrt(max(d2, 1e-6));\n"
-           "      float ndl = saturate(dot(Nb, L)) * saturate(dot(N, L) * 8);\n"
-           "      float sp = pow(saturate(dot(Nb, normalize(L + V))), 24) * 0.5 * gloss * (ndl > 0);\n"
+           "      float ndl = chr > 0 ? saturate(dot(N, L) * 0.35 + 0.65) : saturate(dot(Nb, L)) * saturate(dot(N, L) * 8);\n"
+           "      float sp = pow(saturate(dot(Nb, normalize(L + V))), 24) * 0.5 * gloss * (ndl > 0) * (1 - chr);\n"
            "      float sh = 1;\n"
            "      if (li == 1) {\n"  // the shadow cube: 4 taps around the light -> pixel direction
            "        float3 sd = I.tc5.xyz; float sl = length(sd); float3 sn = sd / max(sl, 1e-4);\n"  // world axes
