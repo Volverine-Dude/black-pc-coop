@@ -153,7 +153,8 @@ struct Config {
     bool coop_sprint = false;    // co-op (HOST's lobby option, black.ini sprint): both players may sprint (pad L1 / Shift)
     int coop_diffmode = 0;       // co-op (HOST's lobby option DIFFICULTY, black.ini coop_difficulty): 0 VANILLA, 1 CO-OP (players take more damage)
     bool coop_revivecost = true;   // co-op (HOST's lobby option REVIVE COST, black.ini coop_revive_cost): a revive costs the reviver 25 % health
-    bool coop_skipmovies = false;  // co-op (HOST's lobby option SKIP MOVIES, black.ini coop_skip_movies): movies skip themselves for both
+    bool coop_skipmovies = false;
+    bool coop_vanillamult = true;  // co-op (HOST's lobby option ENEMY MULTIPLIERS, black.ini coop_enemy_multipliers): the enemy copies, VANILLA and CO-OP  // co-op (HOST's lobby option SKIP MOVIES, black.ini coop_skip_movies): movies skip themselves for both
     bool coop_special = true;    // co-op (HOST's lobby option SPECIAL WEAPONS, black.ini coop_special_weapons): the game's silver / gold weapons
     bool coop_hitmarker = false; // co-op: a local hit marker at the crosshair (white = hit, red = kill); CO-OP page, black.ini hitmarker
     bool coop_downed = false;  // --coop-downed: killing blows clamp to hp 1 (DOWNED, no death branch); spectator cam on the survivor; the survivor's X respawns them
@@ -186,7 +187,8 @@ extern volatile int g_coop_diffmode_on;      // fe/coop_menu.cpp: this session's
 extern volatile int g_coop_special_on;       // fe/coop_menu.cpp: this session's SPECIAL WEAPONS (1 = the game's silver / gold rule, 0 = off)
 extern volatile unsigned long long g_pse_open_ms;   // coop/coop.cpp: when the pause menu's page file was last opened (kernel/k_file.cpp)
 extern volatile int g_coop_revcost_on;      // fe/coop_menu.cpp: this session's REVIVE COST (host: its option; joiner: the host's)
-extern volatile int g_coop_skipmovies_on;   // fe/coop_menu.cpp: this session's SKIP MOVIES (host: its option; joiner: the host's)
+extern volatile int g_coop_skipmovies_on;
+extern volatile int g_coop_vmult_on;        // fe/coop_menu.cpp: this session's VANILLA ENEMIES (host: its option; joiner: the host's)   // fe/coop_menu.cpp: this session's SKIP MOVIES (host: its option; joiner: the host's)
 extern char g_coop_lobby_banner[3][64];      // fe/coop_menu.cpp: the lobby's two top banners (d3d/device.cpp draws them; "" = none)
 extern volatile int g_coop_sprinting;        // input/xinput.cpp: our player sprints now
 extern volatile float g_coop_sprint_blend;   // 0..1, eased: the lowered gun (d3d/draw.cpp)

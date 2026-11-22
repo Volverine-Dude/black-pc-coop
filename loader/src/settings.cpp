@@ -91,7 +91,8 @@ void settings_load()
         else if (k == "coop_difficulty") g_cfg.coop_diffmode = v != 0 ? 1 : 0;   // the host's lobby DIFFICULTY: 0 VANILLA, 1 CO-OP
         else if (k == "coop_special_weapons") g_cfg.coop_special = v != 0;
         else if (k == "coop_skip_movies") g_cfg.coop_skipmovies = v != 0;
-        else if (k == "coop_revive_cost") g_cfg.coop_revivecost = v != 0;          // the host's lobby REVIVE COST          // the host's lobby SKIP MOVIES       // the host's lobby SPECIAL WEAPONS
+        else if (k == "coop_revive_cost") g_cfg.coop_revivecost = v != 0;
+        else if (k == "coop_enemy_multipliers") g_cfg.coop_vanillamult = v != 0;    // the host's lobby ENEMY MULTIPLIERS          // the host's lobby REVIVE COST          // the host's lobby SKIP MOVIES       // the host's lobby SPECIAL WEAPONS
         else bindings::load_ini(k.c_str(), val); // key_<action> = Key[,Key]
     }
     fclose(f);
@@ -137,6 +138,7 @@ void settings_save()
     fprintf(f, "coop_special_weapons = %d\n", g_cfg.coop_special ? 1 : 0);
     fprintf(f, "coop_skip_movies = %d\n", g_cfg.coop_skipmovies ? 1 : 0);
     fprintf(f, "coop_revive_cost = %d\n", g_cfg.coop_revivecost ? 1 : 0);
+    fprintf(f, "coop_enemy_multipliers = %d\n", g_cfg.coop_vanillamult ? 1 : 0);
     bindings::save_ini(f);
     fclose(f);
 }

@@ -1015,6 +1015,13 @@ constexpr float kBarScale = 0.45f, kBarDX = 12.0f, kBarDY = 16.0f - 15.9f * kBar
 constexpr float kKeysX = 175.0f; // a key row's keys, on its caption's line
 constexpr uint32_t kBarDepth = 101;
 
+// INLINE VALUES (owner 20261121: "put the toggle section in the same row of their respective options"): the Sound Setup
+// row template (char 25: arrows clip 19 at depth 1 (9.3, 18.0), value 22 at depth 5 (10.5, 16.5), caption 24 at depth 7;
+// the arrows 18 at -3.5 and, mirrored, 292.2; frames 1-18 only recolour) puts the value on a second line under the
+// caption. With g_inline_values a choice row's arrows + value move up onto the caption's line, to its right, and the
+// right arrow comes in (the values are short: ON / OFF / VANILLA / CO-OP).
+static bool g_inline_values;
+constexpr float kInlineDX = 200.0f, kInlineDY = -17.4f, kInlineArrowR = 100.0f;
 void choice_page(Movie &mv, const std::string &title, const std::vector<RowSpec> &rows, const std::string &back, bool wrap, int page_id)
 {
     if (rows.size() > 6) throw Error("a page has at most six rows");
@@ -1045,6 +1052,16 @@ void choice_page(Movie &mv, const std::string &title, const std::vector<RowSpec>
         if (r.kind == RowSpec::Choice) {
             int lt = mv.add_character(mv.clone_text(mv.character(23), r.label, r.label));
             int ls = mv.add_character(mv.clone_sprite(mv.character(24), {{23, lt}}));
+            if (g_inline_values) {
+                int ar = mv.add_character(mv.clone_sprite(mv.character(19), {}));
+                wrf(mv.apt, mv.find_place(mv.character(ar), 0, 3) + 32, kInlineArrowR);
+                row = mv.add_character(mv.clone_sprite(mv.character(25), {{24, ls}, {22, vs}, {19, ar}}));
+                for (uint32_t d : {1u, 5u}) {
+                    uint32_t c = mv.find_place(mv.character(row), 0, d);
+                    wrf(mv.apt, c + 32, rdf(mv.apt, c + 32) + kInlineDX);
+                    wrf(mv.apt, c + 36, rdf(mv.apt, c + 36) + kInlineDY);
+                }
+            } else
             row = mv.add_character(mv.clone_sprite(mv.character(25), {{24, ls}, {22, vs}}));
         } else {
             int lt = mv.add_character(mv.clone_text(mv.character(38), r.label, r.label));
@@ -1546,7 +1563,9 @@ bool fe_build_pages(const std::wstring &game_dir, const std::wstring &out_root)
         const std::vector<RowSpec> coop_rows = {{RowSpec::Link, 1, "HOST GAME", "", "CoopHost"},
                                                 {RowSpec::Link, 2, "JOIN GAME", "", "CoopJoin"},
                                                 {RowSpec::Choice, 3, "HIT MARKER", "&PC_V2", "PCCoopChange"},
-                                                {RowSpec::Choice, 4, "LIGHTING", "&PC_V3", "PCCoopChange"}};   // dynamic lights (d3d/ppl.h), solo too
+                                                {RowSpec::Choice, 4, "LIGHTING", "&PC_V3", "PCCoopChange"},
+                                                // owner 20261121: SKIP MOVIES moves here from the host lobby (the host's setting)
+                                                {RowSpec::Choice, 5, "SKIP MOVIES", "&PC_V4", "PCCoopChange"}};   // dynamic lights (d3d/ppl.h), solo too
         for (int k = 0; k < 2; k++) {
             Movie page(sound);
             choice_page(page, "CO-OP", coop_rows, k ? "BlackTitleMenu2" : "BlackTitleMenu", true, 200 + k);
@@ -1567,14 +1586,15 @@ bool fe_build_pages(const std::wstring &game_dir, const std::wstring &out_root)
             // owner 20261120: "remove the code menu section on the host lobby and put it in a banner ... and add a skip
             // movie toggle instead" - the code is the third banner; row 0 is SKIP MOVIES (host only)
             Movie lobby(sound);   // rows show &PC_V<row>: skip movies, the difficulty mode, special weapons, sprint
-            choice_page(lobby, "LAN LOBBY", {{RowSpec::Choice, 411, "SKIP MOVIES", "&PC_V0", "PCCoopChange"},
+            // owner 20261121: the rows in this order, each value on its caption's line (g_inline_values)
+            g_inline_values = true;
+            choice_page(lobby, "LAN LOBBY", {{RowSpec::Action, 41, "START MISSION", "", "PCCoop"},
                                              {RowSpec::Choice, 409, "DIFFICULTY", "&PC_V1", "PCCoopChange"},
-                                             {RowSpec::Choice, 410, "SPECIAL WEAPONS", "&PC_V2", "PCCoopChange"},
-                                             {RowSpec::Choice, 408, "SPRINT", "&PC_V3", "PCCoopChange"},   // owner 20261115: host-only option
-                                             {RowSpec::Action, 41, "START MISSION", "", "PCCoop"},
-                                             // owner 20261120: "replace LEAVE LOBBY" (six rows at most) - Back leaves the lobby
-                                             // the same way; a bottom note says so (fe/coop_menu.cpp host_poll)
-                                             {RowSpec::Choice, 412, "REVIVE COST", "&PC_V5", "PCCoopChange"}}, "CoopHost", true, 220);   // step 4: only with player 2 READY (fe/coop_menu.cpp opens mission select)
+                                             {RowSpec::Choice, 413, "ENEMY MULTIPLIERS", "&PC_V2", "PCCoopChange"},   // owner 20261121: copies on / off, both difficulties
+                                             {RowSpec::Choice, 408, "SPRINT", "&PC_V3", "PCCoopChange"},
+                                             {RowSpec::Choice, 410, "SPECIAL WEAPONS", "&PC_V4", "PCCoopChange"},
+                                             {RowSpec::Choice, 412, "REVIVE COST", "&PC_V5", "PCCoopChange"}}, "CoopHost", true, 220);
+            g_inline_values = false;   // step 4: only with player 2 READY (fe/coop_menu.cpp opens mission select)
             add_movie(c, "cooplobby", lobby.build());
             Movie code(sound);
             choice_page(code, "JOIN LAN GAME", {{RowSpec::Choice, 401, "CODE", "&PC_V0", "PCCoopChange"},

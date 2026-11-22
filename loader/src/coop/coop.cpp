@@ -2430,7 +2430,16 @@ static float coop_copy_mul(void)
     }
     if (!on || !g_cfg.coop_role) return 1.0f;
     if (force >= 1.0f) return force;
-    return g_coop_diffmode_on ? coop_diff_damage_mul() : 1.0f;
+    // owner 20261121: "an ENEMY MULTIPLIERS on / off toggle ... for both VANILLA and CO-OP difficulties" - the host's option
+    // (synced) decides the copies alone: Normal x1.5, Hard x2, Black Ops x2.5 in either difficulty, none when OFF
+    if (g_coop_vmult_on) {
+        uint32_t game = *(volatile uint32_t *)(uintptr_t)0x002D45F0;
+        if (game < 0x80000000 || game >= 0x84000000) return 1.0f;
+        int d = *(volatile int *)(uintptr_t)(game + 0x2014C);
+        static const float mul[4] = {1.0f, 1.5f, 2.0f, 2.5f};
+        return d >= 0 && d < 4 ? mul[d] : 1.0f;
+    }
+    return 1.0f;
 }
 static int coop_pool_free(void)
 {
@@ -12448,6 +12457,109 @@ volatile uint32_t g_bank_deny, g_bank_resume;
 // up, a slot that holds a sound-bank job (callback LAB_00141090 at +0x110, set by FUN_00147900) and is not in the middle
 // of a read is passed over; the menu's page loads; the bank job carries on when the menu closes.
 volatile uint32_t g_bank_cb, g_ld_cont, g_ld_read, g_ld_next, g_bank_slot_skips;
+// MENU-ONLY PAUSE (owner two-PC play 20261122: "the pause button should only bring the menu, it should have zero effect on
+// the current game logic and coop mode logic, it shouldn't analyze anything from the game sound and other assets").
+// -92: the host's pause menu never came up (496 s until the mission failed): pausing freed the first-person gun and the
+// running world asked for it again at once; that job held the loader slot the menu's page needed. And while the host
+// was paused its enemy animation stopped (2388 anim calls sent before, none after): parts of the game test the paused
+// flag (+0x210C8) outside the world update. The game's pause request (session +0x21088 = 1, run by FUN_0020d400 each
+// frame: +0x210C8 = 1, every sound channel / music / stream paused, render flag, player input blocked; = 2 undoes it)
+// is now, in a session, reduced to the input block alone: the pause menu opens (the front end does that itself) and
+// takes the keys, and nothing of the game is paused, freed or reloaded. Unpause clears the block. The mission failed
+// screen (g_coop_mission_failed) keeps the game's own pause. COOP_MENU_PAUSE=0 = off.
+volatile uint32_t g_preq_resume;
+// the two pieces of the game's pause kept in a session (FUN_0020d400 0x20d531 / 0x20d54f): the input devices' notice and
+// the pause menu page; everything else there (paused flag, sound channels, music, streams, render flag) is left out
+static volatile uint32_t g_pp_fe, g_pp_in, g_pp_flag;
+static void coop_open_pause_page()
+{
+    g_pp_fe = *(volatile uint32_t *)(uintptr_t)xbe_va(0x002D199C);
+    if (!g_pp_fe) return;
+    uint32_t fn = xbe_va(0x00122630);
+    __asm {
+        pushad
+        mov esi, dword ptr [g_pp_fe]
+        call fn
+        popad
+    }
+}
+static void coop_input_pause_notice(uint32_t input, bool on)
+{
+    g_pp_in = input; g_pp_flag = on ? 1 : 0;
+    uint32_t fn = xbe_va(0x000C2380);
+    __asm {
+        pushad
+        mov esi, dword ptr [g_pp_in]
+        mov edi, esi
+        mov eax, dword ptr [g_pp_flag]
+        call fn
+        popad
+    }
+}
+extern "C" void __cdecl coop_pause_req(uint32_t game)
+{
+    if (!g_cfg.coop_role || game < 0x80000000 || game >= 0x84000000 || g_coop_mission_failed) return;
+    volatile int32_t *req = (volatile int32_t *)(uintptr_t)(game + 0x21088);
+    if (*req != 1 && *req != 2) return;
+    uint32_t I = *(volatile uint32_t *)(uintptr_t)0x002D45E8;
+    bool open = *req == 1;
+    if (I >= 0x80000000 && I < 0x84000000) {
+        coop_input_pause_notice(I, open);                                  // FUN_000c2380 (AL, ESI = EDI = input): what the game tells its input devices
+        *(volatile uint8_t *)(uintptr_t)(I + 0xAEC) = open ? 1 : 0;      // the player's input goes to the menu
+    }
+    if (open && *(volatile uint8_t *)(uintptr_t)(game + 0x210CB)) coop_open_pause_page();   // FUN_00122630: the pause menu page (as the game does)
+    static uint32_t n;
+    if (n++ < 40) logf("coop: menu-only pause: %s - the game is not paused (input %s)", *req == 1 ? "pause menu opens" : "pause menu closes", *req == 1 ? "to the menu" : "back to play");
+    *req = 0;
+}
+// GUN HOLD (owner 20261122 on -93: the last pause-menu delay, 0.14 - 1.77 s, "try to remove it"). Opening the pause
+// menu, the front end (FUN_00120940, FE +0x3924 = 1 from FUN_00122630) asks the first-person gun system FUN_001d4f30
+// (stdcall gun hash lo / hi, EAX = the gun manager, AL = done) for NO gun (0, 0) - the gun is let go to make room for
+// the menu's page (PseMenu.bin), loaded once that request is done. In single player the game stands still meanwhile;
+// in a session the world runs and the player's weapon code (FUN_001dec70 / FUN_001f0650) kept asking for the gun again,
+// so the two requests undid each other (fpguns\*.db reopened every 85 ms) until the menu's won. While the pause menu
+// is up (our input block), a request for a real gun now answers "not done yet" and changes nothing; the menu's request
+// goes through, and the gun comes back when the menu closes - as in single player.
+volatile uint32_t g_gunreq_block, g_gunreq_resume, g_gunreq_holds;
+extern "C" void __cdecl coop_gunreq_check(uint32_t lo, uint32_t hi)
+{
+    g_gunreq_block = 0;
+    if (!g_cfg.coop_role || (lo == 0 && hi == 0) || !coop_game_paused()) return;
+    g_gunreq_block = 1;
+    if (g_gunreq_holds++ % 600 == 0) logf("coop: gun hold: the pause menu is up - the game's request for its gun %08x%08x waits (%u so far)", hi, lo, g_gunreq_holds);
+}
+__declspec(naked) void coop_thunk_gunreq()   // FUN_001d4f30 entry: 53 8B 5C 24 0C (push ebx; mov ebx, [esp+0xc]) re-executed
+{
+    __asm {
+        pushad
+        push dword ptr [esp + 0x28]          // hi
+        push dword ptr [esp + 0x28]          // lo
+        call coop_gunreq_check
+        add esp, 8
+        popad
+        cmp dword ptr [g_gunreq_block], 0
+        jne holdgun
+        push ebx
+        mov ebx, dword ptr [esp + 0xC]
+        jmp dword ptr [g_gunreq_resume]
+    holdgun:
+        xor eax, eax
+        ret 8
+    }
+}
+__declspec(naked) void coop_thunk_pause_req()   // FUN_0020d400 entry: 51 8B 54 24 08 (push ecx; mov edx, [esp+8]) re-executed
+{
+    __asm {
+        pushad
+        push dword ptr [esp + 0x24]             // the game object (our caller's argument)
+        call coop_pause_req
+        add esp, 4
+        popad
+        push ecx
+        mov edx, dword ptr [esp + 8]
+        jmp dword ptr [g_preq_resume]
+    }
+}
 // NO STOPPING HINTS (owner two-PC play 20261121: "the joiner had tutorial hints that would freeze his game and add a blur,
 // both shouldn't be there ... could cause desync and most likely caused the crash on the joiner"). Joiner 291.7 - 302.2:
 // a tutorial hint (PRESS A TO CONTINUE) stopped its whole game for 10.5 s - world, co-op step and all - then the co-op
@@ -12468,6 +12580,30 @@ __declspec(naked) void coop_thunk_hint()   // 0x12a900: B8 80 AA 28 00 (mov eax,
         ret
     }
 }
+// pb4 diagnosis (owner two-PC play 20261121 on -91: "pause still hangs for some time"; host 1447.8: the menu's page
+// 10.7 s late, bg1_shg.db reopened 127 times although the bank job was passed over 1674 times): while the pause menu is
+// up, every loader slot this hook lets through (a slot that is pending and is NOT passed over) is logged once per
+// slot / state / callback - its index, state bytes, callback, bytes read and file name.
+volatile uint32_t g_ld_diag_slot, g_ld_diag_why;
+extern "C" void coop_ld_diag(void)
+{
+    uint32_t sl = g_ld_diag_slot - 0x135;
+    if (sl < 0x10000) return;
+    uint8_t st[4] = {0};
+    for (int i = 0; i < 4; i++) st[i] = *(volatile uint8_t *)(uintptr_t)(sl + 0x134 + i);
+    if (!st[0] && !st[1] && !st[3]) return;   // not pending: nothing to report
+    uint32_t cb = *(volatile uint32_t *)(uintptr_t)(sl + 0x110), rdn = *(volatile uint32_t *)(uintptr_t)(sl + 0x11C);
+    static uint32_t seen[64]; static int ns, lines;
+    uint32_t key = (sl & 0xFFFF) ^ (cb << 8) ^ (st[0] << 1) ^ (st[1] << 2) ^ (st[3] << 3) ^ ((rdn ? 1u : 0u) << 30) ^ (g_ld_diag_why << 28);
+    for (int i = 0; i < ns; i++) if (seen[i] == key) return;
+    if (ns < 64) seen[ns++] = key;
+    if (lines++ >= 60) return;
+    char name[48] = {0};
+    for (int i = 0; i < 47; i++) { char c = *(volatile char *)(uintptr_t)(sl + 0x10 + i); if (!c) break; name[i] = (c >= 32 && c < 127) ? c : '?'; }
+    logf("coop: pause loader: slot %08x (#%d) let through (%s) - read %u open %u done %u, callback %08x%s, %u bytes read, '%s'",
+         sl, (int)((sl - *(volatile uint32_t *)(uintptr_t)0x002D45D8) / 0x13C), g_ld_diag_why == 1 ? "reading, not at its start" : g_ld_diag_why == 2 ? "not a sound-bank job" : "?",
+         st[0], st[1], st[3], cb, cb == g_bank_cb ? " (sound bank)" : "", rdn, name);
+}
 __declspec(naked) void coop_thunk_loader()   // 0x1fbbc0: 8A 50 FF 84 D2 (mov dl, [eax-1]; test dl, dl) + 75 22
 {
     __asm {
@@ -12484,6 +12620,16 @@ __declspec(naked) void coop_thunk_loader()   // 0x1fbbc0: 8A 50 FF 84 D2 (mov dl
         lock inc dword ptr [g_bank_slot_skips]
         jmp dword ptr [g_ld_next]
     normal:
+        cmp dword ptr [g_bank_deny], 0
+        je normal2
+        pushad
+        mov dword ptr [g_ld_diag_slot], eax
+        mov dword ptr [g_ld_diag_why], 2
+        call coop_ld_diag
+        popad
+        mov dl, byte ptr [eax - 1]                // restore the flags the original test gave (dl = 0 here)
+        test dl, dl
+    normal2:
         jmp dword ptr [g_ld_cont]
     readcheck:   // pb3: the failing bank job sits in the READ state and starts over each tick (slot +0x11C = 0 bytes
                  // read, the file reopened) - at that point no read is in progress, so it can be passed over too
@@ -12500,6 +12646,13 @@ __declspec(naked) void coop_thunk_loader()   // 0x1fbbc0: 8A 50 FF 84 D2 (mov dl
         jmp dword ptr [g_ld_next]
     readpop:
         pop ecx
+        pushad
+        mov dword ptr [g_ld_diag_slot], eax
+        mov dword ptr [g_ld_diag_why], 1
+        call coop_ld_diag
+        popad
+        mov dl, byte ptr [eax - 1]
+        test dl, dl
     reading:
         jmp dword ptr [g_ld_read]
     }
@@ -12767,38 +12920,41 @@ static void install_no_pause(void)
     memcpy(c + 1, &rel, 4);
     g_np_on = 1;
     logf("coop: no-pause installed at 0x20f7ff (the world update runs under the in-level pause menu)");
-    {   // the pause bank gate (see coop_thunk_bank)
-        static const uint8_t kBank[6] = {0x81, 0xEC, 0x18, 0x01, 0x00, 0x00};
-        uint32_t b = xbe_va(0x00147900);
-        auto *bc = (uint8_t *)(uintptr_t)b;
-        if (memcmp(bc, kBank, 6) != 0) logf("coop: pause bank gate: 0x147900 is not sub esp, 0x118 - not installed");
+    {   // no stopping hints (see coop_thunk_hint)
+        static const uint8_t kHint[5] = {0xB8, 0x80, 0xAA, 0x28, 0x00};
+        uint32_t hsite = xbe_va(0x0012A900);
+        auto *hc = (uint8_t *)(uintptr_t)hsite;
+        if (memcmp(hc, kHint, 5) != 0) logf("coop: no stopping hints: 0x12a900 is not mov eax, 0x28aa80 - not installed");
         else {
-            g_bank_resume = b + 6;
-            int32_t r2 = (int32_t)((uintptr_t)coop_thunk_bank - (b + 5));
-            bc[0] = 0xE9; memcpy(bc + 1, &r2, 4); bc[5] = 0x90;
-            logf("coop: pause bank gate installed at 0x147900 (no sound-bank loads while the pause menu is up)");
-            {   // no stopping hints (see coop_thunk_hint)
-                static const uint8_t kHint[5] = {0xB8, 0x80, 0xAA, 0x28, 0x00};
-                uint32_t hsite = xbe_va(0x0012A900);
-                auto *hc = (uint8_t *)(uintptr_t)hsite;
-                if (memcmp(hc, kHint, 5) != 0) logf("coop: no stopping hints: 0x12a900 is not mov eax, 0x28aa80 - not installed");
-                else {
-                    g_hint_resume = hsite + 5;
-                    int32_t r4 = (int32_t)((uintptr_t)coop_thunk_hint - (hsite + 5));
-                    hc[0] = 0xE9; memcpy(hc + 1, &r4, 4);
-                    logf("coop: no stopping hints installed at 0x12a900 (tutorial hints show as tips - no game stop, no blur)");
-                }
-            }
-            static const uint8_t kLd[7] = {0x8A, 0x50, 0xFF, 0x84, 0xD2, 0x75, 0x22};
-            uint32_t l = xbe_va(0x001FBBC0);
-            auto *lc = (uint8_t *)(uintptr_t)l;
-            if (memcmp(lc, kLd, 7) != 0) logf("coop: pause loader skip: 0x1fbbc0 is not the job-slot test - not installed");
+            g_hint_resume = hsite + 5;
+            int32_t r4 = (int32_t)((uintptr_t)coop_thunk_hint - (hsite + 5));
+            hc[0] = 0xE9; memcpy(hc + 1, &r4, 4);
+            logf("coop: no stopping hints installed at 0x12a900 (tutorial hints show as tips - no game stop, no blur)");
+        }
+    }
+    {   // MENU-ONLY PAUSE (see coop_thunk_pause_req); the earlier sound-bank gate / loader skip are no longer installed
+        char e[8] = {0};
+        if (GetEnvironmentVariableA("COOP_MENU_PAUSE", e, sizeof e) && e[0] == '0') { logf("coop: menu-only pause: OFF (COOP_MENU_PAUSE=0)"); }
+        else {
+            static const uint8_t kPr[5] = {0x51, 0x8B, 0x54, 0x24, 0x08};
+            uint32_t ps = xbe_va(0x0020D400);
+            auto *pc = (uint8_t *)(uintptr_t)ps;
+            if (memcmp(pc, kPr, 5) != 0) logf("coop: menu-only pause: 0x20d400 is not push ecx; mov edx, [esp+8] - not installed");
             else {
-                g_bank_cb = xbe_va(0x00141090);
-                g_ld_cont = xbe_va(0x001FBBC7); g_ld_read = xbe_va(0x001FBBE9); g_ld_next = xbe_va(0x001FBBD3);
-                int32_t r3 = (int32_t)((uintptr_t)coop_thunk_loader - (l + 5));
-                lc[0] = 0xE9; memcpy(lc + 1, &r3, 4);
-                logf("coop: pause loader skip installed at 0x1fbbc0 (a queued sound-bank job waits while the pause menu is up)");
+                g_preq_resume = ps + 5;
+                int32_t r5 = (int32_t)((uintptr_t)coop_thunk_pause_req - (ps + 5));
+                pc[0] = 0xE9; memcpy(pc + 1, &r5, 4);
+                logf("coop: menu-only pause installed at 0x20d400 (the pause key opens the menu; the game is not paused)");
+                static const uint8_t kGr[5] = {0x53, 0x8B, 0x5C, 0x24, 0x0C};
+                uint32_t gs = xbe_va(0x001D4F30);
+                auto *gc = (uint8_t *)(uintptr_t)gs;
+                if (memcmp(gc, kGr, 5) != 0) logf("coop: gun hold: 0x1d4f30 is not push ebx; mov ebx, [esp+0xc] - not installed");
+                else {
+                    g_gunreq_resume = gs + 5;
+                    int32_t r6 = (int32_t)((uintptr_t)coop_thunk_gunreq - (gs + 5));
+                    gc[0] = 0xE9; memcpy(gc + 1, &r6, 4);
+                    logf("coop: gun hold installed at 0x1d4f30 (no gun reload while the pause menu is up)");
+                }
             }
         }
     }
@@ -12846,8 +13002,59 @@ static void install_ammo_guard(void)
     code[5] = 0x90;
     logf("coop: ammo guard installed at FUN_00199600");
 }
+// TARGET-PICK GUARD (owner two-PC play 20261121: "both players crashed when the host chose to continue game on the
+// mission failed screen"): both copies, 1 s after ContinueMission, AV 0x194bfb (null [weapon] read) - the body was the
+// partner's CLONE (801e39a0), which came back from the restart without a weapon ("weapon guard: agent 8014f220 body
+// 801e39a0 has no weapon/ammo"); the re-arm in the weapon guard only knows enemy puppets. FUN_0019f860 (fastcall ECX =
+// the agent's target-pick record, +0xA4 = the agent) calls FUN_00194be0 first, which reads [[agent+0x8C]+0x29C] (the
+// body's weapon) unchecked. A body with no weapon now skips the target pick (nothing to aim with) until it is armed.
+volatile uint32_t g_tsel_resume, g_tsel_skip, g_tsel_ecx, g_tsel_hits;
+extern "C" void coop_tsel_check(void)
+{
+    g_tsel_skip = 0;
+    uint32_t rec = g_tsel_ecx;
+    if (rec < 0x80000000 || rec >= 0x84000000) return;
+    uint32_t ag = *(volatile uint32_t *)(uintptr_t)(rec + 0xA4);
+    uint32_t body = (ag >= 0x80000000 && ag < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(ag + 0x8C) : 0;
+    uint32_t w = (body >= 0x80000000 && body < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(body + 0x29C) : 0;
+    if (body >= 0x80000000 && body < 0x84000000 && (w < 0x80000000 || w >= 0x84000000)) {
+        g_tsel_skip = 1;
+        if (g_tsel_hits++ < 10) logf("coop: target-pick guard: agent %08x body %08x%s has no weapon - target pick skipped", ag, body, body == g_p10_gdst ? " (the CLONE)" : "");
+    }
+}
+__declspec(naked) void coop_thunk_tsel()   // FUN_0019f860 entry: 55 8B EC 83 E4 F0 re-executed
+{
+    __asm {
+        pushad
+        mov dword ptr [g_tsel_ecx], ecx
+        call coop_tsel_check
+        popad
+        cmp dword ptr [g_tsel_skip], 0
+        jne skipt
+        push ebp
+        mov ebp, esp
+        and esp, 0xFFFFFFF0
+        jmp dword ptr [g_tsel_resume]
+    skipt:
+        ret
+    }
+}
+static void install_tsel_guard(void)
+{
+    uint32_t site = xbe_va(0x0019F860);
+    auto *code = (uint8_t *)(uintptr_t)site;
+    static const uint8_t kExpect[6] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0};
+    if (memcmp(code, kExpect, 6) != 0) { logf("coop: target-pick guard: 0019f860 bytes mismatch - not installed"); return; }
+    g_tsel_resume = site + 6;
+    code[0] = 0xE9;
+    int32_t rel = (int32_t)((uintptr_t)coop_thunk_tsel - (site + 5));
+    memcpy(code + 1, &rel, 4);
+    code[5] = 0x90;
+    logf("coop: target-pick guard installed at FUN_0019f860 (a body with no weapon skips the target pick)");
+}
 static void install_weapon_guard(void)
 {
+    install_tsel_guard();
     uint32_t site = xbe_va(0x001AF190);
     auto *code = (uint8_t *)(uintptr_t)site;
     static const uint8_t kExpect[6] = {0x8B, 0x87, 0xAC, 0x03, 0x00, 0x00};

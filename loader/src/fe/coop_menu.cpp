@@ -33,7 +33,8 @@ volatile int g_coop_diffmode_on;          // this session's DIFFICULTY (host: it
 volatile int g_coop_special_on = 1;       // this session's SPECIAL WEAPONS (same)
 char g_coop_lobby_banner[3][64];
 volatile int g_coop_skipmovies_on;
-volatile int g_coop_revcost_on = 1;        // this session's REVIVE COST (same)         // this session's SKIP MOVIES (host: its option; joiner: the host's, from the heartbeat)          // the lobby's top banners (status / player 2 on the host; the host's options on the joiner)
+volatile int g_coop_revcost_on = 1;
+volatile int g_coop_vmult_on = 1;          // this session's ENEMY MULTIPLIERS (same)        // this session's REVIVE COST (same)         // this session's SKIP MOVIES (host: its option; joiner: the host's, from the heartbeat)          // the lobby's top banners (status / player 2 on the host; the host's options on the joiner)
 
 namespace {
 
@@ -252,7 +253,7 @@ void host_poll(ULONGLONG now)
     if (g_have_joiner && now - g_beat_ms >= kBeatMs) {
         g_beat_ms = now;
         char hb[8]; memcpy(hb, g_code, sizeof hb); hb[6] = g_cfg.coop_sprint ? 1 : 0;   // the host's SPRINT option rides the heartbeat
-        hb[7] = (char)(0x80 | (g_cfg.coop_diffmode ? 1 : 0) | (g_cfg.coop_special ? 2 : 0) | (g_cfg.coop_skipmovies ? 4 : 0) | (g_cfg.coop_revivecost ? 8 : 0));   // + SKIP MOVIES   // and DIFFICULTY / SPECIAL WEAPONS (0x80 = present)
+        hb[7] = (char)(0x80 | (g_cfg.coop_diffmode ? 1 : 0) | (g_cfg.coop_special ? 2 : 0) | (g_cfg.coop_skipmovies ? 4 : 0) | (g_cfg.coop_revivecost ? 8 : 0) | (g_cfg.coop_vanillamult ? 16 : 0));   // + SKIP MOVIES   // and DIFFICULTY / SPECIAL WEAPONS (0x80 = present)
         send_to(g_joiner, kBeat, hb);
         if (g_started) send_to(g_joiner, kActivate, g_code);   // until the mission goes (a lost CLAC)
     }
@@ -262,11 +263,13 @@ void host_poll(ULONGLONG now)
         sendto(g_sock, (const char *)&g_go, sizeof g_go, 0, (const sockaddr *)&g_joiner, sizeof g_joiner);
         if (!g_go_sends) { logf("coop menu: HOST: the mission went to the joiner - lobby closed"); net_close(); g_page = None; return; }
     }
-    show(0, g_cfg.coop_skipmovies ? "ON" : "OFF");
+    // owner 20261121 row order: START MISSION, DIFFICULTY, ENEMY MULTIPLIERS, SPRINT, SPECIAL WEAPONS, REVIVE COST
     show(1, g_cfg.coop_diffmode ? "CO-OP" : "VANILLA");
-    show(2, g_cfg.coop_special ? "ON" : "OFF");
+    show(2, g_cfg.coop_vanillamult ? "ON" : "OFF");
     show(3, g_cfg.coop_sprint ? "ON" : "OFF");
+    show(4, g_cfg.coop_special ? "ON" : "OFF");
     show(5, g_cfg.coop_revivecost ? "ON" : "OFF");
+    g_coop_vmult_on = g_cfg.coop_vanillamult ? 1 : 0;
     g_coop_revcost_on = g_cfg.coop_revivecost ? 1 : 0;
     {   // owner 20261120: LEAVE LOBBY gave its row to REVIVE COST - "have a mention that pressing B will make you leave the lobby"
         static const char kLeave[] = "PRESS B / ESC TO LEAVE THE LOBBY";
@@ -438,6 +441,9 @@ void join_poll(ULONGLONG now)
             int rc = (opt & 0x80) ? ((opt & 8) ? 1 : 0) : 1;   // an older host sends no bit: the cost stays
             if (rc != g_coop_revcost_on) logf("coop menu: JOIN: the host's REVIVE COST %s", rc ? "ON" : "OFF");
             g_coop_revcost_on = rc;
+            int vm = (opt & 0x80) && (opt & 16) ? 1 : 0;
+            if (vm != g_coop_vmult_on) logf("coop menu: JOIN: the host's ENEMY MULTIPLIERS %s", vm ? "ON" : "OFF");
+            g_coop_vmult_on = vm;
         } else if (m.magic == kActivate && g_join == Join::InLobby && !g_started) {
             g_started = true;
             g_host_ms = now;
@@ -474,7 +480,7 @@ void join_poll(ULONGLONG now)
     show(3, st);
     show(4, g_join == Join::InLobby ? (g_ready ? "YES" : "NO") : "-");
     if (g_join == Join::InLobby) {   // the host's options, shown to the joiner as the lobby banners
-        snprintf(g_coop_lobby_banner[0], sizeof g_coop_lobby_banner[0], "DIFFICULTY: %s", g_coop_diffmode_on ? "CO-OP" : "VANILLA");
+        snprintf(g_coop_lobby_banner[0], sizeof g_coop_lobby_banner[0], "DIFFICULTY: %s%s", g_coop_diffmode_on ? "CO-OP" : "VANILLA", g_coop_vmult_on ? " + MORE ENEMIES" : "");
         snprintf(g_coop_lobby_banner[1], sizeof g_coop_lobby_banner[1], "SPECIAL WEAPONS: %s", g_coop_special_on ? "ON" : "OFF");
         snprintf(g_coop_lobby_banner[2], sizeof g_coop_lobby_banner[2], "SKIP MOVIES: %s - REVIVE COST: %s", g_coop_skipmovies_on ? "ON" : "OFF",
                  g_coop_revcost_on ? "ON" : "OFF");
@@ -613,13 +619,21 @@ void coop_menu_change(int id, int dir)
         }
         return;
     }
-    if (id == 411) {   // the host lobby: SKIP MOVIES on / off (host only; it reaches the joiner with the heartbeat)
+    if (id == 413) {   // the host lobby: ENEMY MULTIPLIERS on / off (host only; it reaches the joiner with the heartbeat)
         (void)dir;
         if (g_page == HostLobby && !g_started) {
-            g_cfg.coop_skipmovies = !g_cfg.coop_skipmovies;
+            g_cfg.coop_vanillamult = !g_cfg.coop_vanillamult;
             settings_save();
-            logf("coop menu: HOST: SKIP MOVIES %s", g_cfg.coop_skipmovies ? "ON" : "OFF");
+            logf("coop menu: HOST: ENEMY MULTIPLIERS %s", g_cfg.coop_vanillamult ? "ON" : "OFF");
         }
+        return;
+    }
+    if (id == 5 || id == 411) {   // SKIP MOVIES on / off: the CO-OP page (owner 20261121; the host's setting, sent with the heartbeat)
+        (void)dir;
+        g_cfg.coop_skipmovies = !g_cfg.coop_skipmovies;
+        settings_save();
+        logf("coop menu: SKIP MOVIES %s", g_cfg.coop_skipmovies ? "ON" : "OFF");
+        show(4, g_cfg.coop_skipmovies ? "ON" : "OFF");
         return;
     }
     if (id == 408) {   // the host lobby: SPRINT on / off (host only; it reaches the joiner with the heartbeat)
@@ -714,6 +728,7 @@ void coop_menu_poll()
     if (g_page == Menu || g_page == Menu + 1) {   // the CO-OP page's HIT MARKER and LIGHTING rows
         show(2, g_cfg.coop_hitmarker ? "ON" : "OFF");
         show(3, lighting_name());
+        show(4, g_cfg.coop_skipmovies ? "ON" : "OFF");
     }
     if (g_page != HostLobby && g_page != JoinCode) { g_coop_lobby_banner[0][0] = g_coop_lobby_banner[1][0] = g_coop_lobby_banner[2][0] = 0; return; }
     ULONGLONG now = GetTickCount64();
