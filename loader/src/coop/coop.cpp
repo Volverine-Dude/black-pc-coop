@@ -8475,6 +8475,30 @@ extern "C" void coop_on_pellet(void)
                                 o[0], o[1], o[2], d[0], d[1], d[2], r.o[0], r.o[1], r.o[2], r.d[0], r.d[1], r.d[2]);
             for (int k = 0; k < 3; k++) { o[k] = r.o[k]; d[k] = r.d[k]; }
             g_shot_stats[2]++;
+            {   // cr1 (owner two-PC play 20261122: "clones don't generate ray when they are very close to each other" - no
+                // bullet trail and no impact): the partner's shot starts at the partner's eye; with OUR player right next to
+                // them the ray met our own body first (the game's bullet test stops there, our player takes no damage from
+                // the partner) - nothing further on. When the ray passes through our body (a 0.6 m column, feet to 1.9 m)
+                // within its first 3 m, it now starts just past our body.
+                const volatile float *pf = (pobj >= 0x80000000 && pobj < 0x84000000) ? (const volatile float *)(uintptr_t)(pobj + 0xA0) : nullptr;
+                if (pf) {
+                    const float R = 0.6f;
+                    float ox = o[0] - pf[0], oz = o[2] - pf[2];
+                    float a = d[0] * d[0] + d[2] * d[2], b = 2.0f * (ox * d[0] + oz * d[2]), c = ox * ox + oz * oz - R * R;
+                    float disc = b * b - 4.0f * a * c;
+                    if (a > 1e-6f && disc > 0.0f) {
+                        float sq = sqrtf(disc), t0 = (-b - sq) / (2.0f * a), t1 = (-b + sq) / (2.0f * a);
+                        float tin = t0 > 0.0f ? t0 : 0.0f;
+                        float hy = o[1] + tin * d[1] - pf[1];
+                        if (t1 > 0.0f && tin < 3.0f && hy > -0.2f && hy < 1.9f) {
+                            float adv = t1 + 0.05f;
+                            for (int k = 0; k < 3; k++) o[k] += d[k] * adv;
+                            static uint32_t cn;
+                            if (cn++ % 200 == 0) logf("coop: clone ray: our body stood in the partner's shot (%.2f m from its start) - the shot now starts %.2f m on, past us (%u so far)", tin, adv, cn);
+                        }
+                    }
+                }
+            }
         } else if (g_cfg.shot_test_npc) {
             if (g_shot_in_r != g_shot_in_w) { g_shot_in_r++; g_shot_stats[2]++; }   // test owns the aim; still drain the queue
             // solo test: aim this pellet at the nearest live ENEMY (team != the clone's,
@@ -8585,7 +8609,18 @@ static void coop_shot_catchup(uint32_t body)
         // rays-only: this call IS the shot - make sure the clip cannot block it (the fire block puts the
         // peer's clip count back right after)
         if (g_shot_rays_only && *(volatile int16_t *)(uintptr_t)(ctx + 0x18) < 2) *(volatile int16_t *)(uintptr_t)(ctx + 0x18) = 2;
+        // cr2 (owner two-PC play 20261122: "muzzle flash, bullets ray and sound still don't spawn" with the players close
+        // together): for a non-player shooter FUN_001dbd50 first tests whether the shot's origin lies inside the PLAYER's
+        // column (world [*0x2D45D4] +0xD0 position, +0x310 height, +0x340 radius) - a point-blank shot: it counts as a hit
+        // on the player and returns before the muzzle flash, sound, trail and impacts. The partner's clone standing next
+        // to us met that test on every shot (and partners never hurt each other: nothing at all). For the clone's
+        // replayed shots the test now looks 1 km up (restored right after the call).
+        uint32_t Wd = *(volatile uint32_t *)(uintptr_t)0x002D45D4;
+        bool lift = Wd >= 0x80000000 && Wd < 0x84000000;
+        float py = lift ? *(volatile float *)(uintptr_t)(Wd + 0xD4) : 0.0f;
+        if (lift) *(volatile float *)(uintptr_t)(Wd + 0xD4) = py + 1000.0f;
         coop_thunk_shot();
+        if (lift) *(volatile float *)(uintptr_t)(Wd + 0xD4) = py;
         g_shot_stats[4]++;
         if (g_shot_in_r == before) {   // the pellet did not take the ray (en121: test mode fired 1128 replays) -> drop it, stop
             g_shot_in_r++; g_shot_stats[3]++;
@@ -12525,6 +12560,10 @@ extern "C" void __cdecl coop_gunreq_check(uint32_t lo, uint32_t hi)
 {
     g_gunreq_block = 0;
     if (!g_cfg.coop_role || (lo == 0 && hi == 0) || !coop_game_paused()) return;
+    {   // rs4: only while a menu page is really up (a restart / quit from the menu leaves no page)
+        uint32_t fe = *(volatile uint32_t *)(uintptr_t)xbe_va(0x002D199C);
+        if (!fe || !*(volatile char *)(uintptr_t)(fe + 0x3840)) return;
+    }
     g_gunreq_block = 1;
     if (g_gunreq_holds++ % 600 == 0) logf("coop: gun hold: the pause menu is up - the game's request for its gun %08x%08x waits (%u so far)", hi, lo, g_gunreq_holds);
 }
@@ -12819,6 +12858,14 @@ static void coop_restart_reset(void)
     if (S >= 0x80000000 && S < 0x84000000 && coop_safe_copy(&cur, S + 0x21070, 4) && cur >= 0x80000000 && cur < 0x84000000)
         *(volatile uint32_t *)(uintptr_t)(cur + 0xC) &= ~1u;
     logf("coop: restart: downed / mission failed state cleared");
+    // rs4 (owner two-PC play 20261122: "the host restarted the game from the pause menu only to be stuck in the loading
+    // screen"): RestartLevel leaves the pause menu without the game's unpause request, so the menu-only pause's input
+    // block stayed on - and the gun hold kept the restart's gun load waiting for ever. A restart ends the pause.
+    uint32_t I = *(volatile uint32_t *)(uintptr_t)0x002D45E8;
+    if (I >= 0x80000000 && I < 0x84000000 && *(volatile uint8_t *)(uintptr_t)(I + 0xAEC)) {
+        *(volatile uint8_t *)(uintptr_t)(I + 0xAEC) = 0;
+        logf("coop: restart: the pause menu's input block is cleared (the restart left the menu)");
+    }
 }
 typedef void(__cdecl *rt_fn)(void);
 static void coop_rt_apply(uint32_t which, uint32_t seq)   // joiner: the host restarted
@@ -14602,6 +14649,10 @@ void coop_session_end(int reason)
     if (g_session_over || !g_cfg.coop_role) return;
     g_session_over = true;
     if (coop_in_mission()) g_coop_teardown = 1;   // a level is being quit (pause QUIT, the partner left): no AI update until the next load
+    {   // rs5: a quit from the pause menu leaves it without the unpause request too - drop the menu-only pause's input block
+        uint32_t I = *(volatile uint32_t *)(uintptr_t)0x002D45E8;
+        if (I >= 0x80000000 && I < 0x84000000) *(volatile uint8_t *)(uintptr_t)(I + 0xAEC) = 0;
+    }
     if (reason == 0) coop_send_quit();
     const char *msg = reason == 0 ? "YOU LEFT THE CO-OP SESSION" : reason == 1 ? "YOUR PARTNER LEFT THE CO-OP SESSION" : "CONNECTION TO YOUR PARTNER LOST";
     strncpy(g_coop_end_msg, msg, sizeof g_coop_end_msg - 1);
