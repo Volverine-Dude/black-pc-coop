@@ -5701,6 +5701,53 @@ static void coop_call_reloc(uint32_t buf)
         popad
     }
 }
+// sd3 (owner 20261122 "dig in": mission 4 -> mission 3 left the partner a common soldier - the donor's registration
+// filled no slot 6). The additive registration FUN_001c4c30 -> FUN_0017bd00 takes a package character only when its
+// name (slot 6 = the squad operative, hash 195c1000 bcc9b81d in the slot table 0x289908) is NOT found by the
+// dictionary lookup FUN_00017fc0 (thiscall ECX = dictionary, name lo / hi, ret 8). After mission 0 that name is gone;
+// after mission 4 a left-over entry still answers, so the donor's squad character was never registered. While OUR
+// donor registration runs, the lookup does not see that one name.
+volatile uint32_t g_dict_hide_on, g_dict_hide_lo, g_dict_hide_hi, g_dict_resume, g_dict_hidden;
+__declspec(naked) void coop_thunk_dictfind()   // FUN_00017fc0 entry: 8B 51 08 53 55 (mov edx, [ecx+8]; push ebx; push ebp) re-executed
+{
+    __asm {
+        cmp dword ptr [g_dict_hide_on], 0
+        je plain
+        push eax
+        mov eax, dword ptr [esp + 8]            // lo (after our push: ret at +4)
+        cmp eax, dword ptr [g_dict_hide_lo]
+        jne plainpop
+        mov eax, dword ptr [esp + 12]           // hi
+        cmp eax, dword ptr [g_dict_hide_hi]
+        jne plainpop
+        pop eax
+        lock inc dword ptr [g_dict_hidden]
+        xor eax, eax
+        ret 8
+    plainpop:
+        pop eax
+    plain:
+        mov edx, dword ptr [ecx + 8]
+        push ebx
+        push ebp
+        jmp dword ptr [g_dict_resume]
+    }
+}
+static bool coop_dict_hook_ready()
+{
+    static int state = 0;   // 0 untried, 1 installed, -1 failed
+    if (state) return state > 0;
+    static const uint8_t k[5] = {0x8B, 0x51, 0x08, 0x53, 0x55};
+    uint32_t a = xbe_va(0x00017FC0);
+    auto *c = (uint8_t *)(uintptr_t)a;
+    if (memcmp(c, k, 5) != 0) { logf("coop: squad donor: 0x17fc0 is not the dictionary lookup entry - name hiding not installed"); state = -1; return false; }
+    g_dict_resume = a + 5;
+    int32_t rel = (int32_t)((uintptr_t)coop_thunk_dictfind - (a + 5));
+    c[0] = 0xE9; memcpy(c + 1, &rel, 4);
+    state = 1;
+    logf("coop: squad donor: name hiding installed at 0x17fc0 (used only during the donor's registration)");
+    return true;
+}
 static void coop_call_register(uint32_t mgr, uint32_t pkg)
 {
     __asm {
@@ -5755,7 +5802,12 @@ static void coop_squad_donor_step()
                 if (!r || *(volatile uint32_t *)(uintptr_t)(t + 8) != 6) continue;
                 bool ok2 = r >= 0x80000000 && r < 0x84000000 && coop_safe_copy(&b2, r + 0x38, 4) && coop_safe_copy(&l2, r + 0x3C, 4) &&
                            l2 < 0x10000 && (l2 == 0 || (b2 >= 0x80000000 && b2 < 0x84000000 && coop_safe_copy(&p2, b2, 4)));
-                if (!ok2) { *(volatile uint32_t *)(uintptr_t)t = 0; logf("coop: squad donor: type %02x flushed", i); }
+                // sd2 (owner two-PC play 20261122: "both players crashed after loading a second mission in the same
+                // session"): only 1e was flushed - 1d / 1f still read as live (their old memory was reused by the new
+                // level), the donor's registration left slot 6 EMPTY, and the clone built from a squad type with no
+                // character crashed both copies (null call, 0x96eea). Slot 6 itself is left over, so every slot-6 type is.
+                *(volatile uint32_t *)(uintptr_t)t = 0;
+                logf("coop: squad donor: type %02x flushed%s", i, ok2 ? " (its memory looked readable - reused by this level)" : "");
             }
             have = 0; tw0 = 0;
         }
@@ -5818,7 +5870,16 @@ static void coop_squad_donor_step()
     dump_dicts("after");
     uint32_t dpkg = *(volatile uint32_t *)(uintptr_t)(b + 0xC);
     logf("coop: squad donor: relocated, package %08x - registering it (additive, the unit path)", dpkg);
+    bool hide = coop_dict_hook_ready();
+    if (hide) {
+        const volatile uint32_t *st = (const volatile uint32_t *)(uintptr_t)xbe_va(0x00289908);
+        g_dict_hide_lo = st[12]; g_dict_hide_hi = st[13]; g_dict_hidden = 0; g_dict_hide_on = 1;
+    }
     coop_call_register(lm, dpkg);
+    if (hide) {
+        g_dict_hide_on = 0;
+        logf("coop: squad donor: the squad character's name (%08x %08x) was hidden from %u lookup(s) during the registration", g_dict_hide_lo, g_dict_hide_hi, g_dict_hidden);
+    }
     g_donor_used = true;
     uint32_t now = *(volatile uint32_t *)(uintptr_t)(sl + 0xC);
     logf("coop: squad donor: slot 6 -> %08x%s (level package still %08x)", now, now ? " - the squad character is loaded" : " - STILL EMPTY",
@@ -5935,6 +5996,11 @@ static uint32_t coop_squad_type(uint32_t *idx_out)
             if (!squad || (int)i == want) { squad = t; sidx = i; }
         }
         if (!fallback && w2 == 0) { fallback = t; fidx = i; }
+    }
+    if (squad) {   // sd2: a squad type is only usable while the squad CHARACTER (slot 6) is loaded - else the common soldier
+        uint32_t sl6 = coop_char_slot(6);
+        uint32_t ch6 = (sl6 >= 0x80000000 && sl6 < 0x84000000) ? *(volatile uint32_t *)(uintptr_t)(sl6 + 0xC) : 0;
+        if (!ch6) { logf("coop: own spawn: squad types (slot 6):%s but the squad character is NOT loaded - the clone uses the common soldier (index %02x)", list, fidx); squad = 0; }
     }
     if (squad) { logf("coop: own spawn: squad types (slot 6):%s -> index %02x (wanted %02x)", list, sidx, want); *idx_out = sidx; return squad; }
     *idx_out = fidx;
