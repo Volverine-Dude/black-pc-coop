@@ -14701,16 +14701,27 @@ void coop_activate(int role, uint32_t peer_ip)
 {
     g_coop_host_ms = 0;   // a new session: no partner packet yet (the 20-s silence check starts at the first one)
     g_peer_alive_ms = 0;
-    if (g_cfg.coop_role && g_coop_sock != INVALID_SOCKET) { logf("coop: activate: already active (role %d)", g_cfg.coop_role); return; }
-    g_session_over = false; g_quit_in = 0; g_coop_end_msg[0] = 0;
     // REJOIN (owner two-PC play 20261120): a second session in the same window kept the first partner's numbers - the
     // loading barrier, the position snapshots and the event sequence filters threw the new partner's packets away.
-    logf("coop: activate: new session - partner state cleared (loads so far %u, snapshots %u)", g_load_seq, g_snap_w);
+    // rj2 (owner two-PC play 20261121 on 0.9.2: "the joiner finished loading but the host was still in the loading screen
+    // waiting"): the joiner left the lobby after the results (its session ENDED) and joined again - a fresh session there
+    // (load numbers from 1) - while the host's session had stayed on ("already active") and kept counting (load #2): it
+    // waited for a #2 the joiner never sends. Every mission start from the lobby (both roles call this: the host at START
+    // MISSION, the joiner at the host's CLAC) now clears this state, whether the session is new or still on.
+    logf("coop: activate: %s - partner state cleared (loads so far %u, snapshots %u)",
+         g_cfg.coop_role && g_coop_sock != INVALID_SOCKET ? "mission start in a running session" : "new session", g_load_seq, g_snap_w);
     g_load_base = g_load_seq; g_peer_load_seq = 0; g_load_sent_seq = 0;
     g_load_wait_since = 0; g_load_send_ms = 0; g_load_go_ms = 0; g_coop_load_ui = 0;
     g_snap_w = 0;
     g_an_last_in = 0; g_ob_last_in = 0; g_pj_last_in = 0;
     g_coop_peer_skip = 0; g_coop_peer_intro = 0;
+    // rj3 (owner two-PC play 20261121 on -88: "they got disconnected after loading the mission after the joiner rejoined
+    // the lobby"): the joiner's LEAVE LOBBY sent CLQT; the host (session still on, in its lobby) kept "the partner left"
+    // set, and 4 s into the next mission its play tick acted on it (QuitLevel, session ended). A mission start clears it.
+    if (g_quit_in) logf("coop: activate: an old 'the partner left' (from the lobby) is cleared - the partner is back");
+    g_quit_in = 0;
+    if (g_cfg.coop_role && g_coop_sock != INVALID_SOCKET) { logf("coop: activate: already active (role %d)", g_cfg.coop_role); return; }
+    g_session_over = false; g_quit_in = 0; g_coop_end_msg[0] = 0;
     in_addr ia; ia.s_addr = peer_ip;
     char ip[32] = {0};
     inet_ntop(AF_INET, &ia, ip, sizeof ip);
